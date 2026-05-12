@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "scharnhorst_core",
+    "scharnhorst_schema",
+    "scharnhorst_arrow_store",
+    "scharnhorst_scheduler",
+    "scharnhorst_journal",
+    "scharnhorst_query",
+    "scharnhorst_save",
+    "scharnhorst_content",
+    "scharnhorst_bevy",
+    "scharnhorst_rules",
+    "scharnhorst_integration_tests",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+authors = ["Scharnhorst Contributors"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Internal crates
+scharnhorst_core = { path = "scharnhorst_core" }
+scharnhorst_schema = { path = "scharnhorst_schema" }
+scharnhorst_arrow_store = { path = "scharnhorst_arrow_store" }
+scharnhorst_scheduler = { path = "scharnhorst_scheduler" }
+scharnhorst_journal = { path = "scharnhorst_journal" }
+scharnhorst_query = { path = "scharnhorst_query" }
+scharnhorst_save = { path = "scharnhorst_save" }
+scharnhorst_content = { path = "scharnhorst_content" }
+scharnhorst_bevy = { path = "scharnhorst_bevy" }
+scharnhorst_rules = { path = "scharnhorst_rules" }
+
+# External dependencies
+arrow = "53"
+arrow-array = "53"
+arrow-schema = "53"
+bevy = { version = "0.14", default-features = false }
+datafusion = "42"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.8"
+tracing = "0.1"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -1,0 +1,18 @@
+[package]
+name = "scharnhorst_arrow_store"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+scharnhorst_core = { workspace = true }
+scharnhorst_schema = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

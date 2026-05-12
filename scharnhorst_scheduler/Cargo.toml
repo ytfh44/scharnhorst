@@ -1,0 +1,22 @@
+[package]
+name = "scharnhorst_scheduler"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+scharnhorst_core = { workspace = true }
+scharnhorst_schema = { workspace = true }
+scharnhorst_arrow_store = { workspace = true }
+scharnhorst_journal = { workspace = true }
+scharnhorst_query = { workspace = true }
+bevy = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }

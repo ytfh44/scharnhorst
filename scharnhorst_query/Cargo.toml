@@ -1,0 +1,23 @@
+[package]
+name = "scharnhorst_query"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+scharnhorst_core = { workspace = true }
+scharnhorst_schema = { workspace = true }
+scharnhorst_arrow_store = { workspace = true }
+scharnhorst_journal = { workspace = true }
+datafusion = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

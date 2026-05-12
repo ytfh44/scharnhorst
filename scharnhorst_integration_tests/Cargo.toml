@@ -1,0 +1,29 @@
+[package]
+name = "scharnhorst_integration_tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+scharnhorst_core = { workspace = true }
+scharnhorst_schema = { workspace = true }
+scharnhorst_arrow_store = { workspace = true }
+scharnhorst_scheduler = { workspace = true }
+scharnhorst_journal = { workspace = true }
+scharnhorst_query = { workspace = true }
+scharnhorst_save = { workspace = true }
+scharnhorst_content = { workspace = true }
+scharnhorst_bevy = { workspace = true }
+scharnhorst_rules = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+bevy = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
