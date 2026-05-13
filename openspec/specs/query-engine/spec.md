@@ -94,7 +94,7 @@ Internally, the `query-engine` may dispatch to different Arrow access strategies
 #### Invariant:
 No component outside the `query-engine` may hold a direct reference to an Arrow `RecordBatch` or `Table` from the snapshot. All reads go through the query-engine API.
 
-> **Note on snapshot delivery**: The query-engine does **not** expose a pull-based `get_snapshot()` method. Internally, it caches `TableReadView` entries that are pushed to it by the `arrow_store` via `ingest_snapshot(tick, table_name, batches)`. The cached views are keyed by table name and indexed by the snapshot tick stored in `latest_tick()`. Consumers access data through the typed read APIs (`lookup_row`, `column_view`, `read`) rather than by obtaining a snapshot handle.
+> **Note on snapshot delivery**: The query-engine does **not** expose a pull-based `get_snapshot()` method. Internally, it caches `TableReadView` entries that are pushed to it by the `arrow_store` via `ingest_snapshot(tick, table_name, batches)`. The cached views are keyed by table name and indexed by the snapshot tick stored in `latest_tick()`. Consumers access data through the typed read APIs (`lookup_row`, `column_view`, `batch_reader`, `read`) rather than by obtaining a snapshot handle.
 
 #### Scenario: Simulation system reads via query-engine
 - **WHEN** the `EconomySystem` needs the treasury of actor FRA
@@ -107,3 +107,106 @@ In debug builds, a `DebugWriteJournal` MAY be enabled that translates SQL `UPDAT
 - Still routes through the journal, so it does not violate the single-write-entry-point invariant.
 
 **Implementation**: The `DebugWriteJournal` intercepts SQL write statements from developer tooling, translates them into `Diff` objects, and submits them to the `journal-system`. The actual commit occurs at the next tick boundary (triggered by `sim-scheduler`), preserving the tick-aligned commit cycle.
+
+---
+
+## Invariants
+
+### I-QE-TICK-SENTINEL
+`u64::MAX` is reserved as the None sentinel for `latest_tick`. No valid tick may have this value. `Tick::MAX = Tick(u64::MAX - 1)` encodes this at the type level. `Tick::next()` uses `saturating_add(1)`, so calling `Tick::MAX.next()` saturates to `Tick(u64::MAX)` — the sentinel. In normal operation this is physically unreachable (~585 billion years at 1 billion ticks/sec). A `debug_assert!` in `ingest_snapshot` guards against accidental sentinel ingestion from test code, deserialization, or replay.
+
+### I-QE-TICK-ORDERING
+`latest_tick.store(Release)` in `ingest_snapshot` is paired with `latest_tick.load(Acquire)` in `latest_tick()`. This ordering pair ensures that **when a reader calls `latest_tick()` (Acquire) BEFORE reading `view_cache`**, the `view_cache` insertion performed *in the `ingest_snapshot` call that stored T* is visible to that reader. The precondition is critical: a reader that reads `view_cache` first and `latest_tick()` second may observe stale cache data associated with a newer tick. All current reader sites in `lookup_row()`, `column_view()`, `row_cursor()`, and `batch_reader()` maintain the correct access order (tick first, then cache). During multi-table snapshot ingestion (a sequence of `ingest_snapshot` calls within the journal commit), each call stores tick T independently — intermediate stores expose T with a partial `view_cache` (only tables ingested so far). Since all ingestion and the final `store_world_snapshot` happen within a single sequential `atomic_commit()` phase, no concurrent reader observes the intermediate states.
+
+---
+
+## Design Notes
+
+### Tick Sentinel `u64::MAX` — Silent Data Corruption Prevention (CRITICAL)
+
+**Location**: Snapshot Ingestion, I-QE-TICK-SENTINEL
+
+**Problem**: `u64::MAX` is reserved as the None sentinel for `latest_tick`. `Tick` is a public newtype over `u64` with `pub u64` field access. Any code path — test code, checkpoint deserialization, deterministic replay, or future extensions — can construct `Tick(u64::MAX)`. If passed to `ingest_snapshot`, the atomic store of `u64::MAX` is indistinguishable from `None`. The result: `latest_tick()` returns `None`, and `lookup_row()` returns `Err("no tick available")` despite data being present.
+
+Additionally, `Tick::next()` uses `saturating_add(1)`, so `Tick::MAX = Tick(u64::MAX - 1)` followed by `.next()` produces `Tick(u64::MAX)` — exactly the sentinel. While unreachable in normal operation, this path is formally possible.
+
+**Impact**: Silent logical corruption — data exists but is invisible.
+
+**Recommended Corrections Applied**:
+
+1. Public const `Tick::MAX = Tick(u64::MAX - 1)` reserves the sentinel value at the type level.
+2. In `ingest_snapshot`, a debug-only assertion guards against sentinel ingestion:
+   ```rust
+   debug_assert!(tick.as_u64() != u64::MAX, "Tick sentinel collision");
+   ```
+3. The sentinel invariant is documented on `latest_tick`:
+   ```
+   /// INVARIANT: u64::MAX is reserved as the None sentinel.
+   /// Tick::as_u64() must never equal u64::MAX.
+   ```
+
+### `ingest_snapshot` Ordering — Fragile Stated Invariant (CRITICAL)
+
+**Location**: Snapshot Ingestion, I-QE-TICK-ORDERING
+
+**Problem**: I-QE-TICK-ORDERING claims:
+> "Any reader observing tick T also sees all view_cache insertions performed prior to T's store."
+
+This is achieved via `store(Release)` in `ingest_snapshot` paired with `load(Acquire)` in `latest_tick()`. However, the invariant **only holds if the reader loads `latest_tick` BEFORE reading `view_cache`**. A reader that reads `view_cache` first, then `latest_tick`, can observe:
+
+1. Reader: acquires `view_cache.read()` → sees old data
+2. Writer: completes both `cache.insert()` and `latest_tick.store(Release)`
+3. Reader: `latest_tick.load(Acquire)` → sees new tick T
+4. Reader: uses old cache data under the belief it corresponds to tick T
+
+**Impact**: A future code path that reads cache before tick will silently attribute stale data to a newer tick.
+
+**Recommended Corrections Applied**:
+
+Documented the required access order on both methods:
+
+On `ingest_snapshot`:
+```
+ORDERING INVARIANT: Readers MUST load `latest_tick()` BEFORE
+acquiring the `view_cache` read lock. Violating this order may
+cause stale cache data to be attributed to a newer tick.
+```
+
+Verified `lookup_row()` and all other reader sites maintain this order.
+
+---
+
+## Implementation Notes
+
+### Atomic `latest_tick` Replacement
+
+The `latest_tick` field changes from `Arc<RwLock<Option<Tick>>>` to `Arc<AtomicU64>`:
+
+```rust
+latest_tick: Arc<AtomicU64>  // u64::MAX represents None
+```
+
+**Sentinel encoding**:
+- `None` is represented by `u64::MAX`
+- `Tick::MAX = Tick(u64::MAX - 1)` reserves the sentinel at the type level
+- `Tick::next()` uses `saturating_add`, so `Tick::MAX.next()` saturates to `Tick(u64::MAX)` — the sentinel
+
+**Ordering pair**:
+- `ingest_snapshot` uses `Release` on the store
+- `latest_tick()` uses `Acquire` on the load
+
+This ensures that when a reader calls `latest_tick()` (Acquire) BEFORE reading `view_cache`, the `view_cache` insertion performed in the `ingest_snapshot` call that stored T is visible to that reader.
+
+### Tick Space Reduction
+
+`u64::MAX` is reserved as the None sentinel. This reduces the usable tick range from `[0, 2^64-1]` to `[0, 2^64-2]`. At 1 billion ticks/second (impossibly fast), this is ~585 years of ticks. The reduction is harmless.
+
+### Unchanged Fields
+
+Fields using Mutex/RwLock:
+- `schema_registry: Arc<RwLock<SchemaRegistry>>`
+- `view_cache: Arc<RwLock<HashMap<String, TableReadView>>>`
+- `latest_snapshot: Arc<RwLock<Option<Arc<WorldSnapshot>>>>`
+- `debug_journal: Arc<DebugWriteJournal>` (debug builds only)
+- `sql_context: Arc<RwLock<SqlExecutionContext>>`
+

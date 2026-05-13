@@ -140,3 +140,151 @@ The `Scheduler::initialize()` method SHALL validate the registration state befor
 Validation failures SHALL return `SchedulerError` with descriptive messages. The scheduler SHALL NOT panic on invalid registration state.
 
 The `Scheduler::tick()` method SHALL NOT panic. All failure modes (lock poisoning, commit failure, consumer refresh failure) SHALL propagate as `SchedulerError` variants through `SchedulerResult`. Panicking via `.unwrap()` or `.expect()` on Mutex/RwLock acquisition is FORBIDDEN anywhere in the scheduler crate.
+
+---
+
+## Invariants
+
+### I-SCHED-TICK-ATOMIC
+`current_tick` and `generation` are atomically accessed with `Ordering::Relaxed`. Since all mutations occur on the single scheduler thread, there is no memory ordering requirement beyond atomicity. This `generation` counter is independent of the ArrowStore's `generation` counter (see arrow-store spec I-AS-GENERATION): the Scheduler increments in `atomic_commit()` after journal commit, while the ArrowStore increments at the start of `generate_snapshot()` called *within* the journal commit. The two have no happens-before relationship.
+
+### I-SCHED-INIT-ACQUIRE
+`initialized` uses `Ordering::Acquire` via the `load`-then-`store` two-phase pattern — not via `compare_exchange`. The `Acquire` load on the fast-path check pairs with the `Release` store at the end of successful validation, ensuring all validation side-effects are visible to any thread that subsequently observes `is_initialized() == true`.
+
+### I-SCHED-BROADCAST-SNAPSHOT
+`RefreshSignalBus::broadcast()` operates on a cloned snapshot of the consumer list, making it safe for `register`/`unregister` to run concurrently.
+
+---
+
+## Design Notes
+
+### `initialize()` CAS — Permanent "Initialized" on Validation Failure (SIGNIFICANT)
+
+**Location**: Initialization
+
+**Problem**: The proposed `compare_exchange` pattern sets `initialized = true` BEFORE validation runs:
+
+```rust
+if self.initialized.compare_exchange(false, true, Acquire, Relaxed).is_err() {
+    return Ok(());  // already initialized
+}
+// ... validation runs with initialized=TRUE already stored
+```
+
+If validation fails, `initialized` is already `true`. Subsequent calls return `Ok(())` immediately — the scheduler is permanently "initialized" with failed validation. The old Mutex design held the lock through validation AND the flag write, so a validation failure never set the flag.
+
+The design argues this is safe because "initialize() is called once at application startup." However:
+- The Bevy bridge may call `initialize()` from Bevy system setup, where `RefreshSignalBus::register()` runs concurrently (after Phase 2).
+- Any future parallel startup code path triggers this bug.
+
+**Impact**: Validation failures are masked permanently. The scheduler reports itself as initialized with potentially incorrect system registrations.
+
+**Correction Applied**: Replaced the compare_exchange with a two-phase pattern:
+
+```rust
+pub fn initialize(&self) -> SchedulerResult<()> {
+    // Fast path: already initialized
+    if self.initialized.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    // Validation (must succeed before setting flag)
+    let systems = self.lock_systems()?;
+    let registrations = self.lock_registrations()?;
+    // ... existing validation logic ...
+
+    // Only now mark as initialized
+    self.initialized.store(true, Ordering::Release);
+    Ok(())
+}
+```
+
+This preserves the idempotency contract while ensuring validation failures are never masked.
+
+---
+
+## Implementation Notes
+
+### Atomic Replacements
+
+The `Scheduler` replaces three `Arc<Mutex<T>>` fields with atomics:
+
+```rust
+current_tick: Arc<AtomicU64>,
+generation: Arc<AtomicU64>,
+initialized: Arc<AtomicBool>,
+```
+
+### Tick Lifecycle
+
+```rust
+pub fn current_tick(&self) -> SchedulerResult<Tick> {
+    Ok(Tick(self.current_tick.load(Ordering::Relaxed)))
+}
+
+pub fn advance_tick(&self) -> SchedulerResult<Tick> {
+    let next = self.current_tick.fetch_add(1, Ordering::Relaxed);
+    let new_tick = Tick(next).next();
+    Ok(new_tick)
+}
+```
+
+The use of `.next()` ensures the return value follows `Tick`'s saturation semantics at the type level.
+
+### Atomic Commit
+
+```rust
+self.generation.fetch_add(1, Ordering::Relaxed);
+```
+
+`fetch_add` uses wrapping arithmetic (u64 overflow is impossible in practice).
+
+### Initialization Two-Phase Pattern
+
+```rust
+pub fn initialize(&self) -> SchedulerResult<()> {
+    // Phase 1: fast-path check
+    if self.initialized.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    
+    // Phase 2: validation under Mutex serialization
+    let systems = self.lock_systems()?;
+    let registrations = self.lock_registrations()?;
+    // ... validation ...
+    
+    self.initialized.store(true, Ordering::Release);
+    Ok(())
+}
+```
+
+**Why not compare_exchange**: A `compare_exchange(false, true, Acquire, Relaxed)` would permanently mask validation failures: if the CAS succeeded but validation subsequently failed, the `initialized` flag would remain `true` while no actual initialization completed. The two-phase pattern uses `Acquire`/`Release` ordering matching the original Mutex semantics but avoids this masking issue.
+
+### Refresh Signal Bus — Broadcast Callback Snapshotting
+
+The `RefreshSignalBus::broadcast()` clones the consumer list under the lock, then releases the lock before iteration:
+
+```rust
+pub fn broadcast(&self, tick: u64, generation: u64) -> SchedulerResult<()> {
+    let callbacks: Vec<_> = {
+        let consumers = self.consumers.lock()?;
+        consumers.values().cloned().collect()
+    }; // lock released here
+    
+    for cb in &callbacks {
+        cb(tick, generation)?;
+    }
+    Ok(())
+}
+```
+
+**Observable behavioral change**: Register/unregister calls during a broadcast's callback execution succeed immediately without blocking on the Mutex. Newly registered consumers do NOT receive the current broadcast; newly unregistered consumers DO receive it.
+
+### Debug Implementation
+
+The `Debug` impl uses atomic loads for `current_tick` and `generation` (no lock contention). Under `AtomicU64`, there is no poison state — `load()` always succeeds.
+
+### Lock Helpers Removal
+
+The lock helper methods `lock_tick`, `lock_generation`, `lock_initialized` are removed (they were private). The remaining lock helpers (`lock_systems`, `lock_registrations`, `lock_commands`, `lock_journal`) protect complex multi-field state.
+
