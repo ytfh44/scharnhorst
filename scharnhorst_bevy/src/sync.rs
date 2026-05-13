@@ -246,7 +246,7 @@ pub fn sync_table_components<C, S>(
     table_name: &str,
 ) -> BevyBridgeResult<usize>
 where
-    C: bevy::prelude::Component,
+    C: bevy::prelude::Component<Mutability = bevy::ecs::component::Mutable>,
     S: SyncField<C>,
 {
     let mut updated = 0usize;
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn sync_state_register_and_count() -> BevyBridgeResult<()> {
         let state = SyncState::new();
-        let entity = Entity::from_raw(1);
+        let entity = Entity::from_raw_u32(1).expect("Entity index must be valid");
         state.register_entity(entity, "provinces", 0, Tick(0))?;
         assert_eq!(state.entity_count()?, 1);
         Ok(())
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn sync_state_unregister_removes() -> BevyBridgeResult<()> {
         let state = SyncState::new();
-        let entity = Entity::from_raw(1);
+        let entity = Entity::from_raw_u32(1).expect("Entity index must be valid");
         state.register_entity(entity, "provinces", 0, Tick(0))?;
         state.unregister_entity(entity)?;
         assert_eq!(state.entity_count()?, 0);
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn sync_state_mark_dirty() -> BevyBridgeResult<()> {
         let state = SyncState::new();
-        let entity = Entity::from_raw(1);
+        let entity = Entity::from_raw_u32(1).expect("Entity index must be valid");
         state.register_entity(entity, "provinces", 0, Tick(0))?;
         state.mark_dirty(entity)?;
         assert!(state.is_dirty(entity)?);
@@ -349,8 +349,8 @@ mod tests {
     #[test]
     fn sync_state_mark_all_dirty() -> BevyBridgeResult<()> {
         let state = SyncState::new();
-        let e1 = Entity::from_raw(1);
-        let e2 = Entity::from_raw(2);
+        let e1 = Entity::from_raw_u32(1).expect("Entity index must be valid");
+        let e2 = Entity::from_raw_u32(2).expect("Entity index must be valid");
         state.register_entity(e1, "a", 0, Tick(0))?;
         state.register_entity(e2, "b", 0, Tick(0))?;
         state.mark_all_dirty()?;
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn sync_state_clear_dirty() -> BevyBridgeResult<()> {
         let state = SyncState::new();
-        let entity = Entity::from_raw(1);
+        let entity = Entity::from_raw_u32(1).expect("Entity index must be valid");
         state.register_entity(entity, "provinces", 0, Tick(0))?;
         state.mark_dirty(entity)?;
         state.clear_dirty()?;

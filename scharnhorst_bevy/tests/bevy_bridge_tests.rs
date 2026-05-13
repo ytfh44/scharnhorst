@@ -48,7 +48,7 @@ fn view_of_set_generation() {
 #[test]
 fn registry_round_trip() -> BevyBridgeResult<()> {
     let reg = EntityMaterializationRegistry::new();
-    let entity = bevy::prelude::Entity::from_raw(7);
+    let entity = bevy::prelude::Entity::from_raw_u32(7).expect("Entity index must be valid");
 
     reg.register("provinces", RowId::new(99), entity)?;
     let looked_up = reg.lookup("provinces", RowId::new(99))?;
@@ -67,7 +67,7 @@ fn registry_lookup_missing_returns_none() -> BevyBridgeResult<()> {
 #[test]
 fn registry_unregister_removes_mapping() -> BevyBridgeResult<()> {
     let reg = EntityMaterializationRegistry::new();
-    let entity = bevy::prelude::Entity::from_raw(3);
+    let entity = bevy::prelude::Entity::from_raw_u32(3).expect("Entity index must be valid");
 
     reg.register("actors", RowId::new(5), entity)?;
     let removed = reg.unregister("actors", RowId::new(5))?;
@@ -83,7 +83,7 @@ fn registry_len_and_is_empty() -> BevyBridgeResult<()> {
     let reg = EntityMaterializationRegistry::new();
     assert!(reg.is_empty()?);
 
-    reg.register("t", RowId::new(1), bevy::prelude::Entity::from_raw(1))?;
+    reg.register("t", RowId::new(1), bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"))?;
     assert_eq!(reg.len()?, 1);
     assert!(!reg.is_empty()?);
     Ok(())
@@ -92,9 +92,9 @@ fn registry_len_and_is_empty() -> BevyBridgeResult<()> {
 #[test]
 fn registry_table_names() -> BevyBridgeResult<()> {
     let reg = EntityMaterializationRegistry::new();
-    reg.register("a", RowId::new(1), bevy::prelude::Entity::from_raw(1))?;
-    reg.register("a", RowId::new(2), bevy::prelude::Entity::from_raw(2))?;
-    reg.register("b", RowId::new(3), bevy::prelude::Entity::from_raw(3))?;
+    reg.register("a", RowId::new(1), bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"))?;
+    reg.register("a", RowId::new(2), bevy::prelude::Entity::from_raw_u32(2).expect("Entity index must be valid"))?;
+    reg.register("b", RowId::new(3), bevy::prelude::Entity::from_raw_u32(3).expect("Entity index must be valid"))?;
 
     let mut names = reg.table_names()?;
     names.sort();
@@ -335,7 +335,7 @@ fn view_model_read_table_without_snapshot_fails() {
 #[test]
 fn sync_state_register_and_count() -> BevyBridgeResult<()> {
     let state = SyncState::new();
-    let entity = bevy::prelude::Entity::from_raw(1);
+    let entity = bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid");
     state.register_entity(entity, "provinces", 0, Tick(0))?;
     assert_eq!(state.entity_count()?, 1);
     Ok(())
@@ -344,7 +344,7 @@ fn sync_state_register_and_count() -> BevyBridgeResult<()> {
 #[test]
 fn sync_state_mark_dirty_and_clear() -> BevyBridgeResult<()> {
     let state = SyncState::new();
-    let entity = bevy::prelude::Entity::from_raw(1);
+    let entity = bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid");
     state.register_entity(entity, "provinces", 0, Tick(0))?;
     state.mark_dirty(entity)?;
     assert!(state.is_dirty(entity)?);
@@ -359,8 +359,8 @@ fn sync_state_mark_dirty_and_clear() -> BevyBridgeResult<()> {
 #[test]
 fn sync_state_mark_all_dirty() -> BevyBridgeResult<()> {
     let state = SyncState::new();
-    let e1 = bevy::prelude::Entity::from_raw(1);
-    let e2 = bevy::prelude::Entity::from_raw(2);
+    let e1 = bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid");
+    let e2 = bevy::prelude::Entity::from_raw_u32(2).expect("Entity index must be valid");
     state.register_entity(e1, "a", 0, Tick(0))?;
     state.register_entity(e2, "b", 0, Tick(0))?;
     state.mark_all_dirty()?;
@@ -371,7 +371,7 @@ fn sync_state_mark_all_dirty() -> BevyBridgeResult<()> {
 #[test]
 fn sync_state_unregister_cleans_dirty() -> BevyBridgeResult<()> {
     let state = SyncState::new();
-    let entity = bevy::prelude::Entity::from_raw(1);
+    let entity = bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid");
     state.register_entity(entity, "provinces", 0, Tick(0))?;
     state.mark_dirty(entity)?;
     state.unregister_entity(entity)?;

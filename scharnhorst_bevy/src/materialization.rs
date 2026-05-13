@@ -225,7 +225,7 @@ impl EntityMaterializationRegistry {
                 commands.entity(entity).despawn();
                 Ok(())
             }
-            None => Err(BevyBridgeError::EntityNotFound(entity.index() as u64)),
+            None => Err(BevyBridgeError::EntityNotFound(entity.index().index() as u64)),
         }
     }
 
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn registry_round_trip() -> BevyBridgeResult<()> {
         let reg = EntityMaterializationRegistry::new();
-        let entity = bevy::prelude::Entity::from_raw(7);
+        let entity = bevy::prelude::Entity::from_raw_u32(7).expect("Entity index must be valid");
         reg.register("provinces", RowId::new(99), entity)?;
         let looked_up = reg.lookup("provinces", RowId::new(99))?;
         assert_eq!(looked_up, Some(entity));
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn registry_unregister_removes_mapping() -> BevyBridgeResult<()> {
         let reg = EntityMaterializationRegistry::new();
-        let entity = bevy::prelude::Entity::from_raw(3);
+        let entity = bevy::prelude::Entity::from_raw_u32(3).expect("Entity index must be valid");
         reg.register("actors", RowId::new(5), entity)?;
         let removed = reg.unregister("actors", RowId::new(5))?;
         assert_eq!(removed, Some(entity));
@@ -388,7 +388,7 @@ mod tests {
     fn registry_len_and_is_empty() -> BevyBridgeResult<()> {
         let reg = EntityMaterializationRegistry::new();
         assert!(reg.is_empty()?);
-        reg.register("t", RowId::new(1), bevy::prelude::Entity::from_raw(1))?;
+        reg.register("t", RowId::new(1), bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"))?;
         assert_eq!(reg.len()?, 1);
         assert!(!reg.is_empty()?);
         Ok(())
@@ -397,9 +397,9 @@ mod tests {
     #[test]
     fn registry_table_names() -> BevyBridgeResult<()> {
         let reg = EntityMaterializationRegistry::new();
-        reg.register("a", RowId::new(1), bevy::prelude::Entity::from_raw(1))?;
-        reg.register("a", RowId::new(2), bevy::prelude::Entity::from_raw(2))?;
-        reg.register("b", RowId::new(3), bevy::prelude::Entity::from_raw(3))?;
+        reg.register("a", RowId::new(1), bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"))?;
+        reg.register("a", RowId::new(2), bevy::prelude::Entity::from_raw_u32(2).expect("Entity index must be valid"))?;
+        reg.register("b", RowId::new(3), bevy::prelude::Entity::from_raw_u32(3).expect("Entity index must be valid"))?;
         let mut names = reg.table_names()?;
         names.sort();
         assert_eq!(names, vec!["a", "b"]);
