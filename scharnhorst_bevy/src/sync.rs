@@ -5,6 +5,7 @@ use scharnhorst_query::engine::QueryEngine;
 use scharnhorst_query::unified_read::ReadRequest;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{BevyBridgeError, BevyBridgeResult};
 use crate::view_of::ViewOf;
@@ -12,19 +13,20 @@ use crate::view_of::ViewOf;
 #[derive(Debug, Clone, Default)]
 struct ViewModelState {
     snapshot: Option<Arc<WorldSnapshot>>,
-    generation: u64,
     latest_tick: Option<Tick>,
 }
 
 #[derive(Debug, Clone, Resource)]
 pub struct ViewModel {
     state: Arc<Mutex<ViewModelState>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl Default for ViewModel {
     fn default() -> Self {
         Self {
             state: Arc::new(Mutex::new(ViewModelState::default())),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -42,8 +44,8 @@ impl ViewModel {
 
         let snap_tick = snapshot.tick();
         state.snapshot = Some(snapshot);
-        state.generation = generation;
         state.latest_tick = Some(snap_tick);
+        self.generation.store(generation, Ordering::Relaxed);
         Ok(())
     }
 
@@ -56,11 +58,7 @@ impl ViewModel {
     }
 
     pub fn generation(&self) -> BevyBridgeResult<u64> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|e| BevyBridgeError::LockPoisoned(e.to_string()))?;
-        Ok(state.generation)
+        Ok(self.generation.load(Ordering::Relaxed))
     }
 
     pub fn latest_tick(&self) -> BevyBridgeResult<Option<Tick>> {

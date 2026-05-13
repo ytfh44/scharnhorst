@@ -2,16 +2,11 @@ use scharnhorst_arrow_store::{ArrowStore, WorldSnapshot};
 use scharnhorst_query::engine::QueryEngine;
 use scharnhorst_scheduler::refresh_signal::{RefreshCallback, RefreshSignalHandle};
 use scharnhorst_scheduler::Scheduler;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::error::{BevyBridgeError, BevyBridgeResult};
 use crate::sync::ViewModel;
-
-#[derive(Debug)]
-struct RefreshHandlerState {
-    signal_received: bool,
-    last_snapshot_generation: u64,
-}
 
 #[derive(Debug, Clone)]
 pub struct SnapshotRefreshHandler {
@@ -19,7 +14,8 @@ pub struct SnapshotRefreshHandler {
     query_engine: Arc<QueryEngine>,
     #[allow(dead_code)]
     arrow_store: Arc<ArrowStore>,
-    state: Arc<Mutex<RefreshHandlerState>>,
+    signal_received: Arc<AtomicBool>,
+    last_snapshot_generation: Arc<AtomicU64>,
 }
 
 impl SnapshotRefreshHandler {
@@ -32,72 +28,44 @@ impl SnapshotRefreshHandler {
             view_model,
             query_engine,
             arrow_store,
-            state: Arc::new(Mutex::new(RefreshHandlerState {
-                signal_received: false,
-                last_snapshot_generation: 0,
-            })),
+            signal_received: Arc::new(AtomicBool::new(false)),
+            last_snapshot_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn on_refresh_signal(&self) -> BevyBridgeResult<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|e| BevyBridgeError::LockPoisoned(e.to_string()))?;
-        state.signal_received = true;
+        self.signal_received.store(true, Ordering::Release);
         Ok(())
     }
 
     pub fn should_refresh(&self) -> BevyBridgeResult<bool> {
-        self.state
-            .lock()
-            .map(|s| s.signal_received)
-            .map_err(|e| BevyBridgeError::LockPoisoned(e.to_string()))
+        Ok(self.signal_received.load(Ordering::Acquire))
     }
 
     pub fn refresh_snapshot(
         &self,
         new_snapshot: WorldSnapshot,
     ) -> BevyBridgeResult<()> {
-        let generation = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|e| BevyBridgeError::LockPoisoned(e.to_string()))?;
-            state.last_snapshot_generation += 1;
-            state.last_snapshot_generation
-        };
+        let generation = self.last_snapshot_generation.fetch_add(1, Ordering::Relaxed) + 1;
 
         self.view_model
             .refresh(Arc::new(new_snapshot), generation)?;
 
-        {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|e| BevyBridgeError::LockPoisoned(e.to_string()))?;
-            state.signal_received = false;
-        }
+        self.signal_received.store(false, Ordering::Release);
 
         Ok(())
     }
 
     pub fn current_generation(&self) -> BevyBridgeResult<u64> {
-        self.state
-            .lock()
-            .map(|s| s.last_snapshot_generation)
-            .map_err(|e| BevyBridgeError::LockPoisoned(e.to_string()))
+        Ok(self.last_snapshot_generation.load(Ordering::Relaxed))
     }
 
     pub fn callback(&self) -> RefreshCallback {
         let vm = Arc::clone(&self.view_model);
         let qe = Arc::clone(&self.query_engine);
-        let state = Arc::clone(&self.state);
+        let sig = Arc::clone(&self.signal_received);
+        let gen = Arc::clone(&self.last_snapshot_generation);
         Arc::new(move |tick, _generation| {
-            // Obtain WorldSnapshot through query-engine (DC-10 compliant path).
-            // The snapshot was pushed into query-engine during journal.commit()
-            // via store_world_snapshot(). The tick parameter is ignored since
-            // query_engine.snapshot() returns whatever was most recently stored.
             let _ = tick;
             let snapshot = qe
                 .snapshot()
@@ -105,23 +73,14 @@ impl SnapshotRefreshHandler {
                     scharnhorst_scheduler::error::SchedulerError::Generic(e.to_string())
                 })?;
 
-            let new_gen = {
-                let mut s = state.lock().map_err(|e| {
-                    scharnhorst_scheduler::error::SchedulerError::Generic(e.to_string())
-                })?;
-                s.last_snapshot_generation += 1;
-                s.last_snapshot_generation
-            };
+            let new_gen = gen.fetch_add(1, Ordering::Relaxed) + 1;
 
             vm.refresh(snapshot, new_gen)
                 .map_err(|e| {
                     scharnhorst_scheduler::error::SchedulerError::Generic(e.to_string())
                 })?;
 
-            let mut s = state.lock().map_err(|e| {
-                scharnhorst_scheduler::error::SchedulerError::Generic(e.to_string())
-            })?;
-            s.signal_received = false;
+            sig.store(false, Ordering::Release);
             Ok(())
         })
     }

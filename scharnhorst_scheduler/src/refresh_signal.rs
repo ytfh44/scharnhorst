@@ -86,21 +86,24 @@ impl RefreshSignalBus {
  ///
  /// Returns `Ok()` only if every consumer acknowledges successfully.
     pub fn broadcast(&self, tick: u64, generation: u64) -> SchedulerResult<()> {
-        let consumers = self
-            .consumers
-            .lock()
-            .map_err(|e| SchedulerError::Generic(format!("refresh signal lock poisoned: {e}")))?;
-        consumers
-            .iter()
-            .map(|(name, cb)| {
-                cb(tick, generation)
-                    .map_err(|e| SchedulerError::RefreshSignalFailed {
+        let snapshot: Vec<(String, RefreshCallback)> = {
+            let consumers = self
+                .consumers
+                .lock()
+                .map_err(|e| SchedulerError::Generic(format!("refresh signal lock poisoned: {e}")))?;
+            consumers
+                .iter()
+                .map(|(name, cb)| (name.clone(), Arc::clone(cb)))
+                .collect()
+        };
+        for (name, cb) in &snapshot {
+            cb(tick, generation)
+                .map_err(|e| SchedulerError::RefreshSignalFailed {
                     consumer: name.clone(),
                     source: Box::new(e),
-                })
-            })
-            .collect::<SchedulerResult<Vec<()>>>()
-            .map(|_| ())
+                })?;
+        }
+        Ok(())
     }
 
  /// Returns the names of all currently registered consumers.

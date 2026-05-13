@@ -14,6 +14,10 @@ pub struct Tick(
 impl Tick {
     pub const ZERO: Self = Self(0);
 
+ /// Maximum valid tick value. `u64::MAX` is reserved as a sentinel
+ /// for "no tick" in atomic storage contexts (e.g. QueryEngine `latest_tick`).
+    pub const MAX: Self = Self(u64::MAX - 1);
+
  /// Access the inner `u64` value.
     pub fn as_u64(self) -> u64 {
         self.0

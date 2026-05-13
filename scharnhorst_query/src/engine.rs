@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc, RwLock};
 
 use arrow_array::RecordBatch;
 use scharnhorst_arrow_store::SnapshotIngestor;
@@ -30,7 +30,8 @@ pub struct QueryEngine {
     inspector: Arc<RwLock<InspectorConsole>>,
     debug_journal: Arc<DebugWriteJournal>,
  /// In-memory cache of the latest tick for which we have snapshot data.
-    latest_tick: Arc<RwLock<Option<Tick>>>,
+ /// INVARIANT: u64::MAX is reserved as the None sentinel.
+    latest_tick: Arc<AtomicU64>,
  /// Cached table views keyed by table name (populated on read).
     view_cache: Arc<RwLock<HashMap<String, TableReadView>>>,
  /// Cached reference to the latest WorldSnapshot, pushed via store_world_snapshot()
@@ -46,7 +47,7 @@ impl QueryEngine {
             sql_context: Arc::new(RwLock::new(SqlExecutionContext::new())),
             inspector: Arc::new(RwLock::new(inspector)),
             debug_journal: Arc::new(DebugWriteJournal::default()),
-            latest_tick: Arc::new(RwLock::new(None)),
+            latest_tick: Arc::new(AtomicU64::new(u64::MAX)),
             view_cache: Arc::new(RwLock::new(HashMap::new())),
             latest_snapshot: Arc::new(RwLock::new(None)),
         }
@@ -135,6 +136,12 @@ impl QueryEngine {
  // Snapshot ingestion (bridging from arrow_store)
  // ------------------------------------------------------------------
 
+    /// ORDERING INVARIANT: Readers MUST load `latest_tick()` BEFORE
+ /// acquiring the `view_cache` read lock. Violating this order may
+ /// cause stale cache data to be attributed to a newer tick.
+ ///
+ /// SENTINEL: `u64::MAX` is reserved. `tick.as_u64()` must never equal
+ /// `u64::MAX` (see [`Tick::MAX`]).
     pub fn ingest_snapshot(
         &self,
         tick: Tick,
@@ -142,6 +149,8 @@ impl QueryEngine {
         batches: Vec<RecordBatch>,
         position_map: RowPositionMap,
     ) -> QueryResult<()> {
+        debug_assert!(tick.as_u64() != u64::MAX, "Tick sentinel collision");
+
         let schema = self.table_schema(table_name)?;
         let view = TableReadView::new(table_name, tick, batches, Arc::new(schema), Some(position_map));
 
@@ -151,20 +160,26 @@ impl QueryEngine {
             .map_err(|_| QueryError::UnifiedRead("poisoned lock".to_owned()))?;
         cache.insert(table_name.to_owned(), view);
 
-        let mut latest = self
-            .latest_tick
-            .write()
-            .map_err(|_| QueryError::UnifiedRead("poisoned lock".to_owned()))?;
-        *latest = Some(tick);
+        self.latest_tick.store(tick.as_u64(), Ordering::Release);
 
         Ok(())
     }
 
+ /// Returns the latest tick for which snapshot data is available.
+ ///
+ /// NOTE: The (Release) store in [`ingest_snapshot`] pairs with this
+ /// (Acquire) load. To maintain the ordering invariant, call this
+ /// method BEFORE reading `view_cache`.
+ ///
+ /// INVARIANT: `u64::MAX` is reserved as the `None` sentinel.
+ /// Returns `None` when no snapshot has been ingested yet.
     pub fn latest_tick(&self) -> QueryResult<Option<Tick>> {
-        self.latest_tick
-            .read()
-            .map(|g| *g)
-            .map_err(|_| QueryError::UnifiedRead("poisoned lock".to_owned()))
+        let raw = self.latest_tick.load(Ordering::Acquire);
+        if raw == u64::MAX {
+            Ok(None)
+        } else {
+            Ok(Some(Tick(raw)))
+        }
     }
 
  /// Store the latest WorldSnapshot produced during journal.commit().

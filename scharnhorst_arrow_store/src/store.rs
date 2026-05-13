@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufWriter;
-use std::sync::{Arc, RwLock};
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, RwLock};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder,
@@ -10,6 +10,7 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use arrow::ipc::writer::FileWriter;
+use dashmap::DashMap;
 use arrow_array::types::{
     Float64Type, Int32Type, Int64Type, UInt64Type,
 };
@@ -25,7 +26,7 @@ use crate::snapshot::WorldSnapshot;
 use crate::versioned_table::{MutationMode, VersionedTable};
 
 // ------------------------------------------------------------------
-// Type Registry 鈥?extensible Arrow data-type mapping
+// Type Registry extensible Arrow data-type mapping
 // ------------------------------------------------------------------
 
 /// Factory that converts a JSON value to a single-element Arrow array.
@@ -196,35 +197,31 @@ fn default_type_registry() -> TypeRegistry {
     reg
 }
 
-/// Thread-safe wrapper around the raw ArrowStore state.
+/// Concurrent Arrow store with per-table locking via DashMap.
 ///
-/// All mutable operations acquire a write lock; read-only operations
-/// acquire a read lock. This makes `ArrowStore` safe to share across
-/// threads (e.g. inside an `Arc`) without data races.
-#[derive(Debug, Clone, Default)]
-pub struct ArrowStore {
-    inner: Arc<RwLock<ArrowStoreInner>>,
-}
-
+/// Tables are stored in a `DashMap` with per-entry `Arc<RwLock<VersionedTable>>`,
+/// enabling concurrent read/write access to different tables without a global lock.
 #[derive(Debug, Clone)]
-pub struct ArrowStoreInner {
-    tables: HashMap<String, VersionedTable>,
-    table_id_map: HashMap<TableId, String>,
-    snapshots: HashMap<Tick, Arc<WorldSnapshot>>,
-    next_table_id: u64,
-    generation: u64,
-    type_registry: TypeRegistry,
+pub struct ArrowStore {
+    tables: Arc<DashMap<String, Arc<RwLock<VersionedTable>>>>,
+    table_id_map: Arc<DashMap<TableId, String>>,
+    snapshots: Arc<DashMap<Tick, Arc<WorldSnapshot>>>,
+    next_table_id: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+    type_registry: Arc<RwLock<TypeRegistry>>,
+    create_drop_lock: Arc<Mutex<()>>,
 }
 
-impl Default for ArrowStoreInner {
+impl Default for ArrowStore {
     fn default() -> Self {
         Self {
-            tables: HashMap::new(),
-            table_id_map: HashMap::new(),
-            snapshots: HashMap::new(),
-            next_table_id: 0,
-            generation: 0,
-            type_registry: default_type_registry(),
+            tables: Arc::new(DashMap::new()),
+            table_id_map: Arc::new(DashMap::new()),
+            snapshots: Arc::new(DashMap::new()),
+            next_table_id: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(0)),
+            type_registry: Arc::new(RwLock::new(default_type_registry())),
+            create_drop_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -246,21 +243,9 @@ impl ArrowStore {
         json_to_array: JsonToArrayFn,
         null_array: NullArrayFn,
     ) -> ArrowStoreResult<()> {
-        let mut inner = self.write("register_type")?;
-        inner.type_registry.register(name, data_type, json_to_array, null_array);
+        let mut reg = self.type_registry.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+        reg.register(name, data_type, json_to_array, null_array);
         Ok(())
-    }
-
-    fn read(&self, _operation: &str) -> ArrowStoreResult<std::sync::RwLockReadGuard<'_, ArrowStoreInner>> {
-        self.inner
-            .read()
-            .map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))
-    }
-
-    fn write(&self, _operation: &str) -> ArrowStoreResult<std::sync::RwLockWriteGuard<'_, ArrowStoreInner>> {
-        self.inner
-            .write()
-            .map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))
     }
 
  // ------------------------------------------------------------------
@@ -272,62 +257,57 @@ impl ArrowStore {
         spec: &TableSpec,
         mode: MutationMode,
     ) -> ArrowStoreResult<TableId> {
-        let mut inner = self.write("create_table")?;
-        if inner.tables.contains_key(&spec.name) {
+        let _guard = self.create_drop_lock.lock().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+        if self.tables.contains_key(&spec.name) {
             return Err(ArrowStoreError::TableAlreadyExists(spec.name.clone()));
         }
 
-        let id = TableId::new(inner.next_table_id);
-        inner.next_table_id += 1;
+        let id_val = self.next_table_id.fetch_add(1, Ordering::Relaxed);
+        let id = TableId::new(id_val);
 
         let mut table = VersionedTable::new(&spec.name, mode);
         table.set_spec(spec.clone());
-        inner.tables.insert(spec.name.clone(), table);
-        if inner.table_id_map.contains_key(&id) {
-            return Err(ArrowStoreError::TableAlreadyExists(
-                format!("table id {:?} already mapped", id),
-            ));
-        }
-        inner.table_id_map.insert(id, spec.name.clone());
+
+        self.tables.insert(spec.name.clone(), Arc::new(RwLock::new(table)));
+        self.table_id_map.insert(id, spec.name.clone());
         Ok(id)
     }
 
     pub fn drop_table(&self, name: &str) -> ArrowStoreResult<()> {
-        let mut inner = self.write("drop_table")?;
-        let id = inner
-            .table_id_map
-            .iter()
-            .find(|(_, n)| *n == name)
-            .map(|(id, _)| *id);
+        let _guard = self.create_drop_lock.lock().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+        let id_to_remove = self.table_id_map.iter()
+            .find(|entry| entry.value() == name)
+            .map(|entry| *entry.key());
 
-        if let Some(id) = id {
-            inner.table_id_map.remove(&id);
+        if let Some(id) = id_to_remove {
+            self.table_id_map.remove(&id);
         }
 
-        inner
-            .tables
+        self.tables
             .remove(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
         Ok(())
     }
 
     pub fn get_table(&self, name: &str) -> ArrowStoreResult<VersionedTable> {
-        let inner = self.read("get_table")?;
-        inner
-            .tables
+        let lock = self.tables
             .get(name)
-            .cloned()
-            .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))
+            .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let table = lock.read().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+        Ok(table.clone())
     }
 
+    /// Returns the names of all tables currently in the store.
+ ///
+ /// NOTE: Returns a best-effort snapshot. Under concurrent mutations
+ /// (rare), the result may include recently-created tables or omit
+ /// recently-dropped tables.
     pub fn table_names(&self) -> ArrowStoreResult<Vec<String>> {
-        let inner = self.read("table_names")?;
-        Ok(inner.tables.keys().cloned().collect())
+        Ok(self.tables.iter().map(|entry| entry.key().clone()).collect())
     }
 
     pub fn table_count(&self) -> ArrowStoreResult<usize> {
-        let inner = self.read("table_count")?;
-        Ok(inner.tables.len())
+        Ok(self.tables.len())
     }
 
  // ------------------------------------------------------------------
@@ -335,21 +315,19 @@ impl ArrowStore {
  // ------------------------------------------------------------------
 
     pub fn set_mutation_mode(&self, name: &str, mode: MutationMode) -> ArrowStoreResult<()> {
-        let mut inner = self.write("set_mutation_mode")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get_mut(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         table.mutation_mode = mode;
         Ok(())
     }
 
     pub fn mutation_mode(&self, name: &str) -> ArrowStoreResult<MutationMode> {
-        let inner = self.read("mutation_mode")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let table = lock.read().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         Ok(table.mutation_mode())
     }
 
@@ -363,11 +341,10 @@ impl ArrowStore {
         tick: Tick,
         batches: Vec<RecordBatch>,
     ) -> ArrowStoreResult<()> {
-        let mut inner = self.write("append_batches")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get_mut(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         let entry = table.versions.entry(tick).or_default();
         entry.extend(batches);
         Ok(())
@@ -383,11 +360,10 @@ impl ArrowStore {
         if locations.is_empty() {
             return Ok(());
         }
-        let mut inner = self.write("patch_rows")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get_mut(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         let versions = table
             .versions
             .get_mut(&tick)
@@ -421,11 +397,10 @@ impl ArrowStore {
         tick: Tick,
         batches: Vec<RecordBatch>,
     ) -> ArrowStoreResult<()> {
-        let mut inner = self.write("rebuild_table")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get_mut(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
 
         table.position_map = RowPositionMap::new();
         let mut per_table_counter: u64 = 0;
@@ -446,13 +421,20 @@ impl ArrowStore {
  // Snapshot generation & retrieval
  // ------------------------------------------------------------------
 
+ /// Generate a snapshot at the given tick.
+ ///
+ /// IMPORTANT: Cross-table consistency is not guaranteed when called
+ /// concurrently with mutating operations (`create_table`, `drop_table`,
+ /// `apply_diffs`). Within the sequential scheduler commit path, this
+ /// constraint is trivially satisfied.
     pub fn generate_snapshot(&self, tick: Tick) -> ArrowStoreResult<Arc<WorldSnapshot>> {
-        let mut inner = self.write("generate_snapshot")?;
-        inner.generation += 1;
+        self.generation.fetch_add(1, Ordering::Relaxed);
         let mut snapshot = WorldSnapshot::new(tick);
 
-        for (name, table) in &inner.tables {
-            snapshot.register_table(name, Arc::new(table.clone()));
+        for entry in self.tables.iter() {
+            let table = entry.value().read().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+            let name = entry.key().clone();
+            snapshot.register_table(&name, Arc::new(table.clone()));
 
             for region_id in table.partitions().region_ids() {
                 let partition = table.partitions().get(region_id)?;
@@ -461,38 +443,42 @@ impl ArrowStore {
                     tick,
                     partition.batches().to_vec(),
                 );
-                snapshot.register_partition_snapshot(name, ps);
+                snapshot.register_partition_snapshot(&name, ps);
             }
         }
 
         let arc = Arc::new(snapshot);
-        inner.snapshots.insert(tick, arc.clone());
+        self.snapshots.insert(tick, arc.clone());
         Ok(arc)
     }
 
     pub fn get_snapshot(&self, tick: Tick) -> ArrowStoreResult<Arc<WorldSnapshot>> {
-        let inner = self.read("get_snapshot")?;
-        inner
-            .snapshots
+        self.snapshots
             .get(&tick)
-            .cloned()
+            .map(|r| r.value().clone())
             .ok_or(ArrowStoreError::SnapshotNotFound(tick.as_u64()))
     }
 
+    /// Returns the latest snapshot if any exists.
+ ///
+ /// NOTE: Returns a best-effort snapshot. Under concurrent mutations,
+ /// the result may not reflect the most recently committed snapshot.
     pub fn latest_snapshot(&self) -> ArrowStoreResult<Option<Arc<WorldSnapshot>>> {
-        let inner = self.read("latest_snapshot")?;
-        let latest = inner
-            .snapshots
-            .keys()
-            .copied()
+        let latest = self.snapshots
+            .iter()
+            .map(|entry| *entry.key())
             .max()
-            .and_then(|tick| inner.snapshots.get(&tick).cloned());
+            .and_then(|tick| self.snapshots.get(&tick).map(|r| r.value().clone()));
         Ok(latest)
     }
 
+    /// Returns the ticks of all stored snapshots.
+ ///
+ /// NOTE: Returns a best-effort snapshot. Under concurrent mutations,
+ /// the result may be inconsistent (e.g. include a snapshot created
+ /// concurrently or omit one being created/destroyed).
     pub fn snapshot_ticks(&self) -> ArrowStoreResult<Vec<Tick>> {
-        let inner = self.read("snapshot_ticks")?;
-        Ok(inner.snapshots.keys().copied().collect())
+        Ok(self.snapshots.iter().map(|entry| *entry.key()).collect())
     }
 
  // ------------------------------------------------------------------
@@ -501,11 +487,10 @@ impl ArrowStore {
 
     pub fn build_primary_key_index(&self, name: &str) -> ArrowStoreResult<()> {
         let pk_name = {
-            let inner = self.read("build_primary_key_index.read_spec")?;
-            let table = inner
-                .tables
+            let lock = self.tables
                 .get(name)
                 .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+            let table = lock.read().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
             let spec = table
                 .spec()
                 .ok_or_else(|| ArrowStoreError::Schema("no table spec for PK index".into()))?;
@@ -515,11 +500,10 @@ impl ArrowStore {
             pk_col.name.clone()
         };
 
-        let mut inner = self.write("build_primary_key_index.build_index")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get_mut(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         table.primary_key_index = PrimaryKeyIndex::new();
 
         let versions: Vec<(Tick, Vec<RecordBatch>)> = table
@@ -552,11 +536,10 @@ impl ArrowStore {
         column: &str,
         target_table: &str,
     ) -> ArrowStoreResult<()> {
-        let mut inner = self.write("build_foreign_key_index")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get_mut(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         let mut fk_idx = ForeignKeyIndex::new(column, target_table);
 
         for (&tick, batches) in &table.versions {
@@ -576,20 +559,18 @@ impl ArrowStore {
     }
 
     pub fn primary_key_index(&self, name: &str) -> ArrowStoreResult<PrimaryKeyIndex> {
-        let inner = self.read("primary_key_index")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let table = lock.read().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         Ok(table.primary_key_index().clone())
     }
 
     pub fn foreign_key_indices(&self, name: &str) -> ArrowStoreResult<Vec<ForeignKeyIndex>> {
-        let inner = self.read("foreign_key_indices")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let table = lock.read().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         Ok(table.foreign_key_indices().to_vec())
     }
 
@@ -598,11 +579,10 @@ impl ArrowStore {
  // ------------------------------------------------------------------
 
     pub fn partition_map(&self, name: &str) -> ArrowStoreResult<PartitionMap> {
-        let inner = self.read("partition_map")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let table = lock.read().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         Ok(table.partitions().clone())
     }
 
@@ -610,11 +590,10 @@ impl ArrowStore {
     where
         F: FnOnce(&mut PartitionMap) -> R,
     {
-        let mut inner = self.write("partition_map_mut")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get_mut(name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         Ok(f(table.partitions_mut()))
     }
 
@@ -623,11 +602,10 @@ impl ArrowStore {
         table_name: &str,
         region_id: &str,
     ) -> ArrowStoreResult<crate::partition::Partition> {
-        let inner = self.read("get_partition")?;
-        let table = inner
-            .tables
+        let lock = self.tables
             .get(table_name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
+        let table = lock.read().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         table.partitions().get(region_id).cloned()
     }
 
@@ -636,15 +614,14 @@ impl ArrowStore {
  // ------------------------------------------------------------------
 
     pub fn write_checkpoint(&self, tick: Tick) -> ArrowStoreResult<()> {
-        let inner = self.read("write_checkpoint")?;
-        let snapshot = match inner.snapshots.get(&tick) {
-            Some(s) => s,
+        let snapshot = match self.snapshots.get(&tick) {
+            Some(s) => s.value().clone(),
             None => {
-                let latest = inner
-                    .snapshots
-                    .keys()
+                let latest = self.snapshots
+                    .iter()
+                    .map(|entry| *entry.key())
                     .max()
-                    .and_then(|k| inner.snapshots.get(k));
+                    .and_then(|k| self.snapshots.get(&k).map(|r| r.value().clone()));
                 match latest {
                     Some(s) => s,
                     None => return Ok(()),
@@ -749,52 +726,39 @@ impl ArrowStore {
             )));
         }
 
- // Step 2: Acquire write lock, create tables if needed,
- // insert data, and generate snapshot all in one critical section.
-        let mut inner = self.write("load_checkpoint")?;
+ // Step 2: Insert data per-table and generate snapshot.
         for (name, batches) in table_batches {
-            inner
-                .tables
+            self.tables
                 .entry(name.clone())
-                .or_insert_with(|| VersionedTable::new(&name, MutationMode::AppendOnly));
-            let table = inner
-                .tables
+                .or_insert_with(|| Arc::new(RwLock::new(VersionedTable::new(&name, MutationMode::AppendOnly))));
+            let lock = self.tables
                 .get_mut(&name)
                 .ok_or_else(|| ArrowStoreError::TableNotFound(name.clone()))?;
+            let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
             table.versions.insert(tick, batches);
         }
 
- // Inline snapshot generation -- cannot call generate_snapshot
- // while holding the write lock (RwLock is not reentrant).
-        inner.generation += 1;
-        let mut snapshot = WorldSnapshot::new(tick);
-        for (name, table) in &inner.tables {
-            snapshot.register_table(name, Arc::new(table.clone()));
-            for region_id in table.partitions().region_ids() {
-                let partition = table.partitions().get(region_id)?;
-                let ps =
-                    PartitionSnapshot::new(region_id, tick, partition.batches().to_vec());
-                snapshot.register_partition_snapshot(name, ps);
-            }
-        }
-        let arc = Arc::new(snapshot);
-        inner.snapshots.insert(tick, arc.clone());
-        Ok(arc)
+        self.generate_snapshot(tick)
     }
 
+    /// Truncate all snapshots and table versions before the given tick.
+ ///
+ /// IMPORTANT: Must not run concurrently with `generate_snapshot()`.
+ /// Running both concurrently may produce corrupted snapshots referencing
+ /// deleted versions. Within the sequential scheduler commit path, this
+ /// constraint is trivially satisfied.
     pub fn truncate_before(&self, tick: Tick) -> ArrowStoreResult<()> {
-        let mut inner = self.write("truncate_before")?;
-        inner.snapshots.retain(|&t, _| t >= tick);
+        self.snapshots.retain(|&t, _| t >= tick);
 
-        for table in inner.tables.values_mut() {
+        for entry in self.tables.iter_mut() {
+            let mut table = entry.value().write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
             table.versions.retain(|&t, _| t >= tick);
         }
         Ok(())
     }
 
     pub fn generation(&self) -> ArrowStoreResult<u64> {
-        let inner = self.read("generation")?;
-        Ok(inner.generation)
+        Ok(self.generation.load(Ordering::Relaxed))
     }
 
  // ------------------------------------------------------------------
@@ -802,323 +766,100 @@ impl ArrowStore {
  // ------------------------------------------------------------------
 
     pub fn apply_diffs(&self, tick: Tick, diffs: &[Diff]) -> ArrowStoreResult<()> {
-        let mut inner = self.write("apply_diffs")?;
-        inner.apply_diffs(tick, diffs)
-    }
-}
-
-// ------------------------------------------------------------------
-// ArrowStoreInner diff application
-// ------------------------------------------------------------------
-
-impl ArrowStoreInner {
-    pub fn apply_diffs(&mut self, tick: Tick, diffs: &[Diff]) -> ArrowStoreResult<()> {
         for diff in diffs {
             match diff {
                 Diff::Update { table, row, column, value } => {
-                    self.apply_update(tick, table, row, column, value)?;
+                    self.apply_diff_update(tick, table, row, column, value)?;
                 }
                 Diff::Insert { table, row, values } => {
-                    self.apply_insert(tick, table, row, values)?;
+                    self.apply_diff_insert(tick, table, row, values)?;
                 }
                 Diff::Delete { table, row } => {
-                    self.apply_delete(tick, table, row)?;
+                    self.apply_diff_delete(tick, table, row)?;
                 }
                 Diff::ReplaceTable { table, rows } => {
-                    self.apply_replace(tick, table, rows)?;
+                    self.apply_diff_replace(tick, table, rows)?;
                 }
             }
         }
         Ok(())
     }
+}
 
-    fn apply_update(
-        &mut self,
-        _tick: Tick,
+// ------------------------------------------------------------------
+// Diff application dispatchers — acquire per-table write lock once,
+// then delegate to free functions that operate on &mut VersionedTable
+// ------------------------------------------------------------------
+
+impl ArrowStore {
+    fn apply_diff_update(
+        &self,
+        tick: Tick,
         table_name: &str,
         row: &RowId,
         column: &str,
         value: &serde_json::Value,
     ) -> ArrowStoreResult<()> {
-        let (batch_idx, row_offset) = {
-            let table = self
-                .tables
-                .get(table_name)
-                .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
-            table
-                .position_map
-                .position_of(*row)
-                .ok_or_else(|| ArrowStoreError::Generic(format!(
-                    "row not found in position map: table={}, row_id={}",
-                    table_name, row.as_u64()
-                )))?
-        };
-
-        let loc_tick = {
-            let table = self
-                .tables
-                .get(table_name)
-                .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
-            let mut ticks: Vec<Tick> = table
-                .versions
-                .iter()
-                .filter(|(_, batches)| batches.len() > batch_idx)
-                .map(|(&t, _)| t)
-                .collect();
-            ticks.sort();
-            ticks
-                .into_iter()
-                .last()
-                .ok_or_else(|| ArrowStoreError::Generic(format!(
-                    "no tick found containing batch_idx {} for table {}",
-                    batch_idx, table_name
-                )))?
-        };
-
-        let (patch_batch, loc) = {
-            let table = self
-                .tables
-                .get(table_name)
-                .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
-            let batches = table
-                .versions
-                .get(&loc_tick)
-                .ok_or_else(|| ArrowStoreError::TickNotFound {
-                    table: table_name.to_owned(),
-                    tick: loc_tick.as_u64(),
-                })?;
-
-            if batch_idx >= batches.len() {
-                return Err(ArrowStoreError::Generic(format!(
-                    "batch index {} out of range for table {}",
-                    batch_idx, table_name
-                )));
-            }
-
-            if row_offset >= batches[batch_idx].num_rows() {
-                return Err(ArrowStoreError::Generic(format!(
-                    "row offset {} out of range in batch {}",
-                    row_offset, batch_idx
-                )));
-            }
-
-            let col_idx = batches[batch_idx]
-                .schema()
-                .index_of(column)
-                .map_err(|_| ArrowStoreError::Schema(format!(
-                    "column '{}' not found in table '{}'",
-                    column, table_name
-                )))?;
-
-            let p_batch = build_update_patch(&batches[batch_idx], row_offset, col_idx, value)?;
-
-            let rloc = RowLocation {
-                tick: loc_tick,
-                batch_index: batch_idx,
-                row_index: row_offset,
-                row_id: *row,
-            };
-            (p_batch, rloc)
-        };
-
-        self.patch_inner(table_name, loc.tick, &[loc], patch_batch)
-    }
-
-    fn apply_delete(
-        &mut self,
-        _tick: Tick,
-        table_name: &str,
-        row: &RowId,
-    ) -> ArrowStoreResult<()> {
-        let (batch_idx, row_offset) = {
-            let table = self
-                .tables
-                .get(table_name)
-                .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
-            table
-                .position_map
-                .position_of(*row)
-                .ok_or_else(|| ArrowStoreError::Generic(format!(
-                    "row not found in position map for delete: table={}, row_id={}",
-                    table_name, row.as_u64()
-                )))?
-        };
-
-        let loc_tick = {
-            let table = self
-                .tables
-                .get(table_name)
-                .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
-            let mut ticks: Vec<Tick> = table
-                .versions
-                .iter()
-                .filter(|(_, batches)| batches.len() > batch_idx)
-                .map(|(&t, _)| t)
-                .collect();
-            ticks.sort();
-            ticks
-                .into_iter()
-                .last()
-                .ok_or_else(|| ArrowStoreError::Generic(format!(
-                    "no tick found for delete: table={}, batch_idx={}",
-                    table_name, batch_idx
-                )))?
-        };
-
-        let (null_patch, loc) = {
-            let table = self
-                .tables
-                .get(table_name)
-                .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
-            let batches = table
-                .versions
-                .get(&loc_tick)
-                .ok_or_else(|| ArrowStoreError::TickNotFound {
-                    table: table_name.to_owned(),
-                    tick: loc_tick.as_u64(),
-                })?;
-
-            if batch_idx >= batches.len() || row_offset >= batches[batch_idx].num_rows() {
-                return Err(ArrowStoreError::Generic(format!(
-                    "invalid location for delete: batch={}, row={}",
-                    batch_idx, row_offset
-                )));
-            }
-
-            let n_patch = crate::versioned_table::build_null_patch(&batches[batch_idx], row_offset)?;
-
-            let rloc = RowLocation {
-                tick: loc_tick,
-                batch_index: batch_idx,
-                row_index: row_offset,
-                row_id: *row,
-            };
-            (n_patch, rloc)
-        };
-
-        self.patch_inner(table_name, loc.tick, &[loc], null_patch)?;
-
-        let table = self
+        let lock = self
             .tables
             .get_mut(table_name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
-        table.position_map.remove(row);
-
-        Ok(())
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+        apply_update_to_table(&mut table, table_name, tick, row, column, value)
     }
 
-    fn apply_insert(
-        &mut self,
+    fn apply_diff_delete(
+        &self,
+        tick: Tick,
+        table_name: &str,
+        row: &RowId,
+    ) -> ArrowStoreResult<()> {
+        let lock = self
+            .tables
+            .get_mut(table_name)
+            .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+        apply_delete_to_table(&mut table, table_name, tick, row)
+    }
+
+    fn apply_diff_insert(
+        &self,
         tick: Tick,
         table_name: &str,
         row: &RowId,
         values: &serde_json::Map<String, serde_json::Value>,
     ) -> ArrowStoreResult<()> {
- // Determine schema from spec or existing batches (immutable borrow only)
-        let schema = {
-            let table = self
-                .tables
-                .get(table_name)
-                .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
-            resolve_table_schema(table, values, &self.type_registry)?
-                .ok_or_else(|| ArrowStoreError::Schema(format!(
-                    "cannot determine schema for insert into table '{}'",
-                    table_name
-                )))?
-        };
-
-        let table = self
+        let type_reg = self.type_registry.read().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+        let lock = self
             .tables
             .get_mut(table_name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
-
-        let batch = json_map_to_record_batch(values, &schema, row)?;
-        let entry = table.versions.entry(tick).or_default();
-        entry.push(batch);
-
- // Also update PK index if it exists
-        let pk_col_name = table
-            .spec
-            .as_ref()
-            .and_then(|s| s.primary_key_column())
-            .map(|c| c.name.clone());
-
-        if let Some(ref pk_name) = pk_col_name {
-            if let Some(pk_value) = values.get(pk_name) {
-                let key = match pk_value {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                let batch_idx = entry.len().saturating_sub(1);
-                let row_idx_in_batch = 0usize;
-                table
-                    .primary_key_index
-                    .insert(key, tick, batch_idx, row_idx_in_batch);
-            }
-        }
-
- // Update RowPositionMap
-        let batch_idx = entry.len().saturating_sub(1);
-        let row_offset = 0usize;
-        table.position_map.insert(*row, batch_idx, row_offset);
-
-        Ok(())
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+        apply_insert_to_table(&mut table, table_name, tick, row, values, &type_reg)
     }
 
-    fn apply_replace(
-        &mut self,
+    fn apply_diff_replace(
+        &self,
         tick: Tick,
         table_name: &str,
         rows: &[serde_json::Map<String, serde_json::Value>],
     ) -> ArrowStoreResult<()> {
- // Determine schema from spec or first row (scoped borrow)
-        let schema = {
-            let table = self
-                .tables
-                .get(table_name)
-                .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
-            rows.first()
-                .and_then(|row| resolve_table_schema_from_map(table, row, &self.type_registry).ok())
-                .flatten()
-                .ok_or_else(|| ArrowStoreError::Schema(format!(
-                    "cannot determine schema for ReplaceTable on '{}'",
-                    table_name
-                )))?
-        };
-
-        let mut batches: Vec<RecordBatch> = Vec::with_capacity(rows.len());
-        for (i, row_map) in rows.iter().enumerate() {
-            let temp_row_id = RowId::new(i as u64);
-            let batch = json_map_to_record_batch(row_map, &schema, &temp_row_id)?;
-            batches.push(batch);
-        }
-
-        let table = self
+        let type_reg = self.type_registry.read().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+        let lock = self
             .tables
             .get_mut(table_name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
-
-        table.position_map = RowPositionMap::new();
-        let mut per_table_counter: u64 = 0;
-        for (batch_idx, batch) in batches.iter().enumerate() {
-            for offset in 0..batch.num_rows() {
-                table
-                    .position_map
-                    .insert(RowId::new(per_table_counter), batch_idx, offset);
-                per_table_counter += 1;
-            }
-        }
-
-        table.versions.insert(tick, batches);
-        Ok(())
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+        apply_replace_to_table(&mut table, table_name, tick, rows, &type_reg)
     }
 
-    fn ensure_primary_key_index(&mut self, table_name: &str) -> ArrowStoreResult<()> {
+    fn ensure_primary_key_index(&self, table_name: &str) -> ArrowStoreResult<()> {
         let pk_name = {
-            let table = self
+            let lock = self
                 .tables
                 .get(table_name)
                 .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
+            let table = lock.read().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
             let spec = table
                 .spec
                 .as_ref()
@@ -1129,10 +870,11 @@ impl ArrowStoreInner {
             pk_col.name.clone()
         };
 
-        let table = self
+        let lock = self
             .tables
             .get_mut(table_name)
             .ok_or_else(|| ArrowStoreError::TableNotFound(table_name.to_owned()))?;
+        let mut table = lock.write().map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
         table.primary_key_index = PrimaryKeyIndex::new();
 
         let versions: Vec<(Tick, Vec<RecordBatch>)> = table
@@ -1157,46 +899,267 @@ impl ArrowStoreInner {
         }
         Ok(())
     }
+}
 
-    fn patch_inner(
-        &mut self,
-        name: &str,
-        tick: Tick,
-        locations: &[RowLocation],
-        batch: RecordBatch,
-    ) -> ArrowStoreResult<()> {
-        if locations.is_empty() {
-            return Ok(());
-        }
-        let table = self
-            .tables
-            .get_mut(name)
-            .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
-        let versions = table
-            .versions
-            .get_mut(&tick)
-            .ok_or_else(|| ArrowStoreError::TickNotFound {
-                table: name.to_owned(),
-                tick: tick.as_u64(),
-            })?;
+// ------------------------------------------------------------------
+// Free functions — operate on &mut VersionedTable under a held lock
+// ------------------------------------------------------------------
 
-        let mut grouped: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-        for (patch_row_idx, loc) in locations.iter().enumerate() {
-            grouped
-                .entry(loc.batch_index)
-                .or_default()
-                .push((loc.row_index, patch_row_idx));
-        }
+fn apply_update_to_table(
+    table: &mut VersionedTable,
+    table_name: &str,
+    patch_tick: Tick,
+    row: &RowId,
+    column: &str,
+    value: &serde_json::Value,
+) -> ArrowStoreResult<()> {
+    let (batch_idx, row_offset) = table
+        .position_map
+        .position_of(*row)
+        .ok_or_else(|| ArrowStoreError::Generic(format!(
+            "row not found in position map: table={}, row_id={}",
+            table_name, row.as_u64()
+        )))?;
 
-        for (batch_idx, patches) in &grouped {
-            if *batch_idx >= versions.len() {
-                continue;
-            }
-            let patched = patch_record_batch(&versions[*batch_idx], &batch, patches)?;
-            versions[*batch_idx] = patched;
-        }
-        Ok(())
+    let mut ticks: Vec<Tick> = table
+        .versions
+        .iter()
+        .filter(|(_, batches)| batches.len() > batch_idx)
+        .map(|(&t, _)| t)
+        .collect();
+    ticks.sort();
+    let loc_tick = ticks
+        .into_iter()
+        .last()
+        .ok_or_else(|| ArrowStoreError::Generic(format!(
+            "no tick found containing batch_idx {} for table {}",
+            batch_idx, table_name
+        )))?;
+
+    let batches = table
+        .versions
+        .get(&loc_tick)
+        .ok_or_else(|| ArrowStoreError::TickNotFound {
+            table: table_name.to_owned(),
+            tick: loc_tick.as_u64(),
+        })?;
+
+    if batch_idx >= batches.len() {
+        return Err(ArrowStoreError::Generic(format!(
+            "batch index {} out of range for table {}",
+            batch_idx, table_name
+        )));
     }
+
+    if row_offset >= batches[batch_idx].num_rows() {
+        return Err(ArrowStoreError::Generic(format!(
+            "row offset {} out of range in batch {}",
+            row_offset, batch_idx
+        )));
+    }
+
+    let col_idx = batches[batch_idx]
+        .schema()
+        .index_of(column)
+        .map_err(|_| ArrowStoreError::Schema(format!(
+            "column '{}' not found in table '{}'",
+            column, table_name
+        )))?;
+
+    let patch_batch = build_update_patch(&batches[batch_idx], row_offset, col_idx, value)?;
+
+    let loc = RowLocation {
+        tick: loc_tick,
+        batch_index: batch_idx,
+        row_index: row_offset,
+        row_id: *row,
+    };
+
+    let _ = patch_tick;
+    apply_patch_to_versions(table, table_name, loc_tick, &[loc], patch_batch)
+}
+
+fn apply_delete_to_table(
+    table: &mut VersionedTable,
+    table_name: &str,
+    patch_tick: Tick,
+    row: &RowId,
+) -> ArrowStoreResult<()> {
+    let (batch_idx, row_offset) = table
+        .position_map
+        .position_of(*row)
+        .ok_or_else(|| ArrowStoreError::Generic(format!(
+            "row not found in position map for delete: table={}, row_id={}",
+            table_name, row.as_u64()
+        )))?;
+
+    let mut ticks: Vec<Tick> = table
+        .versions
+        .iter()
+        .filter(|(_, batches)| batches.len() > batch_idx)
+        .map(|(&t, _)| t)
+        .collect();
+    ticks.sort();
+    let loc_tick = ticks
+        .into_iter()
+        .last()
+        .ok_or_else(|| ArrowStoreError::Generic(format!(
+            "no tick found for delete: table={}, batch_idx={}",
+            table_name, batch_idx
+        )))?;
+
+    let batches = table
+        .versions
+        .get(&loc_tick)
+        .ok_or_else(|| ArrowStoreError::TickNotFound {
+            table: table_name.to_owned(),
+            tick: loc_tick.as_u64(),
+        })?;
+
+    if batch_idx >= batches.len() || row_offset >= batches[batch_idx].num_rows() {
+        return Err(ArrowStoreError::Generic(format!(
+            "invalid location for delete: batch={}, row={}",
+            batch_idx, row_offset
+        )));
+    }
+
+    let null_patch = crate::versioned_table::build_null_patch(&batches[batch_idx], row_offset)?;
+
+    let loc = RowLocation {
+        tick: loc_tick,
+        batch_index: batch_idx,
+        row_index: row_offset,
+        row_id: *row,
+    };
+
+    let _ = patch_tick;
+    apply_patch_to_versions(table, table_name, loc_tick, &[loc], null_patch)?;
+
+    table.position_map.remove(row);
+
+    Ok(())
+}
+
+fn apply_insert_to_table(
+    table: &mut VersionedTable,
+    table_name: &str,
+    tick: Tick,
+    row: &RowId,
+    values: &serde_json::Map<String, serde_json::Value>,
+    type_registry: &TypeRegistry,
+) -> ArrowStoreResult<()> {
+    let schema = resolve_table_schema(table, values, type_registry)?
+        .ok_or_else(|| ArrowStoreError::Schema(format!(
+            "cannot determine schema for insert into table '{}'",
+            table_name
+        )))?;
+
+    let pk_col_name = table
+        .spec
+        .as_ref()
+        .and_then(|s| s.primary_key_column())
+        .map(|c| c.name.clone());
+
+    let batch = json_map_to_record_batch(values, &schema, row)?;
+
+    {
+        let entry = table.versions.entry(tick).or_default();
+        entry.push(batch);
+    }
+
+    let batch_idx = table.versions.get(&tick)
+        .map(|v| v.len().saturating_sub(1))
+        .unwrap_or(0);
+    let row_offset = 0usize;
+
+    if let Some(ref pk_name) = pk_col_name {
+        if let Some(pk_value) = values.get(pk_name) {
+            let key = match pk_value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            table
+                .primary_key_index
+                .insert(key, tick, batch_idx, row_offset);
+        }
+    }
+
+    table.position_map.insert(*row, batch_idx, row_offset);
+
+    Ok(())
+}
+
+fn apply_replace_to_table(
+    table: &mut VersionedTable,
+    table_name: &str,
+    tick: Tick,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    type_registry: &TypeRegistry,
+) -> ArrowStoreResult<()> {
+    let schema = rows.first()
+        .and_then(|row| resolve_table_schema_from_map(table, row, type_registry).ok())
+        .flatten()
+        .ok_or_else(|| ArrowStoreError::Schema(format!(
+            "cannot determine schema for ReplaceTable on '{}'",
+            table_name
+        )))?;
+
+    let mut batches: Vec<RecordBatch> = Vec::with_capacity(rows.len());
+    for (i, row_map) in rows.iter().enumerate() {
+        let temp_row_id = RowId::new(i as u64);
+        let batch = json_map_to_record_batch(row_map, &schema, &temp_row_id)?;
+        batches.push(batch);
+    }
+
+    table.position_map = RowPositionMap::new();
+    let mut per_table_counter: u64 = 0;
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        for offset in 0..batch.num_rows() {
+            table
+                .position_map
+                .insert(RowId::new(per_table_counter), batch_idx, offset);
+            per_table_counter += 1;
+        }
+    }
+
+    table.versions.insert(tick, batches);
+    Ok(())
+}
+
+fn apply_patch_to_versions(
+    table: &mut VersionedTable,
+    table_name: &str,
+    tick: Tick,
+    locations: &[RowLocation],
+    batch: RecordBatch,
+) -> ArrowStoreResult<()> {
+    if locations.is_empty() {
+        return Ok(());
+    }
+    let versions = table
+        .versions
+        .get_mut(&tick)
+        .ok_or_else(|| ArrowStoreError::TickNotFound {
+            table: table_name.to_owned(),
+            tick: tick.as_u64(),
+        })?;
+
+    let mut grouped: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for (patch_row_idx, loc) in locations.iter().enumerate() {
+        grouped
+            .entry(loc.batch_index)
+            .or_default()
+            .push((loc.row_index, patch_row_idx));
+    }
+
+    for (batch_idx, patches) in &grouped {
+        if *batch_idx >= versions.len() {
+            continue;
+        }
+        let patched = patch_record_batch(&versions[*batch_idx], &batch, patches)?;
+        versions[*batch_idx] = patched;
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------

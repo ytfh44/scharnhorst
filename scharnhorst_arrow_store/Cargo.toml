@@ -12,6 +12,7 @@ scharnhorst_schema = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+dashmap = "6"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 

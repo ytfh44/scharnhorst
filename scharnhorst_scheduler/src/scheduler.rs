@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex};
 
 use scharnhorst_core::Tick;
 use scharnhorst_journal::command::CommandEnvelope;
@@ -36,11 +36,11 @@ pub struct Scheduler {
  /// Refresh signal bus for snapshot generation protocol.
     refresh_bus: RefreshSignalBus,
  /// Current simulation tick.
-    current_tick: Arc<Mutex<Tick>>,
+    current_tick: Arc<AtomicU64>,
  /// Current snapshot generation (monotonically increasing).
-    generation: Arc<Mutex<u64>>,
+    generation: Arc<AtomicU64>,
  /// Whether the scheduler has been initialized.
-    initialized: Arc<Mutex<bool>>,
+    initialized: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -55,8 +55,8 @@ impl std::fmt::Debug for Scheduler {
             .lock()
             .map(|m| m.len())
             .unwrap_or(0);
-        let tick = self.current_tick.lock().map(|g| *g).unwrap_or(Tick::ZERO);
-        let gen = self.generation.lock().map(|g| *g).unwrap_or(0);
+        let tick = Tick(self.current_tick.load(Ordering::Relaxed));
+        let gen = self.generation.load(Ordering::Relaxed);
         f.debug_struct("Scheduler")
             .field("system_count", &sys_count)
             .field("pending_commands", &cmd_count)
@@ -77,9 +77,9 @@ impl Scheduler {
             journal: Arc::new(Mutex::new(journal)),
             query_engine: Arc::new(query_engine),
             refresh_bus: RefreshSignalBus::new(),
-            current_tick: Arc::new(Mutex::new(Tick::ZERO)),
-            generation: Arc::new(Mutex::new(0)),
-            initialized: Arc::new(Mutex::new(false)),
+            current_tick: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(0)),
+            initialized: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -252,33 +252,30 @@ impl Scheduler {
     pub fn atomic_commit(&self) -> SchedulerResult<CommitResult> {
         let mut journal = self.lock_journal()?;
         let result = journal.commit()?;
-        let mut gen = self.lock_generation()?;
-        *gen = gen.saturating_add(1);
+        self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(result)
     }
 
  /// Broadcast the refresh signal to all registered consumers.
-    pub fn broadcast_refresh(&self, tick: Tick, generation: u64) -> SchedulerResult<()> {
-        self.refresh_bus.broadcast(tick.as_u64(), generation)
+    pub fn broadcast_refresh(&self, tick: Tick, state_hash: u64) -> SchedulerResult<()> {
+        self.refresh_bus.broadcast(tick.as_u64(), state_hash)
     }
 
  /// Advance the internal tick counter.
     pub fn advance_tick(&self) -> SchedulerResult<Tick> {
-        let mut tick = self.lock_tick()?;
-        *tick = tick.next();
-        Ok(*tick)
+        let prev = self.current_tick.fetch_add(1, Ordering::Relaxed);
+        Ok(Tick(prev).next())
     }
 
  /// Returns the current tick.
     pub fn current_tick(&self) -> SchedulerResult<Tick> {
-        let tick = self.lock_tick()?;
-        Ok(*tick)
+        let raw = self.current_tick.load(Ordering::Relaxed);
+        Ok(Tick(raw))
     }
 
  /// Returns the current snapshot generation.
     pub fn current_generation(&self) -> SchedulerResult<u64> {
-        let gen = self.lock_generation()?;
-        Ok(*gen)
+        Ok(self.generation.load(Ordering::Relaxed))
     }
 
  // ------------------------------------------------------------------
@@ -314,8 +311,7 @@ impl Scheduler {
  /// (3) registrations match system map, (4) no write conflicts within same phase.
  /// Safe to call multiple times 鈥?subsequent calls are no-ops.
     pub fn initialize(&self) -> SchedulerResult<()> {
-        let mut init = self.lock_initialized()?;
-        if *init {
+        if self.initialized.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -357,18 +353,17 @@ impl Scheduler {
             }
         }
 
-        for (_id, reg) in registrations.iter() {
-            let _phase_order = reg.phase.order_index();
+        for _reg in registrations.values() {
+            let _phase_order = _reg.phase.order_index();
         }
 
-        *init = true;
+        self.initialized.store(true, Ordering::Release);
         Ok(())
     }
 
  /// Returns true if the scheduler has been initialized.
     pub fn is_initialized(&self) -> SchedulerResult<bool> {
-        let init = self.lock_initialized()?;
-        Ok(*init)
+        Ok(self.initialized.load(Ordering::Acquire))
     }
 
  // ------------------------------------------------------------------
@@ -399,24 +394,6 @@ impl Scheduler {
         self.journal
             .lock()
             .map_err(|e| SchedulerError::Generic(format!("journal lock poisoned: {e}")))
-    }
-
-    fn lock_tick(&self) -> SchedulerResult<std::sync::MutexGuard<'_, Tick>> {
-        self.current_tick
-            .lock()
-            .map_err(|e| SchedulerError::Generic(format!("tick lock poisoned: {e}")))
-    }
-
-    fn lock_generation(&self) -> SchedulerResult<std::sync::MutexGuard<'_, u64>> {
-        self.generation
-            .lock()
-            .map_err(|e| SchedulerError::Generic(format!("generation lock poisoned: {e}")))
-    }
-
-    fn lock_initialized(&self) -> SchedulerResult<std::sync::MutexGuard<'_, bool>> {
-        self.initialized
-            .lock()
-            .map_err(|e| SchedulerError::Generic(format!("initialized lock poisoned: {e}")))
     }
 
  // ------------------------------------------------------------------
