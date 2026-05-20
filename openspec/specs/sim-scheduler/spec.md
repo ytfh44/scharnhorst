@@ -113,20 +113,21 @@ The following components MUST register for the REFRESH_SIGNAL:
 For any tick T, `snapshot_T = apply_diffs(snapshot_{T-1}, journal_diffs_T)` is identical across all platforms and runs, given the same initial state and command sequence.
 
 ### Requirement: System Registration with Dependency Graph
-Before the first tick, each simulation system MUST register with the scheduler, declaring:
-- **Read tables**: tables it will read via `query-engine`
-- **Write diffs**: the `Diff` types it may emit (e.g., `EconomySystem` emits `Diff::Update` on "economy" table)
-- **Refresh signal handler**: callback function for REFRESH_SIGNAL (if the system maintains any cache or derived state)
+Before `initialize()` is called, each simulation system MUST register with the scheduler, declaring:
 
-All simulation systems MUST access world state **exclusively through the `query-engine`** -- whether for semantic-aware reads, filtered scans, or direct column access. The query-engine is the **unified read interface** for all consumers (simulation systems, `bevy-bridge`, `rule-ir` evaluator). Internally, the query-engine may dispatch to different Arrow access strategies (direct column scan, index lookup, SQL plan) depending on the query type, allowing the Arrow layer to perform parallel optimizations without the caller needing to know the strategy used.
+- State tier classification: which state this system owns as Authority, Derived, or Ephemeral.
+- Read tables: tables it will read via `query-engine`. Non-Authority tables SHALL NOT be listed — systems SHOULD access Derived/Ephemeral state through their own internal stores.
+- Write tables: tables it will mutate (must be Authority, must go through journal diff submission).
+- Refresh signal handler: callback function for REFRESH_SIGNAL with generation payload.
 
-In **debug builds only**, a system MAY issue SQL `UPDATE`/`INSERT` statements through the `query-engine` SQL interface. These are intercepted by the `DebugWriteJournal` (see `query-engine` spec) and translated into journal diffs, preserving the single-write-entry-point invariant. This path is **disabled in production and multiplayer builds**.
+A system's declaration establishes its simulation capability boundary. A system owning authority tables SHALL declare itself as Authority and must write through journal diff submission. A system computing derived caches SHALL declare itself as Derived and must rebuild from query-engine reads. A system managing UI state SHALL declare itself as Ephemeral and must not access journal or ArrowStore.
 
-The scheduler uses registration data to:
-- Order phases topologically
-- Parallelize systems within a phase when write sets are disjoint (optimization -- sequential is always correct)
-- Detect conflicts (two systems writing to the same table in the same phase = error)
-- Build the REFRESH_SIGNAL recipient list
+All simulation systems MUST access Authority world state exclusively through the query-engine. Systems MUST NOT hold mutable references to Arrow tables, raw Arrow RecordBatch values, or partition internals. The query-engine is the unified read interface for all simulation consumers.
+
+#### Scenario: System declares state tier classification
+- **WHEN** a system is registered during scheduler initialization
+- **THEN** its state tier, read tables (none if Ephemeral), write tables (none if non-Authority), and refresh handler are recorded
+- **AND** the registration serves as compile-time-enforced documentation of the system's capability boundary
 
 ### Requirement: Scheduler Initialization Validation
 
@@ -141,6 +142,71 @@ Validation failures SHALL return `SchedulerError` with descriptive messages. The
 
 The `Scheduler::tick()` method SHALL NOT panic. All failure modes (lock poisoning, commit failure, consumer refresh failure) SHALL propagate as `SchedulerError` variants through `SchedulerResult`. Panicking via `.unwrap()` or `.expect()` on Mutex/RwLock acquisition is FORBIDDEN anywhere in the scheduler crate.
 
+### Requirement: Simulation Lifecycle Boundary
+The simulation SHALL have exactly two lifecycle modes: Initialization and Simulation. All state mutations SHALL occur in the Initialization phase. Authority state mutations during Simulation SHALL only occur through journal-committed diffs.
+
+#### Scenario: Initialization writes tables
+- **WHEN** `content-loader` compiles base and mod definitions
+- **THEN** it writes tables to `ArrowStore` through initialization capabilities
+- **AND** no journal diffs are involved
+
+#### Scenario: Simulation writes diffs
+- **WHEN** a simulation system computes an economy update
+- **THEN** it submits a diff through journal-system
+- **AND** the diff is committed at the tick boundary
+
+### Requirement: Refresh Signal Covers Non-Authority State
+`REFRESH_SIGNAL` broadcast SHALL notify consumers regardless of their state tier. Both Derived and Ephemeral consumers MAY register handlers. The generation payload enables query-engine consumers to validate tick-synchronous data access.
+
+#### Scenario: Derived consumer receives refresh
+- **WHEN** `journal.commit()` completes and `REFRESH_SIGNAL` broadcasts
+- **THEN** Derived state consumers receive the signal with the new generation number
+- **AND** they may rebuild caches from query-engine data for the new generation
+
+### Requirement: Tick-Commit Transactional Boundary
+The scheduler's `tick()` method SHALL enforce that each tick follows exactly one PreTick->Economy->Diplomacy->Military->PostTick sequence and exactly one commit. Between the start of `tick()` and the completion of `journal.commit()`, NO external system may inject commands, diffs, or simulation state into the running tick.
+
+#### Scenario: Atomic tick boundary
+- **WHEN** `scheduler.tick()` is called
+- **THEN** all consumer command buffers are drained at PreTick
+- **AND** phases execute sequentially
+- **AND** PostTick triggers a single commit
+- **AND** the commit completes before the next `tick()` call
+
+### Requirement: Deterministic RNG Across Platforms
+Each system's RNG stream SHALL produce identical values across different platforms (Windows, Linux, macOS) and CPU architectures (x86, ARM) for the same system_id and tick, provided the simulator and RNG algorithms are consistent. This enables multiplayer desync-proofing and deterministic replay on any platform.
+
+`deterministic_rng` SHALL use a fixed-endian seed encoding for the RNG state. Little-endian encoding SHALL be used on all platforms to ensure cross-platform identical output. The encoded seed bytes SHALL be the same regardless of the host platform's native byte order.
+
+#### Scenario: Cross-platform RNG consistency
+- **WHEN** a simulation runs tick 42 on Windows with `system_id = 7`
+- **THEN** the RNG output matches the same `(system_id=7, tick=42)` run on Linux and macOS
+- **AND** replay verification across platforms is guaranteed
+
+### Requirement: Registration Lifecycle Gate
+Before the first tick, each simulation system SHALL register with the scheduler. `register_system()` SHALL be callable from any thread via thread-safe data structures. `register_system()` called on an already-initialized scheduler (where `is_initialized() == true`) SHALL return `SchedulerError::AlreadyInitialized` to catch programming errors during debugging while being a recoverable error in production.
+
+The `run()` method SHALL require `is_initialized() == true` before executing ticks. Calling `run()` on an uninitialized scheduler SHALL return `SchedulerError::NotInitialized` rather than panicking. This TOCTOU-safe gate ensures systems are registered before simulation begins.
+
+#### Scenario: Late registration rejected
+- **WHEN** a system attempts to register after `initialize()` has completed
+- **THEN** `register_system()` returns `SchedulerError::AlreadyInitialized`
+- **AND** the scheduler state remains unchanged
+
+#### Scenario: Run without initialization rejected
+- **WHEN** `scheduler.run()` is called before `initialize()`
+- **THEN** `SchedulerError::NotInitialized` is returned
+- **AND** no ticks are executed
+
+### Requirement: Unregistration Cleans Refresh Bus
+When a system is removed from registration (e.g., mod unload or configuration change), the scheduler SHALL remove its refresh callback from the signal bus. Stale refresh callbacks referencing deallocated state or invalidated thread-local data SHALL NOT persist after unregistration. This prevents segmentation faults and use-after-free in the refresh broadcast loop.
+
+#### Scenario: Unregister removes stale callback
+- **WHEN** a system calls `unregister_system()`
+- **THEN** its refresh handler is removed from the signal bus
+- **AND** the next `REFRESH_SIGNAL` broadcast does not invoke the removed handler
+- **AND** no stale reference persists in the consumer list
+
 ---
 
 ## Invariants
@@ -153,6 +219,15 @@ The `Scheduler::tick()` method SHALL NOT panic. All failure modes (lock poisonin
 
 ### I-SCHED-BROADCAST-SNAPSHOT
 `RefreshSignalBus::broadcast()` operates on a cloned snapshot of the consumer list, making it safe for `register`/`unregister` to run concurrently.
+
+### I-SCHED-LIFECYCLE-GATE
+`register_system()` called on an already-initialized scheduler (`is_initialized() == true`) SHALL return `SchedulerError::AlreadyInitialized`. `run()` called before `initialize()` SHALL return `SchedulerError::NotInitialized`. Both gates are TOCTOU-safe: the `initialized` flag uses `Acquire`/`Release` ordering, and `run()` checks the flag on each call. This prevents simulation from starting with unregistered systems and catches late-registration programming errors.
+
+### I-SCHED-RNG-PLATFORM
+Each system's RNG stream produces identical values across Windows/Linux/macOS and x86/ARM for the same `(system_id, tick)` pair, provided the simulator and RNG algorithms are consistent. `deterministic_rng` uses little-endian seed encoding on all platforms, regardless of host native byte order. This enables multiplayer desync-proofing and cross-platform replay verification.
+
+### I-SCHED-UNREGISTER
+`unregister_system()` removes the system's refresh callback from the signal bus. After unregistration, `REFRESH_SIGNAL` broadcasts SHALL NOT invoke the removed handler. No stale callback reference persists in the consumer list. This prevents segmentation faults or use-after-free when systems are removed.
 
 ---
 

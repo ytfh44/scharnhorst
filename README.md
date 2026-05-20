@@ -34,7 +34,7 @@ Most game engines treat determinism as a nice-to-have — something you "try to 
 | `scharnhorst_rules` — expression evaluator, modifiers, scopes, effects | ✅ Stable |
 | `scharnhorst_bevy` — entity materialisation, input bridge, refresh sync | ✅ Stable |
 | `scharnhorst_integration_tests` | ✅ Exists |
-| **Phase 0** — Enforce invariants (single-write gate, tiered state, schema freeze) | ⬜ Not started |
+| **Phase 0** — Enforce invariants (single-write gate, tiered state, schema freeze) | ✅ Completed |
 | **Phase 1+** — Observability, rule diagnostics, mod pipeline, replay proof | ⬜ Not started |
 
 ---
@@ -105,7 +105,7 @@ The full roadmap is in [ROADMAP.md](./ROADMAP.md). High-level phases:
 
 | Phase | Theme | Status |
 |-------|-------|--------|
-| **0** | Fortify the invariants (type-system enforcement, tiered state, schema freeze) | ⬜ |
+| **0** | Fortify the invariants (type-system enforcement, tiered state, schema freeze) | ✅ |
 | **1** | Make the world observable (productionise query engine, SQL console, inspector panels, telemetry) | ⬜ |
 | **2** | Content language & rule diagnostics (source-anchored errors, static analysis, rule debugger) | ⬜ |
 | **3** | Mod & content pipeline (dependency resolution, overlay hardening, fingerprint-based tolerance) | ⬜ |

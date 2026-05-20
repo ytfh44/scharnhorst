@@ -29,44 +29,49 @@ The `InputCommandBuffer` SHALL accumulate player commands per frame and expose t
 - **THEN** the bridge stores all three commands; the scheduler pulls all three at tick start and submits them to the journal.
 
 ### Requirement: Read-Only Snapshot Access (query-engine, sim-scheduler)
+The `bevy-bridge` SHALL obtain committed world data via `query-engine` to drive entity materialization and view model synchronization. The bridge:
 
-The `bevy-bridge` SHALL obtain an immutable `WorldSnapshot` reference **via the `query-engine`** to drive ViewModel synchronization. The bridge:
 - MUST NOT hold mutable references to Arrow tables.
-- MUST NOT bypass the `journal-system` to write diffs.
-- MUST NOT reference Arrow `RecordBatch` or `Table` objects directly; all reads MUST go through `query-engine`.
-- MUST NOT query the `schema-registry`'s RelationGraph directly (accessed via `query-engine`).
-- SHALL refresh its snapshot reference **after** receiving the refresh signal from `sim-scheduler` (triggered by `journal.commit()` at tick boundary), discarding the prior snapshot.
+- MUST NOT bypass `journal-system` to write diffs.
+- MUST NOT reference raw Arrow `RecordBatch` or table internals directly.
+- MUST NOT query the schema-registry `RelationGraph` directly.
+- SHALL refresh read-only committed data after receiving `REFRESH_SIGNAL`.
+- SHALL treat Bevy ECS components, view models, hover state, animation state, and frame-local caches as Derived or Ephemeral state, not Authority state.
 
-#### Component Lifetime Constraint:
-All Bevy Component types defined in `scharnhorst_bevy` SHALL satisfy `Component: 'static`. Fields containing string data SHALL use `String` (owned heap-allocated) rather than `&'static str`. The `ViewOf` component SHALL store:
+**Component lifetime constraint:**
+All Bevy Component types defined in `scharnhorst_bevy` SHALL satisfy `Component: 'static`. Fields containing string data SHALL use owned `String` rather than borrowed `&'static str`. The `ViewOf` component SHALL store:
 - `row_id: RowId` (u64 wrapper -- `Copy`)
 - `table_name: String` (owned -- NOT `&'static str`)
 - `generation: u64`
 
 Using `&'static str` for component fields is FORBIDDEN because it either requires `Box::leak` (memory leak) or a global string interner (complexity). `String` is the correct choice for Bevy Component fields that hold textual data.
 
-#### REFRESH_SIGNAL Protocol
-
-The `bevy-bridge` registers a refresh handler with the `sim-scheduler`. The lifecycle is:
+**REFRESH_SIGNAL protocol:**
 
 ```
-T+0 (end of PostTick):
-1. sim-scheduler broadcasts REFRESH_SIGNAL
-2. bevy-bridge receives signal
+T+0 end of PostTick:
+1. sim-scheduler broadcasts REFRESH_SIGNAL.
+2. bevy-bridge receives signal.
 
-T+1 (before next frame sync):
-3. Bridge discards old snapshot reference (generation N)
-4. Bridge obtains new snapshot reference (generation N+1) via query-engine.get_snapshot()
-5. Entity synchronization proceeds with fresh snapshot
+T+1 before next frame sync:
+3. bridge discards old committed data handles.
+4. bridge obtains fresh read-only data via query-engine.
+5. entity synchronization proceeds with generation N+1 data.
 ```
 
-#### Refresh handler error handling:
+**Refresh handler error handling:**
 The refresh handler SHALL handle `Mutex`/`RwLock` poisoning as a **recoverable error**, not a panic. Panicking via `.expect()` or `.unwrap()` on lock acquisition is FORBIDDEN. Instead, the handler SHALL use `.map_err(|e| BevyBridgeError::LockPoisoned(e.to_string()))` to propagate the error through the scheduler's refresh signal protocol.
 
-This is consistent with:
-- DC-10's requirement that the scheduler SHALL NOT panic on invalid state
-- The `sync.rs` module's existing lock poisoning pattern
-- The error-preserving refresh signal semantics in `sim-scheduler`
+#### Scenario: Bridge reads after commit
+- **WHEN** `sim-scheduler` commits a tick and signals consumers
+- **THEN** the bridge discards old committed data handles
+- **AND** synchronizes entities from fresh query-engine data
+- **AND** cannot mutate Authority state through the read handle
+
+#### Scenario: Bridge view state excluded from saves
+- **WHEN** a province entity has hover and animation components
+- **THEN** those components are treated as Ephemeral Bevy state
+- **AND** they are not persisted as Authority state
 
 #### Scenario: Lock poisoning during refresh
 - **WHEN** a previous operation panicked while holding the refresh handler's `Mutex`
@@ -74,18 +79,41 @@ This is consistent with:
 - **AND** the scheduler SHALL propagate the error through `SchedulerResult` (not panic)
 - **AND** the application SHALL decide recovery policy (e.g., restart tick, shutdown gracefully)
 
-#### Scenario: Bridge reads after commit
-- **WHEN** the `sim-scheduler` triggers `journal.commit()` at tick boundary and signals consumers to refresh
-- **THEN** the bridge receives REFRESH_SIGNAL, discards old snapshot reference
-- **AND** the bridge obtains the new `WorldSnapshot` (generation N+1) via `query-engine`
-- **THEN** the bridge begins synchronizing entities from the fresh snapshot in the next frame.
-
 ### Requirement: Player Commands Only (journal-system)
 The Bevy bridge SHALL ONLY buffer **player-originated** commands. AI and internal simulation commands bypass the bridge entirely and write directly to the `journal-system`. This ensures the bridge remains a UI-layer concern and does not become a bottleneck for simulation systems.
 
 #### Scenario: AI declares war
 - **WHEN** an AI system decides to declare war
 - **THEN** it calls `journal_system.submit(Command::DeclareWar { ... })` directly, without going through the bridge buffer.
+
+### Requirement: Bevy State Tier Ownership
+The Bevy bridge SHALL document or register state-tier ownership for its runtime state:
+
+- Player command buffer: Ephemeral until consumed into journal submission.
+- Entity materialization registry: Derived or Ephemeral view mapping.
+- View models and sync fields: Derived views of Authority state.
+- Hover, selection, animation, and camera state: Ephemeral.
+
+#### Scenario: Materialization registry rebuild
+- **WHEN** a committed snapshot changes visible province ownership
+- **THEN** Bevy view synchronization updates Derived view state from query-engine data
+- **AND** the materialization registry is not treated as Authority state
+
+### Requirement: No Simulation-Origin Commands Through Bridge
+The Bevy bridge SHALL only buffer player-originated commands. AI and internal simulation systems submit directly to journal-system through scheduler-provided capabilities.
+
+#### Scenario: AI declares war
+- **WHEN** an AI system decides to declare war
+- **THEN** it submits through journal-system or scheduler-provided journal capability
+- **AND** it does not use the Bevy input buffer
+
+### Requirement: Lock Poisoning Propagation
+All Mutex lock acquisitions in `scharnhorst_bevy` production code SHALL propagate lock poisoning as `BevyBridgeError::LockPoisoned` rather than silently swallowing the poison via `if let Ok(...)` or `.ok()`. This includes `with_player_id` on `InputCommandBuffer` and all `SyncState` lock methods. Lock poisoning indicates an unrecoverable invariants violation in another subsystem and SHALL be surfaced to the caller.
+
+#### Scenario: Poisoned lock surfaced
+- **WHEN** any `scharnhorst_bevy` Mutex is poisoned by a panic in another subsystem
+- **THEN** subsequent lock acquisitions return `BevyBridgeError::LockPoisoned`
+- **AND** the error propagates to the application-level recovery or panic handler
 
 ---
 
@@ -99,6 +127,12 @@ The Bevy bridge SHALL ONLY buffer **player-originated** commands. AI and interna
 
 ### I-BB-GENERATION-ATOMIC
 `last_snapshot_generation` uses `Relaxed` ordering. Since all mutations flow through a single Bevy system (the refresh handler), there is no need for inter-thread ordering — atomicity alone ensures correctness.
+
+### I-BB-STATE-TIER
+All Bevy ECS components, ViewModels, hover/animation/selection state, and frame-local caches are Derived or Ephemeral. The Bevy bridge never holds Authority state directly. Any state that must persist or be replay-authoritative lives in `ArrowStore` as Authority tables; the bridge materializes read-only views of that state.
+
+### I-BB-INPUT-BOUNDARY
+`InputCommandBuffer` contains only player-originated commands. AI and internal simulation systems SHALL submit commands directly to `journal-system` through scheduler-provided capabilities, bypassing the bridge buffer. No non-player command enters through the Bevy input path.
 
 ---
 

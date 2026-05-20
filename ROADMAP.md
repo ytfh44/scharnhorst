@@ -35,7 +35,7 @@ skip nothing, permute nothing.
 
 **Theme**: Turn conventions into type-system guarantees.
 
-### 0.1 Enforce the Single-Write-Entry-Point Invariant
+### 0.1 Enforce the Single-Write-Entry-Point Invariant ✅
 
 The most important architectural rule is: **during simulation, all world-state
 mutations go through `scharnhorst_journal`. Nothing writes to `ArrowStore`
@@ -60,7 +60,7 @@ become a type-system guarantee.
 imports `ArrowStore`'s mutation methods. A panic (in debug builds) if `apply_diffs`
 is called outside `atomic_commit`.
 
-### 0.2 Split World State into Three Tiers
+### 0.2 Split World State into Three Tiers ✅
 
 Arrow's columnar format excels at cache-local scans and analytical queries,
 but its immutability-per-generation makes it expensive for transient data.
@@ -86,7 +86,7 @@ Keeping only Authority data in Arrow preserves the determinism-replay-hash
 chain for what matters, while leaving the engine free to use fast mutable
 structures for per-frame work.
 
-### 0.3 Formalise Schema Immutability After Initialisation
+### 0.3 Formalise Schema Immutability After Initialisation ✅
 
 The schema (tables, columns, relations) must be frozen before the first tick.
 No `create_table` or `add_relation` during simulation.
@@ -586,7 +586,7 @@ or is technical debt against it.
 | scharnhorst_rules (expression evaluator, modifiers, scope jumps) | ✅ Stable |
 | scharnhorst_bevy (entity materialisation, sync, refresh handler) | ✅ Stable |
 | scharnhorst_integration_tests | ✅ Exists |
-| **Phase 0 — Invariants** | ⬜ Not started |
+| **Phase 0 — Invariants** | ✅ Completed |
 | **Phase 1 — Observability** | ⬜ Not started |
 | **Phase 2 — Rule Diagnostics** | ⬜ Not started |
 | **Phase 3 — Mod Pipeline** | ⬜ Not started |

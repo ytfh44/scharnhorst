@@ -66,32 +66,37 @@ evaluator.register_function(name, impl Fn(&[EvalValue]) -> RuleResult<EvalValue>
 This replaces the hardcoded `match` with a pluggable registry. Built-in functions are registered the same way custom ones would be. Custom functions are responsible for validating their own arguments inside their closure. Built-in functions additionally benefit from a separate arg-count registry that enables early-exit validation in `evaluate_call()`.
 
 ### Requirement: Read-Only Evaluation with Effect Submission (journal-system, query-engine)
+The Rule-IR evaluator SHALL be a pure reader over committed Authority state during expression and trigger evaluation. Expressions and triggers read state exclusively through `query-engine`; they MUST NOT mutate snapshots, access raw Arrow tables, or bypass `journal-system`.
 
-The Rule-IR evaluator SHALL be a **pure function** over the current `WorldSnapshot`. Expressions and triggers read state exclusively through the `query-engine`; they MUST NOT mutate the snapshot and MUST NOT bypass the journal-system to write diffs. Only the **effect** phase of rule execution may produce state changes, and these MUST be submitted as `Diff` objects through the `journal-system`.
+Only the effect phase of rule execution may produce state changes. Effects MUST be submitted through a journal submission capability and MUST NOT be applied directly to `ArrowStore`.
 
-**Unified Read Interface Contract**:
-All read operations in the evaluator MUST route through `query-engine`. Direct access to Arrow `RecordBatch` or `Table` objects is **strictly forbidden**:
+**Unified Read Interface Contract:**
 
 | Operation | Allowed Path | Forbidden |
-|-----------|-------------|-----------|
-| Column value lookup | `query_engine.get_column(...)` | `snapshot.arrow_table().column()` |
-| Row iteration | `query_engine.scan_table(...)` | `snapshot.arrow_table().iter()` |
-| Cross-partition jump | `query_engine.lookup_row(table, row_id)` | Direct partition access |
-| Filtered query | `query_engine.filter(...)` | Manual Arrow filter application |
+|-----------|--------------|-----------|
+| Column value lookup | query-engine typed read | raw Arrow column access |
+| Row iteration | query-engine scan/read API | raw snapshot table iteration |
+| Cross-partition jump | query-engine lookup | direct partition access |
+| Filtered query | query-engine filter/read API | manual Arrow filter over store internals |
+| State change | journal submission capability | direct `ArrowStore` mutation |
 
-Read path: `rule-ir evaluator -> query-engine -> WorldSnapshot -> ArrowStore`
+**Evaluation lifecycle:**
 
-#### Evaluation lifecycle:
-```
-1. Read -> evaluator issues queries via query-engine against current snapshot + modifiers (pure query)
-2. Trigger -> evaluates conditions via query-engine (pure computation, no side-effects)
-3. Effect -> for each triggered effect, emits Diff::Update/Diff::Insert
-4. Submit -> diffs submitted to journal-system for batched commit
-```
+1. Read: evaluator issues queries via query-engine against the current committed generation.
+2. Trigger: evaluator computes conditions without side effects.
+3. Effect: triggered effects are converted into diffs or commands.
+4. Submit: effects are submitted to journal-system for batched commit.
 
 #### Scenario: Modifier chain evaluation
-- **WHEN** evaluating "tax_income" for actor FRA
-- **THEN** the evaluator (a) queries base treasury from snapshot via `query-engine`, (b) queries modifier chain from the modifier registry, (c) computes `base * 1.1 * 0.95 = final_value`, (d) emits `Diff::Update { table: "actor_state", row: FRA, column: "treasury", value: final_value }` -- **but does NOT write to the Arrow table directly**.
+- **WHEN** evaluating `tax_income` for actor FRA
+- **THEN** the evaluator reads base values and modifiers through query-engine or modifier registry reads
+- **AND** it submits any resulting treasury update through journal-system
+- **AND** it does not write to Arrow tables directly
+
+#### Scenario: Rule effect cannot apply store diff
+- **WHEN** a rule effect wants to create a new event row
+- **THEN** it submits an insert diff through the journal submission capability
+- **AND** the event row appears in Authority state only after journal commit
 
 ### Requirement: RelationGraph for Scope Traversal (schema-registry, query-engine)
 Scope traversal (`jump_to`) SHALL use the `RelationGraph` maintained by `schema-registry` to resolve cross-table jumps. The RelationGraph SHALL store:
@@ -116,42 +121,65 @@ When a scope jump crosses partition boundaries, the evaluator SHALL:
 - **THEN** the evaluator (a) queries `RelationGraph` via `query-engine` for the Owner relation, (b) identifies actor A is in the `global` partition, (c) calls `query-engine.lookup_row("actor_state", actor_id)`, (d) pins the result in the prefetch cache.
 
 ### Requirement: Prefetch Cache with LRU Eviction
+The evaluator SHALL maintain a bounded in-memory prefetch cache for cross-partition scope lookups. The cache is Derived state. It SHALL be rebuilt or cleared from committed Authority state and MUST NOT be persisted or included in replay hashes.
 
-The evaluator SHALL maintain a bounded in-memory prefetch cache for cross-partition scope lookups. Default capacity: 1024 pinned rows. Eviction policy: **LRU** (Least Recently Used).
+Default capacity: 1024 pinned rows. Eviction policy: LRU.
 
-#### CachedRow restriction -- no raw RowId indexing:
-The `CachedRow` struct SHALL store the `RowId` and resolve physical position via `RowPositionMap` at access time. It MUST NOT store `row_index: usize` derived from `RowId.0`. Rationale:
-- Rows can be deleted, creating gaps in physical storage that would make a cached `row_index` stale
-- Multiple `RecordBatch` objects per table mean a RowId's physical `(batch_idx, offset)` is not a simple linear index
-- Tick boundaries invalidate all cached positions (handled by REFRESH_SIGNAL)
+**CachedRow restriction:**
+The `CachedRow` struct SHALL store logical row identity and resolve physical position through query-engine or `RowPositionMap` at access time. It MUST NOT treat `RowId.0` as a raw physical array index.
 
-#### Cache lifecycle -- REFRESH_SIGNAL protocol
-
-The `rule-ir` evaluator registers a refresh handler with the `sim-scheduler`. The lifecycle is:
-
-```
-T+0 (end of PostTick):
-1. sim-scheduler broadcasts REFRESH_SIGNAL
-2. rule-ir evaluator receives signal
-
-T+1 (before first rule evaluation):
-3. Evaluator discards all cached rows from snapshot T
-4. Evaluator obtains new snapshot reference via query-engine.get_snapshot()
-5. First rule of tick T+1 executes with fresh lookups against snapshot T+1
-```
-
-**Invariant**: The prefetch cache MUST be empty at the start of each tick's rule evaluation. This is enforced by the `sim-scheduler`'s synchronous REFRESH_SIGNAL protocol (all consumers acknowledge before any proceeds).
+**Cache lifecycle:**
+The evaluator registers a refresh handler with `sim-scheduler`. On `REFRESH_SIGNAL`, the evaluator discards all cached rows for the previous generation before the next tick's rule evaluation.
 
 #### Scenario: Cache cleared at tick boundary
-- **WHEN** the `sim-scheduler` triggers `journal.commit()` at end of tick T
-- **THEN** the evaluator receives REFRESH_SIGNAL, discards all cached rows from snapshot T
-- **AND** when the first rule of tick T+1 executes, it performs fresh lookups against snapshot T+1
+- **WHEN** `sim-scheduler` triggers `journal.commit()` at end of tick T
+- **THEN** the evaluator receives `REFRESH_SIGNAL` and clears prefetch cache entries from snapshot T
+- **AND** the first rule of tick T+1 performs fresh lookups against generation T+1
 
-#### Cache safety guarantee
+### Requirement: No Raw Diff Return for External Application
+Rule APIs SHALL NOT expose raw diffs in a way that invites arbitrary external store application. If rule evaluation produces effects, those effects SHALL be submitted through an explicit journal-facing capability or returned only to a scheduler/journal adapter that cannot bypass the journal commit path.
 
-Because the evaluator operates exclusively on an **immutable** `WorldSnapshot`, the prefetch cache is inherently safe from stale reads **within** a single tick. `ArrowStore` mutation modes (`Patchable`, `RebuildPerTick`) never mutate tables in-place -- they produce new snapshot generations. Since the evaluator pins rows from a single immutable snapshot for the duration of one tick, cached cross-partition references cannot become invalid mid-evaluation.
+#### Scenario: Rule API returns effect result
+- **WHEN** a caller evaluates a rule set that produces an Authority update
+- **THEN** the update is submitted to journal-system or returned in a type accepted only by the journal adapter
+- **AND** no caller can apply it directly to `ArrowStore`
 
-#### Scenario: Prefetch hit during scope traversal
-- **WHEN** the evaluator resolves `jump_to(Relation::Owner)` for province P and pins the result (actor A) in the cache
-- **AND** another rule in the same tick also traverses the `OwnerOf` relation for a different province that also targets actor A
-- **THEN** the evaluator serves the second lookup from the prefetch cache, avoiding a redundant cross-partition index lookup.
+### Requirement: Short-Circuit Boolean Evaluation
+`evaluate_and` SHALL short-circuit on the first `Bool(false)` result: subsequent expressions in the AND chain MUST NOT be evaluated once a `false` result is reached. `evaluate_or` SHALL short-circuit on the first `Bool(true)` result.
+
+This prevents evaluation of expressions that reference non-existent columns or tables in branches that are already logically determined to be unreachable. Without short-circuit evaluation, a `false && unknown_column` expression would incorrectly fail with a column-not-found error instead of returning `false`.
+
+#### Scenario: AND short-circuits on false
+- **WHEN** evaluating `false && column("missing_table", "col")`
+- **THEN** the evaluator returns `Bool(false)` without attempting to resolve `missing_table`
+- **AND** no column-not-found error is raised
+
+#### Scenario: OR short-circuits on true
+- **WHEN** evaluating `true || column("missing_table", "col")`
+- **THEN** the evaluator returns `Bool(true)` without attempting to resolve `missing_table`
+
+### Requirement: CachedRow TableReadView Sharing
+Within a single prefetch cache population for a given table, all `CachedRow` entries SHALL share a single `Arc<TableReadView>` rather than cloning the `TableReadView` per row. This prevents memory amplification when caching many rows from the same table (e.g., 1024 pinned rows each holding a copy of all column arrays).
+
+The `CachedRow` struct SHALL store `Arc<TableReadView>` and resolve physical position through query-engine or `RowPositionMap` at access time. It MUST NOT treat `RowId.0` as a raw physical array index.
+
+#### Scenario: Multiple rows share same TableReadView
+- **WHEN** prefetching 100 rows from the `actor_state` table
+- **THEN** all 100 `CachedRow` entries reference the same `Arc<TableReadView>`
+- **AND** total memory usage for the table's column arrays is only one copy
+
+---
+
+## Invariants
+
+### I-RR-READ-ONLY-EVAL
+During expression and trigger evaluation, the evaluator is a pure reader over committed Authority state via `query-engine`. No Arrow tables, snapshots, or `RelationGraph` are mutated during evaluation. Only the effect phase produces state changes, and these MUST be submitted through a journal submission capability.
+
+### I-RR-CACHE-LIFECYCLE
+The prefetch cache MUST be empty at the start of each tick's rule evaluation. On `REFRESH_SIGNAL`, the evaluator discards all `CachedRow` entries from the previous generation. This is enforced by the scheduler's synchronous `REFRESH_SIGNAL` protocol.
+
+### I-RR-CACHED-ROW-ARC
+Within a single prefetch cache population for a given table, all `CachedRow` entries share a single `Arc<TableReadView>`. This prevents memory amplification when caching many rows from the same table. `CachedRow` resolves physical position through `query-engine` or `RowPositionMap` at access time — it MUST NOT treat `RowId.0` as a raw physical array index.
+
+### I-RR-SHORT-CIRCUIT
+`evaluate_and` SHALL short-circuit on `Bool(false)`: subsequent expressions after a `false` result MUST NOT be evaluated. `evaluate_or` SHALL short-circuit on `Bool(true)`. This prevents evaluation of expressions that reference non-existent fields in unreachable branches.
