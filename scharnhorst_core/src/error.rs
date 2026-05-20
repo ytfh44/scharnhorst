@@ -6,6 +6,9 @@ pub enum CoreError {
     #[error("invalid identifier: {0}")]
     InvalidId(String),
 
+    #[error("invalid format: {0}")]
+    InvalidFormat(String),
+
     #[error("arithmetic overflow")]
     ArithmeticOverflow,
 
@@ -17,6 +20,12 @@ pub enum CoreError {
 
     #[error("schema error: {0}")]
     Schema(String),
+
+    #[error("duplicate tier registration: {0}")]
+    DuplicateRegistration(String),
+
+    #[error("invalid lifecycle phase: {0}")]
+    InvalidPhase(String),
 
     #[error("io error: {0}")]
     Io(String),

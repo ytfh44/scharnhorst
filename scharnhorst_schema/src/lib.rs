@@ -18,14 +18,14 @@ pub mod error;
 pub mod field_semantic;
 pub mod manifest;
 pub mod migration;
-pub mod relation;
 pub mod registry;
+pub mod relation;
 pub mod table_spec;
 
 pub use error::{SchemaError, SchemaResult};
 pub use field_semantic::FieldSemantic;
 pub use manifest::{MigratedSchemaManifest, ModFingerprint, SchemaManifest};
-pub use migration::{Migration, MigrationFn, MigrationRegistry, MigratedSchemaManifestExt};
-pub use relation::{RelationEdge, RelationGraph, RelationKind};
+pub use migration::{MigratedSchemaManifestExt, Migration, MigrationFn, MigrationRegistry};
 pub use registry::SchemaRegistry;
+pub use relation::{RelationEdge, RelationGraph, RelationKind};
 pub use table_spec::{ColumnSpec, TableSpec};

@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use scharnhorst_core::Tick;
-use scharnhorst_journal::{CommitRecord, SaveJournal};
+use scharnhorst_core::{Tick, TierRegistry};
+use scharnhorst_journal::{CommitRecord, JournalError, SaveJournal};
 
 use crate::error::{SaveError, SaveResult};
-use crate::snapshot_persistence::SnapshotPersistence;
+use crate::snapshot_persistence::{PersistedSnapshot, SnapshotPersistence};
 
 /// Retention policy for snapshots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,7 @@ pub struct CheckpointManager {
     policy: RetentionPolicy,
     journal_path: PathBuf,
     journal_entries_since_snapshot: usize,
+    tier_registry: Option<TierRegistry>,
 }
 
 impl CheckpointManager {
@@ -60,7 +61,19 @@ impl CheckpointManager {
             policy,
             journal_path: journal_path.as_ref().to_path_buf(),
             journal_entries_since_snapshot: 0,
+            tier_registry: None,
         }
+    }
+
+    /// Attach a TierRegistry for authority-table filtering during saves.
+    pub fn with_tier_registry(mut self, tier_registry: TierRegistry) -> Self {
+        self.persistence = self.persistence.with_tier_registry(tier_registry.clone());
+        self.tier_registry = Some(tier_registry);
+        self
+    }
+
+    pub fn tier_registry(&self) -> Option<&TierRegistry> {
+        self.tier_registry.as_ref()
     }
 
     pub fn persistence(&self) -> &SnapshotPersistence {
@@ -75,22 +88,46 @@ impl CheckpointManager {
         self.journal_entries_since_snapshot
     }
 
- /// Record that a journal entry was appended.
+    /// Record that a journal entry was appended.
     pub fn record_journal_entry(&mut self) {
         self.journal_entries_since_snapshot += 1;
     }
 
- /// Reset the journal counter after a full snapshot.
+    /// Reset the journal counter after a full snapshot.
     pub fn reset_journal_counter(&mut self) {
         self.journal_entries_since_snapshot = 0;
     }
 
- /// Determine whether an auto-checkpoint should be triggered.
+    /// Determine whether an auto-checkpoint should be triggered.
     pub fn should_auto_checkpoint(&self) -> bool {
         self.journal_entries_since_snapshot >= self.policy.auto_checkpoint_threshold
     }
 
- /// Enforce the 3-snapshot retention window by deleting oldest snapshots.
+    /// Trigger auto-checkpoint if the threshold has been reached.
+    ///
+    /// Enforces retention policy (deletes oldest snapshots beyond
+    /// `max_snapshots`). Does NOT truncate the on-disk journal because
+    /// truncation without a covering snapshot would cause data loss
+    /// on crash recovery. Full snapshot writing is deferred to a layer
+    /// that holds world state (`ArrowStore` / `Journal`).
+    ///
+    /// Callers that DO have access to a current `PersistedSnapshot`
+    /// should call [`write_checkpoint_snapshot`] instead, which
+    /// performs the complete auto-checkpoint (snapshot write + retention
+    /// + truncation).
+    ///
+    /// Returns `true` if the threshold was reached.
+    pub fn try_auto_checkpoint(&mut self) -> SaveResult<bool> {
+        if self.should_auto_checkpoint() {
+            self.enforce_retention()?;
+            self.reset_journal_counter();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Enforce the 3-snapshot retention window by deleting oldest snapshots.
     pub fn enforce_retention(&self) -> SaveResult<()> {
         let snapshots = self.persistence.list_snapshots()?;
         if snapshots.len() <= self.policy.max_snapshots {
@@ -105,7 +142,19 @@ impl CheckpointManager {
             .map(|_| ())
     }
 
- /// Truncate the on-disk save journal file.
+    /// Write a full snapshot, enforce retention, and truncate the journal.
+    ///
+    /// Authority-table filtering is handled internally by
+    /// [`SnapshotPersistence`] if a [`TierRegistry`] was attached.
+    pub fn write_checkpoint_snapshot(&mut self, snapshot: &PersistedSnapshot) -> SaveResult<()> {
+        self.persistence.write_snapshot(snapshot)?;
+        self.enforce_retention()?;
+        self.truncate_journal()?;
+        self.reset_journal_counter();
+        Ok(())
+    }
+
+    /// Truncate the on-disk save journal file.
     pub fn truncate_journal(&mut self) -> SaveResult<()> {
         if self.journal_path.exists() {
             std::fs::remove_file(&self.journal_path)
@@ -115,7 +164,7 @@ impl CheckpointManager {
         Ok(())
     }
 
- /// Return the path to the save journal file.
+    /// Return the path to the save journal file.
     pub fn journal_path(&self) -> &Path {
         &self.journal_path
     }
@@ -174,6 +223,9 @@ impl SaveJournal for CheckpointingSaveJournal {
         self.inner.push(record.clone());
         if let Some(manager) = self.manager.as_mut() {
             manager.record_journal_entry();
+            manager
+                .try_auto_checkpoint()
+                .map_err(|e| JournalError::SaveJournal(e.to_string()))?;
         }
         Ok(())
     }
@@ -199,7 +251,14 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("sch_chk_test_{}", std::process::id()))
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("sch_chk_test_{}_{}", std::process::id(), id))
+    }
+
+    fn cleanup(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -212,8 +271,8 @@ mod tests {
     #[test]
     fn checkpoint_manager_tracks_entries() {
         let dir = temp_dir();
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
+        cleanup(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let journal = dir.join("journal.bin");
         let mut mgr = CheckpointManager::new(&dir, RetentionPolicy::default(), &journal);
         mgr.record_journal_entry();
@@ -221,14 +280,14 @@ mod tests {
         assert_eq!(mgr.journal_entries_since_snapshot(), 2);
         mgr.reset_journal_counter();
         assert!(!mgr.should_auto_checkpoint());
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
     fn auto_checkpoint_trigger() {
         let dir = temp_dir();
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
+        cleanup(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let journal = dir.join("journal.bin");
         let mut mgr = CheckpointManager::new(
             &dir,
@@ -239,7 +298,7 @@ mod tests {
             mgr.record_journal_entry();
         }
         assert!(mgr.should_auto_checkpoint());
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]

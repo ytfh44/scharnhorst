@@ -3,18 +3,47 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 pub use scharnhorst_schema::manifest::ModFingerprint;
+use scharnhorst_schema::TableSpec;
 
 /// Extension trait providing content-specific methods for [`ModFingerprint`].
 pub trait ModFingerprintExt {
- /// Compute a simple hash from table spec names and a seed string.
-    fn compute_hash(&mut self, seed: &str);
+    /// Compute a content hash from table schema structures and a seed string.
+    fn compute_hash(&mut self, seed: &str, table_specs: &[TableSpec]);
 }
 
 impl ModFingerprintExt for ModFingerprint {
-    fn compute_hash(&mut self, seed: &str) {
-        let mut names = self.table_specs.clone();
+    fn compute_hash(&mut self, seed: &str, table_specs: &[TableSpec]) {
+        let mut names: Vec<&str> = self.table_specs.iter().map(|s| s.as_str()).collect();
         names.sort_unstable();
-        let combined = format!("{}:{}:{}", self.mod_id, self.version, seed);
+
+        let mut combined = format!(
+            "{}:{}:{}:{}",
+            self.mod_id,
+            self.version,
+            names.join(","),
+            seed
+        );
+
+        let mut sorted_specs: Vec<&TableSpec> = table_specs
+            .iter()
+            .filter(|s| self.table_specs.contains(&s.name))
+            .collect();
+        sorted_specs.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for spec in &sorted_specs {
+            combined.push(':');
+            combined.push_str(&spec.name);
+            for col in &spec.columns {
+                combined.push('|');
+                combined.push_str(&col.name);
+                combined.push('=');
+                combined.push_str(&col.storage_type);
+                combined.push(':');
+                combined.push_str(&format!("{:?}", col.semantic));
+                combined.push_str(if col.nullable { "?n" } else { "" });
+            }
+        }
+
         self.content_hash = format!("{:x}", fxhash::hash64(&combined));
     }
 }
@@ -54,15 +83,14 @@ impl FingerprintRegistry {
         self.fingerprints.is_empty()
     }
 
- /// Compare stored fingerprints against available mods and report mismatches.
-    pub fn compare<'a>(
-        &'a self,
-        available: &'a [ModFingerprint],
-    ) -> FingerprintComparison<'a> {
-        let stored_ids: HashSet<&str> =
-            self.fingerprints.iter().map(|fp| fp.mod_id.as_str()).collect();
-        let available_ids: HashSet<&str> =
-            available.iter().map(|fp| fp.mod_id.as_str()).collect();
+    /// Compare stored fingerprints against available mods and report mismatches.
+    pub fn compare<'a>(&'a self, available: &'a [ModFingerprint]) -> FingerprintComparison<'a> {
+        let stored_ids: HashSet<&str> = self
+            .fingerprints
+            .iter()
+            .map(|fp| fp.mod_id.as_str())
+            .collect();
+        let available_ids: HashSet<&str> = available.iter().map(|fp| fp.mod_id.as_str()).collect();
 
         let missing: Vec<&'a ModFingerprint> = self
             .fingerprints

@@ -6,15 +6,13 @@
 
 use std::sync::Arc;
 
-use scharnhorst_arrow_store::{ArrowStore, MutationMode};
+use scharnhorst_arrow_store::{ArrowStore, InitStore, MutationMode};
 use scharnhorst_bevy::{InputCommandBuffer, ViewModel};
-use scharnhorst_core::RowId;
-use scharnhorst_journal::{
-    Command, CommandEnvelope, Diff, DiffBatch, Journal,
-};
+use scharnhorst_core::{JournalSubmitToken, RowId};
+use scharnhorst_journal::{Command, CommandEnvelope, Diff, DiffBatch, Journal};
 use scharnhorst_query::engine::QueryEngine;
+use scharnhorst_scheduler::{Phase, Scheduler, SimSystem};
 use scharnhorst_schema::{ColumnSpec, FieldSemantic, SchemaRegistry, TableSpec};
-use scharnhorst_scheduler::{Scheduler, SimSystem, Phase};
 
 /// Errors that can occur in the test harness.
 #[derive(Debug)]
@@ -72,7 +70,6 @@ pub type HarnessResult<T> = Result<T, HarnessError>;
 /// A minimal world configuration used by integration tests.
 pub struct TestWorld {
     pub arrow_store: ArrowStore,
-    pub journal: Journal,
     pub scheduler: Scheduler,
     pub query_engine: QueryEngine,
     pub view_model: ViewModel,
@@ -80,9 +77,10 @@ pub struct TestWorld {
 }
 
 impl TestWorld {
- /// Build a world with the standard MVP schema (actors, spatial_nodes, ownership).
+    /// Build a world with the standard MVP schema (actors, spatial_nodes, ownership).
     pub fn build_mvp() -> HarnessResult<Self> {
-        let arrow_store = ArrowStore::new();
+        let arrow_store = Arc::new(ArrowStore::new());
+        let init_store = InitStore::new(Arc::clone(&arrow_store));
         let schema_registry = SchemaRegistry::new();
 
         let actors_spec = TableSpec::new("actors")
@@ -96,27 +94,34 @@ impl TestWorld {
             .with_column(ColumnSpec::new("y", FieldSemantic::Position2D, "f64"))?
             .with_column(ColumnSpec::new(
                 "owner",
-                FieldSemantic::ForeignKey { target_table: "actors".to_owned() },
+                FieldSemantic::ForeignKey {
+                    target_table: "actors".to_owned(),
+                },
                 "i64",
             ))?;
 
-        arrow_store.create_table(&actors_spec, MutationMode::AppendOnly)?;
-        arrow_store.create_table(&nodes_spec, MutationMode::AppendOnly)?;
+        init_store.create_table(&actors_spec, MutationMode::AppendOnly)?;
+        init_store.create_table(&nodes_spec, MutationMode::AppendOnly)?;
+
+        let _ = init_store.into_simulation()?;
 
         let query_engine = QueryEngine::new(schema_registry);
         query_engine.register_table_schema(actors_spec)?;
         query_engine.register_table_schema(nodes_spec)?;
 
-        let journal = Journal::new(arrow_store.clone());
-        let scheduler = Scheduler::new(Journal::new(arrow_store.clone()), query_engine.clone());
+        // Freeze the schema registry before creating the scheduler.
+        // The scheduler enforces this at initialize() time.
+        query_engine.freeze_schema_registry()?;
+
+        let journal = Journal::new(Arc::clone(&arrow_store));
+        let scheduler = Scheduler::new(journal, query_engine.clone());
         scheduler.initialize()?;
 
         let view_model = ViewModel::new();
         let input_buffer = InputCommandBuffer::new();
 
         Ok(Self {
-            arrow_store,
-            journal,
+            arrow_store: (*arrow_store).clone(),
             scheduler,
             query_engine,
             view_model,
@@ -124,7 +129,7 @@ impl TestWorld {
         })
     }
 
- /// Seed the world with 2 actors and 10 spatial nodes.
+    /// Seed the world with 2 actors and 10 spatial nodes.
     pub fn seed_mvp_data(&mut self) -> HarnessResult<()> {
         let actor_ids: Vec<RowId> = (0..2).map(RowId::new).collect();
         let node_ids: Vec<RowId> = (0..10).map(RowId::new).collect();
@@ -141,7 +146,11 @@ impl TestWorld {
                 );
                 values.insert(
                     "color".to_owned(),
-                    serde_json::Value::String(if idx == 0 { "red".to_owned() } else { "blue".to_owned() }),
+                    serde_json::Value::String(if idx == 0 {
+                        "red".to_owned()
+                    } else {
+                        "blue".to_owned()
+                    }),
                 );
                 Diff::Insert {
                     table: "actors".to_owned(),
@@ -156,9 +165,18 @@ impl TestWorld {
             .enumerate()
             .map(|(idx, &row)| {
                 let mut values = serde_json::Map::new();
-                values.insert("id".to_owned(), serde_json::Value::Number((idx as u64 + 100).into()));
-                values.insert("x".to_owned(), serde_json::Value::Number(((idx * 10) as u64).into()));
-                values.insert("y".to_owned(), serde_json::Value::Number(((idx * 10) as u64).into()));
+                values.insert(
+                    "id".to_owned(),
+                    serde_json::Value::Number((idx as u64 + 100).into()),
+                );
+                values.insert(
+                    "x".to_owned(),
+                    serde_json::Value::Number(((idx * 10) as u64).into()),
+                );
+                values.insert(
+                    "y".to_owned(),
+                    serde_json::Value::Number(((idx * 10) as u64).into()),
+                );
                 values.insert(
                     "owner".to_owned(),
                     serde_json::Value::Number((idx % 2).into()),
@@ -176,12 +194,16 @@ impl TestWorld {
             diffs: actor_diffs.into_iter().chain(node_diffs).collect(),
         };
 
-        self.journal.submit_batch(batch)?;
-        self.journal.commit()?;
+        {
+            let mut journal = self.scheduler.journal_mut()?;
+            journal.submit_batch(batch, &JournalSubmitToken::new())?;
+        }
+        self.scheduler.atomic_commit()?;
+        self.scheduler.advance_tick()?;
         Ok(())
     }
 
- /// Transfer ownership of a single node from one actor to another via command.
+    /// Transfer ownership of a single node from one actor to another via command.
     pub fn transfer_node_owner(
         &mut self,
         node_id: RowId,
@@ -201,14 +223,14 @@ impl TestWorld {
         Ok(())
     }
 
- /// Register a [`SimSystem`] with the scheduler.
+    /// Register a [`SimSystem`] with the scheduler.
     pub fn register_system(&self, system: Arc<dyn SimSystem>) -> HarnessResult<()> {
         use scharnhorst_scheduler::BoxedSystem;
         self.scheduler.register_system(BoxedSystem::from(system))?;
         Ok(())
     }
 
- /// Advance the simulation by one tick.
+    /// Advance the simulation by one tick.
     pub fn tick(&self) -> HarnessResult<scharnhorst_journal::CommitResult> {
         Ok(self.scheduler.tick()?)
     }
@@ -249,7 +271,8 @@ impl SimSystem for NoOpSystem {
     fn execute(
         &self,
         _rng: &mut scharnhorst_scheduler::DeterministicRng,
-        _query: &QueryEngine, _phase: Phase,
+        _query: &QueryEngine,
+        _phase: Phase,
         _tick: u64,
     ) -> scharnhorst_scheduler::SchedulerResult<Vec<Diff>> {
         Ok(Vec::new())

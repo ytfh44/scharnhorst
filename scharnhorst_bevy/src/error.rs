@@ -37,8 +37,8 @@ pub enum BevyBridgeError {
     #[error("refresh handler error: {0}")]
     RefreshHandler(String),
 
-    #[error("command rejected: player commands only; AI must bypass bridge")]
-    AiCommandRejected,
+    #[error("command rejected: player commands only; AI and internal must bypass bridge")]
+    NonPlayerCommandRejected,
 
     #[error("tick alignment error: expected tick {expected}, got {actual} - {reason}")]
     TickAlignmentError {

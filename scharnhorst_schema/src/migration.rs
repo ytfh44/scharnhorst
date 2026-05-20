@@ -18,18 +18,18 @@ pub type MigrationFn = Box<dyn Fn(&mut SchemaManifest) -> SchemaResult<()> + Sen
 /// Note: `Migration` does not implement `Clone` because it contains a boxed
 /// function pointer. If you need to share migrations, wrap them in `Arc`.
 pub struct Migration {
- /// Human-readable name of this migration (e.g., "v1_0_to_v1_1").
+    /// Human-readable name of this migration (e.g., "v1_0_to_v1_1").
     pub name: String,
- /// Source schema version this migration applies to.
+    /// Source schema version this migration applies to.
     pub from_version: String,
- /// Target schema version after applying this migration.
+    /// Target schema version after applying this migration.
     pub to_version: String,
- /// The migration function that performs the transformation.
+    /// The migration function that performs the transformation.
     migration_fn: MigrationFn,
 }
 
 impl Migration {
- /// Creates a new migration with the given name and version range.
+    /// Creates a new migration with the given name and version range.
     pub fn new(
         name: impl Into<String>,
         from_version: impl Into<String>,
@@ -44,9 +44,9 @@ impl Migration {
         }
     }
 
- /// Applies this migration to the given manifest.
- ///
- /// Returns an error if the manifest's current version doesn't match `from_version`.
+    /// Applies this migration to the given manifest.
+    ///
+    /// Returns an error if the manifest's current version doesn't match `from_version`.
     pub fn apply(&self, manifest: &mut SchemaManifest) -> SchemaResult<()> {
         if manifest.schema_version != self.from_version {
             return Err(SchemaError::MigrationVersionMismatch {
@@ -77,25 +77,25 @@ impl std::fmt::Debug for Migration {
 /// migrations to bring a saved schema up to the current engine version.
 #[derive(Debug, Default)]
 pub struct MigrationRegistry {
- /// Maps source version -> list of migrations starting from that version.
+    /// Maps source version -> list of migrations starting from that version.
     migrations: HashMap<String, Vec<Migration>>,
- /// Target version that all migrations should eventually reach.
+    /// Target version that all migrations should eventually reach.
     target_version: String,
 }
 
 impl MigrationRegistry {
- /// Creates a new empty migration registry.
+    /// Creates a new empty migration registry.
     pub fn new() -> Self {
         Self::default()
     }
 
- /// Sets the target version for migrations.
+    /// Sets the target version for migrations.
     pub fn with_target_version(mut self, version: impl Into<String>) -> Self {
         self.target_version = version.into();
         self
     }
 
- /// Registers a migration in this registry.
+    /// Registers a migration in this registry.
     pub fn register(&mut self, migration: Migration) {
         self.migrations
             .entry(migration.from_version.clone())
@@ -103,24 +103,27 @@ impl MigrationRegistry {
             .push(migration);
     }
 
- /// Returns the target version for migrations.
+    /// Returns the target version for migrations.
     pub fn target_version(&self) -> &str {
         &self.target_version
     }
 
- /// Finds a migration path from the given version to the target version.
- ///
- /// Returns a list of migrations to apply in order, or None if no path exists.
+    /// Finds a migration path from the given version to the target version.
+    ///
+    /// Uses BFS (breadth-first search) via `VecDeque` to find the shortest
+    /// migration path in terms of migration steps.
+    /// Returns a list of migrations to apply in order, or None if no path exists.
     pub fn find_migration_path(&self, from_version: &str) -> Option<Vec<&Migration>> {
         if from_version == self.target_version {
             return Some(Vec::new());
         }
 
- // Simple BFS to find migration path
         let mut visited = std::collections::HashSet::new();
-        let mut queue: Vec<(String, Vec<&Migration>)> = vec![(from_version.to_string(), Vec::new())];
+        let mut queue: std::collections::VecDeque<(String, Vec<&Migration>)> =
+            std::collections::VecDeque::new();
+        queue.push_back((from_version.to_string(), Vec::new()));
 
-        while let Some((current_version, path)) = queue.pop() {
+        while let Some((current_version, path)) = queue.pop_front() {
             if current_version == self.target_version {
                 return Some(path);
             }
@@ -133,7 +136,7 @@ impl MigrationRegistry {
                 for migration in migrations {
                     let mut new_path = path.clone();
                     new_path.push(migration);
-                    queue.push((migration.to_version.clone(), new_path));
+                    queue.push_back((migration.to_version.clone(), new_path));
                 }
             }
         }
@@ -141,33 +144,36 @@ impl MigrationRegistry {
         None
     }
 
- /// Applies all necessary migrations to bring the manifest to the target version.
- ///
- /// This is the primary method used in Phase 3 of the load lifecycle.
- /// Returns a `MigratedSchemaManifest` containing the migrated schema and
- /// information about what migrations were applied.
- ///
- /// # Phase 3 Usage
- ///
- /// ```rust,ignore
- /// // In save-system Phase 3:
- /// let migrated = migration_registry.apply_migrations(manifest)?;
- /// // Pass migrated to Phase 4 via shared state
- /// ```
-    pub fn apply_migrations(&self, mut manifest: SchemaManifest) -> SchemaResult<MigratedSchemaManifest> {
+    /// Applies all necessary migrations to bring the manifest to the target version.
+    ///
+    /// This is the primary method used in Phase 3 of the load lifecycle.
+    /// Returns a `MigratedSchemaManifest` containing the migrated schema and
+    /// information about what migrations were applied.
+    ///
+    /// # Phase 3 Usage
+    ///
+    /// ```rust,ignore
+    /// // In save-system Phase 3:
+    /// let migrated = migration_registry.apply_migrations(manifest)?;
+    /// // Pass migrated to Phase 4 via shared state
+    /// ```
+    pub fn apply_migrations(
+        &self,
+        mut manifest: SchemaManifest,
+    ) -> SchemaResult<MigratedSchemaManifest> {
         let original_version = manifest.schema_version.clone();
 
- // If already at target version, no migrations needed
+        // If already at target version, no migrations needed
         if original_version == self.target_version {
             return Ok(MigratedSchemaManifest::new(manifest, original_version));
         }
 
-        let path = self
-            .find_migration_path(&original_version)
-            .ok_or_else(|| SchemaError::NoMigrationPath {
+        let path = self.find_migration_path(&original_version).ok_or_else(|| {
+            SchemaError::NoMigrationPath {
                 from: original_version.clone(),
                 to: self.target_version.clone(),
-            })?;
+            }
+        })?;
 
         let mut applied = Vec::new();
 
@@ -176,14 +182,16 @@ impl MigrationRegistry {
             applied.push(migration.name.clone());
         }
 
-        Ok(MigratedSchemaManifest::new(manifest, original_version)
-            .with_applied_migrations(applied))
+        Ok(
+            MigratedSchemaManifest::new(manifest, original_version)
+                .with_applied_migrations(applied),
+        )
     }
 }
 
 /// Extension trait for MigratedSchemaManifest to support batch migration recording.
 pub trait MigratedSchemaManifestExt {
- /// Records multiple migrations as applied.
+    /// Records multiple migrations as applied.
     fn with_applied_migrations(self, migrations: Vec<String>) -> Self;
 }
 
@@ -209,7 +217,7 @@ mod tests {
         SchemaManifest::new(version).with_table(make_test_table("test_table"))
     }
 
- // ---- Migration ----
+    // ---- Migration ----
 
     #[test]
     fn migration_construction() {
@@ -256,12 +264,7 @@ mod tests {
 
     #[test]
     fn migration_apply_version_mismatch() {
-        let migration = Migration::new(
-            "v1_to_v2",
-            "1.0.0",
-            "2.0.0",
-            Box::new(|_manifest| Ok(())),
-        );
+        let migration = Migration::new("v1_to_v2", "1.0.0", "2.0.0", Box::new(|_manifest| Ok(())));
 
         let mut manifest = make_test_manifest("0.9.0");
         let result = migration.apply(&mut manifest);
@@ -272,7 +275,7 @@ mod tests {
         ));
     }
 
- // ---- MigrationRegistry ----
+    // ---- MigrationRegistry ----
 
     #[test]
     fn registry_construction() {
@@ -339,7 +342,9 @@ mod tests {
             "1.0.0",
             "2.0.0",
             Box::new(|manifest| {
-                manifest.metadata.insert("migrated".to_string(), "true".to_string());
+                manifest
+                    .metadata
+                    .insert("migrated".to_string(), "true".to_string());
                 Ok(())
             }),
         ));
@@ -350,7 +355,10 @@ mod tests {
         assert_eq!(migrated.manifest.schema_version, "2.0.0");
         assert_eq!(migrated.original_version, "1.0.0");
         assert_eq!(migrated.applied_migrations, vec!["v1_to_v2"]);
-        assert_eq!(migrated.manifest.metadata.get("migrated"), Some(&"true".to_string()));
+        assert_eq!(
+            migrated.manifest.metadata.get("migrated"),
+            Some(&"true".to_string())
+        );
     }
 
     #[test]

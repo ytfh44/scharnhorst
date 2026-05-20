@@ -6,6 +6,7 @@ pub mod ipc_serialization;
 pub mod partition;
 pub mod snapshot;
 pub mod store;
+pub mod store_guard;
 pub mod versioned_table;
 
 use arrow_array::RecordBatch;
@@ -17,6 +18,7 @@ pub use ipc_serialization::{deserialize_batches, serialize_batches, IpcBuffer};
 pub use partition::{Partition, PartitionMap, PartitionSnapshot};
 pub use snapshot::WorldSnapshot;
 pub use store::{ArrowStore, JsonToArrayFn, NullArrayFn, TypeEntry, TypeRegistry};
+pub use store_guard::{CommitStore, InitStore};
 pub use versioned_table::{MutationMode, VersionedTable};
 
 pub trait SnapshotIngestor: Send + Sync {

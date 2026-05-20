@@ -1,8 +1,8 @@
 use std::io::Cursor;
 
-use arrow_array::RecordBatch;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
+use arrow_array::RecordBatch;
 
 use crate::error::{ArrowStoreError, ArrowStoreResult};
 
@@ -52,39 +52,39 @@ impl IpcBuffer {
         Self::default()
     }
 
- /// Append a pre-serialized IPC chunk.
+    /// Append a pre-serialized IPC chunk.
     pub fn push(&mut self, chunk: Vec<u8>) {
         self.chunks.push(chunk);
     }
 
- /// Serialize batches and append the resulting bytes.
+    /// Serialize batches and append the resulting bytes.
     pub fn push_batches(&mut self, batches: &[RecordBatch]) -> ArrowStoreResult<()> {
         let bytes = serialize_batches(batches)?;
         self.push(bytes);
         Ok(())
     }
 
- /// Return the total byte length of all chunks.
+    /// Return the total byte length of all chunks.
     pub fn total_len(&self) -> usize {
         self.chunks.iter().map(|c| c.len()).sum()
     }
 
- /// Return the number of stored chunks.
+    /// Return the number of stored chunks.
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
 
- /// Iterate over all chunks.
+    /// Iterate over all chunks.
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
         self.chunks.iter().map(|c| c.as_slice())
     }
 
- /// Clear all accumulated chunks.
+    /// Clear all accumulated chunks.
     pub fn clear(&mut self) {
         self.chunks.clear();
     }
 
- /// Concatenate all chunks into a single byte vector.
+    /// Concatenate all chunks into a single byte vector.
     pub fn into_bytes(self) -> Vec<u8> {
         let total = self.total_len();
         let mut out = Vec::with_capacity(total);
@@ -99,8 +99,8 @@ impl IpcBuffer {
 mod tests {
     use super::*;
     use crate::error::ArrowStoreResult;
-    use arrow_array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_array::{Int32Array, StringArray};
     use std::sync::Arc;
 
     fn sample_batch() -> RecordBatch {

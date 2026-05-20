@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use scharnhorst_arrow_store::{ArrowStore, MutationMode};
-use scharnhorst_core::Tick;
-use scharnhorst_schema::{SchemaRegistry, TableSpec};
+use scharnhorst_arrow_store::{ArrowStore, InitStore, MutationMode};
+use scharnhorst_core::{StateTier, Tick, TierRegistry};
+use scharnhorst_schema::manifest::{MigratedSchemaManifest, ModFingerprint};
+use scharnhorst_schema::{RelationEdge, SchemaRegistry, TableSpec};
 
 use crate::error::{ContentError, ContentResult};
+use crate::fingerprint::ModFingerprintExt;
 use crate::name_resolution::NamespaceResolver;
 use crate::overlay::OverlayResolver;
 
@@ -13,7 +16,7 @@ use crate::overlay::OverlayResolver;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawTableDef {
     pub spec: TableSpec,
- /// Rows as columnar string data, keyed by column name.
+    /// Rows as columnar string data, keyed by column name.
     pub rows: HashMap<String, Vec<String>>,
 }
 
@@ -23,6 +26,7 @@ pub struct CompilationInput {
     pub tables: Vec<RawTableDef>,
     pub overlays: OverlayResolver,
     pub resolver: NamespaceResolver,
+    pub migrated_manifest: Option<MigratedSchemaManifest>,
 }
 
 impl CompilationInput {
@@ -44,17 +48,31 @@ impl CompilationInput {
         self.resolver = resolver;
         self
     }
+
+    pub fn with_migrated_manifest(mut self, manifest: MigratedSchemaManifest) -> Self {
+        self.migrated_manifest = Some(manifest);
+        self
+    }
 }
 
 /// Output produced by content compilation.
 #[derive(Debug, Clone)]
 pub struct CompilationOutput {
- /// The populated Arrow store with compiled tables.
+    /// The populated Arrow store with compiled tables.
     pub store: ArrowStore,
- /// The populated schema registry with all TableSpecs.
+    /// The populated schema registry with all TableSpecs.
     pub registry: SchemaRegistry,
- /// Final namespace resolver after name registration.
+    /// Final namespace resolver after name registration.
     pub resolver: NamespaceResolver,
+    /// Tier registry mapping each compiled table to its state tier.
+    /// Content-loaded tables are always registered as `Authority`.
+    pub tier_registry: TierRegistry,
+    /// Relation edges between compiled tables.
+    pub relation_edges: Vec<RelationEdge>,
+    /// Mod fingerprints for compatibility checking.
+    pub fingerprints: Vec<ModFingerprint>,
+    /// Migrated schema manifest from the load lifecycle (if any).
+    pub migrated_manifest: Option<MigratedSchemaManifest>,
 }
 
 /// Compiles raw content definitions into binary Arrow tables.
@@ -65,36 +83,122 @@ impl ContentCompiler {
         Self
     }
 
- /// Compile all raw definitions into the Arrow store and schema registry.
+    /// Compile all raw definitions into the Arrow store and schema registry.
     pub fn compile(&self, input: CompilationInput) -> ContentResult<CompilationOutput> {
-        let mut store = ArrowStore::new();
+        let store = Arc::new(ArrowStore::new());
+        let init_store = InitStore::new(Arc::clone(&store));
         let mut registry = SchemaRegistry::new();
+        let mut tier_registry = TierRegistry::new();
         let resolver = input.resolver;
 
         for def in &input.tables {
-            Self::compile_table(&mut store, &mut registry, def)?;
+            Self::compile_table(&init_store, &mut registry, def)?;
         }
 
+        let (relation_edges, fingerprints) = if let Some(ref migrated) = input.migrated_manifest {
+            for table_spec in migrated.manifest().tables.iter() {
+                if !registry.contains(&table_spec.name) {
+                    return Err(ContentError::CompilationFailed {
+                        table: table_spec.name.clone(),
+                        reason: "table from manifest not found in compiled output".to_string(),
+                    });
+                }
+            }
+
+            let edges = migrated.relations().to_vec();
+            let mut fps = migrated.mod_fingerprints().to_vec();
+
+            registry.set_migrated_manifest(migrated.clone()).map_err(|e| {
+                ContentError::CompilationFailed {
+                    table: "schema_registry".to_string(),
+                    reason: format!("set_migrated_manifest failed: {e}"),
+                }
+            })?;
+
+            for edge in &edges {
+                registry.add_relation(edge.clone()).map_err(|e| {
+                    ContentError::CompilationFailed {
+                        table: edge.from.clone(),
+                        reason: format!("relation error: {e}"),
+                    }
+                })?;
+            }
+
+            let cycles = registry.relation_graph().detect_cycles();
+            if !cycles.is_empty() {
+                return Err(ContentError::CompilationFailed {
+                    table: "relation_graph".to_string(),
+                    reason: format!("cycle detected: {:?}", cycles[0]),
+                });
+            }
+
+            let table_specs: Vec<TableSpec> =
+                input.tables.iter().map(|t| t.spec.clone()).collect();
+            for fp in &mut fps {
+                fp.compute_hash("content_compilation", &table_specs);
+            }
+
+            registry.store_mod_fingerprints(fps.clone()).map_err(|e| {
+                ContentError::CompilationFailed {
+                    table: "fingerprints".to_string(),
+                    reason: format!("fingerprint storage error: {e}"),
+                }
+            })?;
+
+            (edges, fps)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        for def in &input.tables {
+            if def.spec.tier != StateTier::Authority {
+                return Err(ContentError::CompilationFailed {
+                    table: def.spec.name.clone(),
+                    reason: format!(
+                        "content compilation only supports Authority-tier tables; '{}' has tier {:?}",
+                        def.spec.name, def.spec.tier
+                    ),
+                });
+            }
+            tier_registry
+                .register(
+                    &def.spec.name,
+                    StateTier::Authority,
+                    "content_loader",
+                    format!("Compiled content table: {}", def.spec.name),
+                )
+                .map_err(|e| ContentError::CompilationFailed {
+                    table: def.spec.name.clone(),
+                    reason: format!("tier registration error: {e}"),
+                })?;
+        }
+
+        registry.freeze();
+
         Ok(CompilationOutput {
-            store,
+            store: (*store).clone(),
             registry,
             resolver,
+            tier_registry,
+            relation_edges,
+            fingerprints,
+            migrated_manifest: input.migrated_manifest,
         })
     }
 
     fn compile_table(
-        store: &mut ArrowStore,
+        init_store: &InitStore,
         registry: &mut SchemaRegistry,
         def: &RawTableDef,
     ) -> ContentResult<()> {
-        registry.register(def.spec.clone()).map_err(|e| {
-            ContentError::CompilationFailed {
+        registry
+            .register(def.spec.clone())
+            .map_err(|e| ContentError::CompilationFailed {
                 table: def.spec.name.clone(),
                 reason: format!("registry error: {}", e),
-            }
-        })?;
+            })?;
 
-        store
+        init_store
             .create_table(&def.spec, MutationMode::AppendOnly)
             .map_err(|e| ContentError::CompilationFailed {
                 table: def.spec.name.clone(),
@@ -102,7 +206,7 @@ impl ContentCompiler {
             })?;
 
         let batches = Self::build_batches(def)?;
-        store
+        init_store
             .append_batches(&def.spec.name, Tick::ZERO, batches)
             .map_err(|e| ContentError::CompilationFailed {
                 table: def.spec.name.clone(),
@@ -153,12 +257,12 @@ fn build_record_batch_from_strings(
         .columns
         .iter()
         .map(|col| -> Result<ArrayRef, ContentError> {
-            let values = rows.get(&col.name).ok_or_else(|| {
-                ContentError::CompilationFailed {
+            let values = rows
+                .get(&col.name)
+                .ok_or_else(|| ContentError::CompilationFailed {
                     table: spec.name.clone(),
                     reason: format!("missing column data: {}", col.name),
-                }
-            })?;
+                })?;
             let arr: ArrayRef = Arc::new(StringArray::from(values.clone()));
             Ok(arr)
         })

@@ -28,7 +28,10 @@ impl ServerJournal {
 }
 
 impl SaveJournal for ServerJournal {
-    fn append(&mut self, record: &scharnhorst_journal::CommitRecord) -> scharnhorst_journal::JournalResult<()> {
+    fn append(
+        &mut self,
+        record: &scharnhorst_journal::CommitRecord,
+    ) -> scharnhorst_journal::JournalResult<()> {
         self.inner.append(record)
     }
 
@@ -56,7 +59,8 @@ impl ClientInputBuffer {
     }
 
     fn submit(&mut self, tick: Tick, command: Command) {
-        self.commands.push(CommandEnvelope::new(tick, self.player_id.clone(), command));
+        self.commands
+            .push(CommandEnvelope::new(tick, self.player_id.clone(), command));
     }
 
     fn drain(&mut self) -> Vec<CommandEnvelope> {
@@ -110,10 +114,11 @@ fn replayed_input_produces_same_hashes() {
     world_a.seed_mvp_data().expect("seed a");
     world_b.seed_mvp_data().expect("seed b");
 
- // Simulate client input.
+    // Simulate client input at the current tick (1, after seeding advanced from 0).
     let mut client = ClientInputBuffer::new("player_1");
+    let current_tick = world_a.scheduler.current_tick().expect("current tick");
     client.submit(
-        Tick(0),
+        current_tick,
         Command::TransferControl {
             province_id: RowId::new(3),
             from_actor: RowId::new(0),
@@ -123,15 +128,21 @@ fn replayed_input_produces_same_hashes() {
 
     let inputs = client.drain();
 
- // Server A processes the inputs.
+    // Server A processes the inputs.
     for env in &inputs {
-        world_a.scheduler.enqueue_command(env.clone()).expect("enqueue a");
+        world_a
+            .scheduler
+            .enqueue_command(env.clone())
+            .expect("enqueue a");
     }
     let result_a = world_a.tick().expect("tick a");
 
- // Server B replays the *same* inputs.
+    // Server B replays the *same* inputs.
     for env in &inputs {
-        world_b.scheduler.enqueue_command(env.clone()).expect("enqueue b");
+        world_b
+            .scheduler
+            .enqueue_command(env.clone())
+            .expect("enqueue b");
     }
     let result_b = world_b.tick().expect("tick b");
 
@@ -141,8 +152,8 @@ fn replayed_input_produces_same_hashes() {
 
 #[test]
 fn client_cannot_commit_directly() {
- // The ClientInputBuffer has no commit method; it only produces envelopes.
- // This is a compile-time guarantee, but we assert the API surface here.
+    // The ClientInputBuffer has no commit method; it only produces envelopes.
+    // This is a compile-time guarantee, but we assert the API surface here.
     let client = ClientInputBuffer::new("player_1");
     assert!(client.to_json().is_ok());
 }

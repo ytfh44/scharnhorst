@@ -16,8 +16,8 @@
 //! ```
 
 use scharnhorst_schema::{
-    ColumnSpec, FieldSemantic, MigratedSchemaManifest, RelationEdge, RelationKind,
-    SchemaError, SchemaManifest, SchemaRegistry, SchemaResult, TableSpec,
+    ColumnSpec, FieldSemantic, MigratedSchemaManifest, RelationEdge, RelationKind, SchemaError,
+    SchemaManifest, SchemaRegistry, SchemaResult, TableSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -27,7 +27,7 @@ use scharnhorst_schema::{
 fn make_spec(name: &str) -> TableSpec {
     let col = ColumnSpec::new("id", FieldSemantic::Id, "u64");
     TableSpec::new(name).with_column(col).unwrap_or_else(|_| {
- // with_column only errors on duplicate column names; unreachable for this helper
+        // with_column only errors on duplicate column names; unreachable for this helper
         TableSpec::new(name)
     })
 }
@@ -109,7 +109,7 @@ fn dc5_frozen_registry_rejects_register() -> SchemaResult<()> {
 fn dc5_frozen_registry_rejects_add_relation() -> SchemaResult<()> {
     let mut registry = SchemaRegistry::new();
 
- // Pre-freeze: register tables so the relation would otherwise be valid.
+    // Pre-freeze: register tables so the relation would otherwise be valid.
     registry.register(make_spec("A"))?;
     registry.register(make_spec("B"))?;
     registry.freeze();
@@ -183,15 +183,15 @@ fn dc5_frozen_registry_rejects_remove_relation() -> SchemaResult<()> {
 fn dc13_phase6_frozen_registry_allows_read_operations() -> SchemaResult<()> {
     let mut registry = SchemaRegistry::new();
 
- // Phase 4: populate
+    // Phase 4: populate
     registry.register(make_spec("A"))?;
     registry.register(make_spec("B"))?;
     registry.add_relation(make_relation("A", "B"))?;
 
- // Phase 5: freeze
+    // Phase 5: freeze
     registry.freeze();
 
- // Phase 6: all reads must succeed
+    // Phase 6: all reads must succeed
     assert!(
         registry.contains("A"),
         "DC-13 Phase 6: contains() must work on frozen registry"
@@ -227,7 +227,7 @@ fn dc13_phase6_frozen_registry_allows_read_operations() -> SchemaResult<()> {
         "DC-13 Phase 6: children_of() must work on frozen registry"
     );
 
- // relation_graph returns the read-only reference
+    // relation_graph returns the read-only reference
     let graph = registry.relation_graph();
     let all_edges = graph.all_edges();
     assert_eq!(
@@ -289,7 +289,7 @@ fn dc13_phase4_load_from_manifest_succeeds_before_freeze() -> SchemaResult<()> {
     let mut registry = SchemaRegistry::new();
     let migrated = make_manifest_with_tables(&["A", "B", "C"]);
 
- // Phase 4: load the migrated manifest into the registry
+    // Phase 4: load the migrated manifest into the registry
     registry.load_from_manifest(&migrated)?;
 
     assert_eq!(
@@ -309,19 +309,19 @@ fn dc13_phase4_load_from_manifest_succeeds_before_freeze() -> SchemaResult<()> {
 fn dc13_phase5_load_from_manifest_fails_after_freeze() -> SchemaResult<()> {
     let mut registry = SchemaRegistry::new();
 
- // Phase 4: initial load
+    // Phase 4: initial load
     let migrated1 = make_manifest_with_tables(&["A"]);
     registry.load_from_manifest(&migrated1)?;
     assert!(registry.contains("A"));
 
- // Phase 5: freeze
+    // Phase 5: freeze
     registry.freeze();
     assert!(
         registry.is_frozen(),
         "DC-13 Phase 5: is_frozen() returns true before Phase 6 Simulation Start"
     );
 
- // Attempt another load_from_manifest after freeze -- must fail
+    // Attempt another load_from_manifest after freeze -- must fail
     let migrated2 = make_manifest_with_tables(&["X"]);
     let result = registry.load_from_manifest(&migrated2);
     assert_eq!(
@@ -330,7 +330,7 @@ fn dc13_phase5_load_from_manifest_fails_after_freeze() -> SchemaResult<()> {
         "DC-13 Phase 4->Phase 5 boundary: load_from_manifest() must fail after freeze"
     );
 
- // Verify the registry was not mutated
+    // Verify the registry was not mutated
     assert!(
         !registry.contains("X"),
         "DC-13: registry must not be mutated by a failed load_from_manifest after freeze"
@@ -356,7 +356,7 @@ fn dc13_phase4_load_from_manifest_with_relations() -> SchemaResult<()> {
         .with_relation(make_relation("A", "B"));
     let migrated = MigratedSchemaManifest::new(manifest, "0.9.0");
 
- // Phase 4: load with tables and relations
+    // Phase 4: load with tables and relations
     registry.load_from_manifest(&migrated)?;
 
     assert_eq!(registry.table_count(), 2);

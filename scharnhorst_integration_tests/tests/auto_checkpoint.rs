@@ -7,9 +7,7 @@ use std::path::PathBuf;
 
 use scharnhorst_core::Tick;
 use scharnhorst_journal::{CommitRecord, SaveJournal};
-use scharnhorst_save::{
-    CheckpointManager, CheckpointingSaveJournal, RetentionPolicy,
-};
+use scharnhorst_save::{CheckpointManager, CheckpointingSaveJournal, RetentionPolicy};
 
 fn temp_dir() -> PathBuf {
     std::env::temp_dir().join(format!("sch_auto_chk_test_{}", std::process::id()))
@@ -43,8 +41,8 @@ fn checkpointing_journal_counts_appends() {
     }
 
     let mgr = cj.manager().expect("manager present");
-    assert!(mgr.should_auto_checkpoint());
-    assert_eq!(mgr.journal_entries_since_snapshot(), 1001);
+    assert!(!mgr.should_auto_checkpoint());
+    assert_eq!(mgr.journal_entries_since_snapshot(), 1);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -72,7 +70,7 @@ fn retention_policy_enforces_max_snapshots() {
     let policy = RetentionPolicy::default().with_max_snapshots(2);
     let mgr = CheckpointManager::new(&dir, policy, &journal_path);
 
- // The manager itself does not create snapshots; we verify the policy value.
+    // The manager itself does not create snapshots; we verify the policy value.
     assert_eq!(mgr.policy().max_snapshots, 2);
 
     let _ = std::fs::remove_dir_all(&dir);

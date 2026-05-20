@@ -37,120 +37,124 @@ pub struct SchemaRegistry {
     tables: HashMap<String, TableSpec>,
     relations: RelationGraph,
     frozen: bool,
- /// Mod fingerprints stored during Phase 2 for compatibility checking.
+    /// Mod fingerprints stored during Phase 2 for compatibility checking.
     mod_fingerprints: Vec<ModFingerprint>,
- /// The migrated schema manifest received during Phase 4 (if any).
+    /// The migrated schema manifest received during Phase 4 (if any).
     migrated_manifest: Option<MigratedSchemaManifest>,
 }
 
 impl SchemaRegistry {
- /// Creates a new empty schema registry.
+    /// Creates a new empty schema registry.
     pub fn new() -> Self {
         Self::default()
     }
 
- /// Returns true if the registry is frozen and cannot be modified.
- ///
- /// Used in Phase 5 to verify the registry is frozen before simulation starts.
+    /// Returns true if the registry is frozen and cannot be modified.
+    ///
+    /// Used in Phase 5 to verify the registry is frozen before simulation starts.
     pub fn is_frozen(&self) -> bool {
         self.frozen
     }
 
- /// Freezes the registry, preventing further modifications.
- ///
- /// # Phase 5 Usage
- ///
- /// Called at the end of Phase 4 (Content Compilation) to freeze the registry
- /// before the simulation starts. Once frozen, no new `TableSpec` registrations
- /// are accepted until the next cold start.
- ///
- /// ```rust,ignore
- /// // In Phase 5:
- /// registry.freeze;
- /// assert!(registry.is_frozen);
- /// ```
+    /// Freezes the registry, preventing further modifications.
+    ///
+    /// # Phase 5 Usage
+    ///
+    /// Called at the end of Phase 4 (Content Compilation) to freeze the registry
+    /// before the simulation starts. Once frozen, no new `TableSpec` registrations
+    /// are accepted until the next cold start.
+    ///
+    /// ```rust,ignore
+    /// // In Phase 5:
+    /// registry.freeze;
+    /// assert!(registry.is_frozen);
+    /// ```
     pub fn freeze(&mut self) {
         self.frozen = true;
     }
 
- // =========================================================================
- // Phase 2: Mod Coordination
- // =========================================================================
+    // =========================================================================
+    // Phase 2: Mod Coordination
+    // =========================================================================
 
- /// Stores the mod fingerprint list for compatibility checking.
- ///
- /// # Phase 2 Usage
- ///
- /// Called during Phase 2 (Mod Coordination) to store the mod fingerprints
- /// from the save file. These are used to compare against available mods on disk.
- ///
- /// ```rust,ignore
- /// // In save-system Phase 2:
- /// let fingerprints = manifest.mod_fingerprints;
- /// registry.store_mod_fingerprints(fingerprints);
- /// // Compare against available mods...
- /// ```
-    pub fn store_mod_fingerprints(&mut self, fingerprints: Vec<ModFingerprint>) {
-        self.mod_fingerprints = fingerprints;
-    }
-
- /// Returns the stored mod fingerprints (if any).
-    pub fn mod_fingerprints(&self) -> &[ModFingerprint] {
-        &self.mod_fingerprints
-    }
-
- /// Returns the mod fingerprint for the given mod ID, if stored.
-    pub fn get_mod_fingerprint(&self, mod_id: &str) -> Option<&ModFingerprint> {
-        self.mod_fingerprints.iter().find(|m| m.mod_id == mod_id)
-    }
-
- // =========================================================================
- // Phase 4: Content Compilation
- // =========================================================================
-
- /// Loads schema from a migrated manifest and registers all tables and relations.
- ///
- /// This is the primary entry point for Phase 4 (Content Compilation). The
- /// `content-loader` receives the `MigratedSchemaManifest` from Phase 3 and
- /// uses this method to populate the registry.
- ///
- /// # Phase 4 Usage
- ///
- /// ```rust,ignore
- /// // In content-loader Phase 4:
- /// let migrated_manifest = // received from Phase 3 via shared state
- /// registry.load_from_manifest(&migrated_manifest)?;
- /// // Registry now contains all tables and relations from the manifest
- /// ```
- ///
- /// # Errors
- ///
- /// Returns `SchemaError::RegistryFrozen` if the registry is already frozen.
-    pub fn load_from_manifest(
+    /// Stores the mod fingerprint list for compatibility checking.
+    ///
+    /// # Phase 2 Usage
+    ///
+    /// Called during Phase 2 (Mod Coordination) to store the mod fingerprints
+    /// from the save file. These are used to compare against available mods on disk.
+    ///
+    /// ```rust,ignore
+    /// // In save-system Phase 2:
+    /// let fingerprints = manifest.mod_fingerprints;
+    /// registry.store_mod_fingerprints(fingerprints)?;
+    /// // Compare against available mods...
+    /// ```
+    pub fn store_mod_fingerprints(
         &mut self,
-        migrated: &MigratedSchemaManifest,
+        fingerprints: Vec<ModFingerprint>,
     ) -> SchemaResult<()> {
         if self.frozen {
             return Err(SchemaError::RegistryFrozen);
         }
+        self.mod_fingerprints = fingerprints;
+        Ok(())
+    }
 
- // Store the migrated manifest for later reference
+    /// Returns the stored mod fingerprints (if any).
+    pub fn mod_fingerprints(&self) -> &[ModFingerprint] {
+        &self.mod_fingerprints
+    }
+
+    /// Returns the mod fingerprint for the given mod ID, if stored.
+    pub fn get_mod_fingerprint(&self, mod_id: &str) -> Option<&ModFingerprint> {
+        self.mod_fingerprints.iter().find(|m| m.mod_id == mod_id)
+    }
+
+    // =========================================================================
+    // Phase 4: Content Compilation
+    // =========================================================================
+
+    /// Loads schema from a migrated manifest and registers all tables and relations.
+    ///
+    /// This is the primary entry point for Phase 4 (Content Compilation). The
+    /// `content-loader` receives the `MigratedSchemaManifest` from Phase 3 and
+    /// uses this method to populate the registry.
+    ///
+    /// # Phase 4 Usage
+    ///
+    /// ```rust,ignore
+    /// // In content-loader Phase 4:
+    /// let migrated_manifest = // received from Phase 3 via shared state
+    /// registry.load_from_manifest(&migrated_manifest)?;
+    /// // Registry now contains all tables and relations from the manifest
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchemaError::RegistryFrozen` if the registry is already frozen.
+    pub fn load_from_manifest(&mut self, migrated: &MigratedSchemaManifest) -> SchemaResult<()> {
+        if self.frozen {
+            return Err(SchemaError::RegistryFrozen);
+        }
+
+        // Store the migrated manifest for later reference
         self.migrated_manifest = Some(migrated.clone());
 
- // Store mod fingerprints from the manifest
+        // Store mod fingerprints from the manifest
         self.mod_fingerprints = migrated.manifest.mod_fingerprints.clone();
 
- // Register all tables from the manifest
+        // Register all tables from the manifest
         for table in migrated.tables() {
             self.register(table.clone())?;
         }
 
- // Add all relations from the manifest
+        // Add all relations from the manifest
         for edge in migrated.relations() {
             self.add_relation(edge.clone())?;
         }
 
- // Global cycle detection: verify the complete relation graph
+        // Global cycle detection: verify the complete relation graph
         let cycles = self.relations.detect_cycles();
         if !cycles.is_empty() {
             return Err(SchemaError::CircularRelation(format!(
@@ -162,40 +166,52 @@ impl SchemaRegistry {
         Ok(())
     }
 
- /// Returns the migrated manifest if one was loaded.
+    /// Returns the migrated manifest if one was loaded.
     pub fn migrated_manifest(&self) -> Option<&MigratedSchemaManifest> {
         self.migrated_manifest.as_ref()
     }
 
- // =========================================================================
- // Phase 5+: Export for Saving
- // =========================================================================
+    /// Sets the migrated manifest on the registry (for audit/debug).
+    ///
+    /// Called during Phase 4 (Content Compilation) to store the
+    /// `MigratedSchemaManifest` produced in Phase 3.
+    pub fn set_migrated_manifest(&mut self, manifest: MigratedSchemaManifest) -> SchemaResult<()> {
+        if self.frozen {
+            return Err(SchemaError::RegistryFrozen);
+        }
+        self.migrated_manifest = Some(manifest);
+        Ok(())
+    }
 
- /// Exports the current registry state as a `SchemaManifest`.
- ///
- /// Used when saving the game to serialize the current schema state.
- ///
- /// # Usage
- ///
- /// ```rust,ignore
- /// // When saving:
- /// let manifest = registry.export_manifest("1.0.0");
- /// // Serialize manifest to save header...
- /// ```
+    // =========================================================================
+    // Phase 5+: Export for Saving
+    // =========================================================================
+
+    /// Exports the current registry state as a `SchemaManifest`.
+    ///
+    /// Used when saving the game to serialize the current schema state.
+    ///
+    /// # Usage
+    ///
+    /// ```rust,ignore
+    /// // When saving:
+    /// let manifest = registry.export_manifest("1.0.0");
+    /// // Serialize manifest to save header...
+    /// ```
     pub fn export_manifest(&self, schema_version: impl Into<String>) -> SchemaManifest {
         let mut manifest = SchemaManifest::new(schema_version);
 
- // Export all tables
+        // Export all tables
         for table in self.tables.values() {
             manifest = manifest.with_table(table.clone());
         }
 
- // Export all relations
+        // Export all relations
         for edge in self.relations.all_edges() {
             manifest = manifest.with_relation(edge.clone());
         }
 
- // Export mod fingerprints
+        // Export mod fingerprints
         for fingerprint in &self.mod_fingerprints {
             manifest = manifest.with_mod_fingerprint(fingerprint.clone());
         }
@@ -204,6 +220,9 @@ impl SchemaRegistry {
     }
 
     pub fn register(&mut self, spec: TableSpec) -> SchemaResult<()> {
+        if spec.name.is_empty() {
+            return Err(SchemaError::InvalidTableName(spec.name));
+        }
         if self.frozen {
             return Err(SchemaError::RegistryFrozen);
         }
@@ -281,7 +300,7 @@ impl SchemaRegistry {
         Ok(&mut self.relations)
     }
 
- /// Returns all tables that have a direct outgoing relation from `name`.
+    /// Returns all tables that have a direct outgoing relation from `name`.
     pub fn children_of(&self, name: &str) -> impl Iterator<Item = &str> {
         self.relations.edges_from(name).map(|e| e.to.as_str())
     }
@@ -308,7 +327,7 @@ mod tests {
         }
     }
 
- // ---- register ----
+    // ---- register ----
 
     #[test]
     fn register_ok() -> SchemaResult<()> {
@@ -324,7 +343,10 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         reg.register(make_spec("Unit")).unwrap();
         let result = reg.register(make_spec("Unit"));
-        assert_eq!(result, Err(SchemaError::TableAlreadyExists("Unit".to_string())));
+        assert_eq!(
+            result,
+            Err(SchemaError::TableAlreadyExists("Unit".to_string()))
+        );
     }
 
     #[test]
@@ -335,7 +357,7 @@ mod tests {
         assert!(result.is_err());
     }
 
- // ---- get / get_mut ----
+    // ---- get / get_mut ----
 
     #[test]
     fn get_ok() -> SchemaResult<()> {
@@ -350,17 +372,23 @@ mod tests {
     fn get_not_found() {
         let reg = SchemaRegistry::new();
         let result = reg.get("Missing");
-        assert_eq!(result, Err(SchemaError::TableNotFound("Missing".to_string())));
+        assert_eq!(
+            result,
+            Err(SchemaError::TableNotFound("Missing".to_string()))
+        );
     }
 
     #[test]
     fn get_mut_not_found() {
         let mut reg = SchemaRegistry::new();
         let result = reg.get_mut("Missing");
-        assert_eq!(result, Err(SchemaError::TableNotFound("Missing".to_string())));
+        assert_eq!(
+            result,
+            Err(SchemaError::TableNotFound("Missing".to_string()))
+        );
     }
 
- // ---- remove ----
+    // ---- remove ----
 
     #[test]
     fn remove_ok() -> SchemaResult<()> {
@@ -377,10 +405,13 @@ mod tests {
     fn remove_not_found() {
         let mut reg = SchemaRegistry::new();
         let result = reg.remove("Missing");
-        assert_eq!(result, Err(SchemaError::TableNotFound("Missing".to_string())));
+        assert_eq!(
+            result,
+            Err(SchemaError::TableNotFound("Missing".to_string()))
+        );
     }
 
- // ---- contains ----
+    // ---- contains ----
 
     #[test]
     fn contains_true() -> SchemaResult<()> {
@@ -396,7 +427,7 @@ mod tests {
         assert!(!reg.contains("Nothing"));
     }
 
- // ---- table_names / table_count ----
+    // ---- table_names / table_count ----
 
     #[test]
     fn table_names_and_count() -> SchemaResult<()> {
@@ -419,7 +450,7 @@ mod tests {
         assert!(names.is_empty());
     }
 
- // ---- add_relation ----
+    // ---- add_relation ----
 
     #[test]
     fn add_relation_ok() -> SchemaResult<()> {
@@ -459,7 +490,7 @@ mod tests {
         Ok(())
     }
 
- // ---- children_of ----
+    // ---- children_of ----
 
     #[test]
     fn children_of_empty() {
@@ -482,7 +513,7 @@ mod tests {
         Ok(())
     }
 
- // ---- remove_relation ----
+    // ---- remove_relation ----
 
     #[test]
     fn remove_relation_ok() -> SchemaResult<()> {
@@ -496,7 +527,7 @@ mod tests {
         Ok(())
     }
 
- // ---- freeze ----
+    // ---- freeze ----
 
     #[test]
     fn default_is_not_frozen() {
@@ -536,7 +567,7 @@ mod tests {
         reg.register(make_spec("B"))?;
         reg.add_relation(make_relation("A", "B"))?;
         reg.freeze();
- // read operations should still work
+        // read operations should still work
         assert!(reg.contains("A"));
         assert_eq!(reg.table_count(), 2);
         assert!(reg.get("A").is_ok());

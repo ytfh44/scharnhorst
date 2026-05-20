@@ -9,6 +9,9 @@ pub enum SchemaError {
     #[error("table not found: {0}")]
     TableNotFound(String),
 
+    #[error("invalid table name: '{0}' — must be non-empty")]
+    InvalidTableName(String),
+
     #[error("column not found: {0}")]
     ColumnNotFound(String),
 
@@ -30,23 +33,23 @@ pub enum SchemaError {
     #[error("schema registry is frozen")]
     RegistryFrozen,
 
- /// Migration version mismatch: expected {expected}, found {actual}
+    /// Migration version mismatch: expected {expected}, found {actual}
     #[error("migration version mismatch: expected {expected}, found {actual}")]
     MigrationVersionMismatch { expected: String, actual: String },
 
- /// No migration path found from {from} to {to}
+    /// No migration path found from {from} to {to}
     #[error("no migration path found from {from} to {to}")]
     NoMigrationPath { from: String, to: String },
 
- /// Manifest serialization error
+    /// Manifest serialization error
     #[error("manifest serialization failed: {0}")]
     ManifestSerialization(String),
 
- /// Manifest deserialization error
+    /// Manifest deserialization error
     #[error("manifest deserialization failed: {0}")]
     ManifestDeserialization(String),
 
- /// Phase error: operation not allowed in current phase
+    /// Phase error: operation not allowed in current phase
     #[error("phase error: {0}")]
     PhaseError(String),
 

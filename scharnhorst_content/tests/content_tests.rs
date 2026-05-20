@@ -5,12 +5,13 @@ use scharnhorst_content::error::ContentError;
 use scharnhorst_content::fingerprint::{FingerprintRegistry, ModFingerprintExt};
 use scharnhorst_content::lifecycle::{LifecycleCoordinator, LoadLifecycle, LoadPhase};
 use scharnhorst_content::manifest::{
-    manifest_from_bytes, manifest_to_bytes,
-    migrated_from_manifest, migrated_table_by_name, migrated_target_version,
+    manifest_from_bytes, manifest_to_bytes, migrated_from_manifest, migrated_table_by_name,
+    migrated_target_version,
 };
 use scharnhorst_content::name_resolution::{NameResolver, NamespaceResolver};
 use scharnhorst_content::overlay::{MergeStrategy, OverlayEntry, OverlayLayer, OverlayResolver};
 use scharnhorst_content::ModFingerprint;
+use scharnhorst_core::StateTier;
 use scharnhorst_schema::manifest::{MigratedSchemaManifest, SchemaManifest};
 use scharnhorst_schema::{ColumnSpec, FieldSemantic, TableSpec};
 
@@ -161,7 +162,10 @@ fn mod_fingerprint_builder() {
 #[test]
 fn mod_fingerprint_compute_hash() {
     let mut fp = ModFingerprint::new("mod_a", "v1").with_table_spec("t1");
-    fp.compute_hash("seed");
+    let t1 = TableSpec::new("t1")
+        .with_column(ColumnSpec::new("id", FieldSemantic::Id, "u64"))
+        .unwrap();
+    fp.compute_hash("seed", &[t1]);
     assert!(!fp.content_hash.is_empty());
 }
 
@@ -315,20 +319,15 @@ fn load_lifecycle_start_phase_enforces_order() {
 #[test]
 fn load_lifecycle_manifest_storage() {
     let mut lifecycle = LoadLifecycle::new();
-    let manifest = SchemaManifest::new("0.1.0")
-        .with_metadata("engine_version", "0.1.0");
+    let manifest = SchemaManifest::new("0.1.0").with_metadata("engine_version", "0.1.0");
     lifecycle.set_manifest(manifest.clone());
-    assert_eq!(
-        lifecycle.manifest().unwrap().schema_version,
-        "0.1.0"
-    );
+    assert_eq!(lifecycle.manifest().unwrap().schema_version, "0.1.0");
 }
 
 #[test]
 fn load_lifecycle_migrated_manifest_storage() {
     let mut lifecycle = LoadLifecycle::new();
-    let manifest = SchemaManifest::new("0.2.0")
-        .with_metadata("engine_version", "0.2.0");
+    let manifest = SchemaManifest::new("0.2.0").with_metadata("engine_version", "0.2.0");
     let migrated = MigratedSchemaManifest::new(manifest, "0.1.0");
     lifecycle.set_migrated_manifest(migrated);
     assert_eq!(
@@ -451,27 +450,24 @@ fn content_compiler_with_resolver() {
 fn full_load_lifecycle_integration() {
     let mut lifecycle = LoadLifecycle::new();
 
- // Phase 1: Snapshot Deserialize
+    // Phase 1: Snapshot Deserialize
     lifecycle.advance().unwrap();
     let manifest = SchemaManifest::new("0.1.0")
         .with_metadata("engine_version", "0.1.0")
         .with_table(TableSpec::new("actors"));
     lifecycle.set_manifest(manifest);
 
- // Phase 2: Mod Coordination
+    // Phase 2: Mod Coordination
     lifecycle.advance().unwrap();
     let mods = vec![ModFingerprint::new("base", "1.0")];
     lifecycle.set_final_mods(mods);
 
- // Phase 3: Schema Migration
+    // Phase 3: Schema Migration
     lifecycle.advance().unwrap();
-    let migrated = migrated_from_manifest(
-        lifecycle.manifest().unwrap(),
-        "0.2.0",
-    );
+    let migrated = migrated_from_manifest(lifecycle.manifest().unwrap(), "0.2.0");
     lifecycle.set_migrated_manifest(migrated);
 
- // Phase 4: Content Compilation
+    // Phase 4: Content Compilation
     lifecycle.advance().unwrap();
     let spec = TableSpec::new("actors")
         .with_column(ColumnSpec::new("actor_id", FieldSemantic::Id, "utf8"))
@@ -484,12 +480,12 @@ fn full_load_lifecycle_integration() {
     let output = compiler.compile(input).unwrap();
     assert_eq!(output.registry.table_count(), 1);
 
- // Phase 5: Schema Freeze
+    // Phase 5: Schema Freeze
     lifecycle.advance().unwrap();
     lifecycle.set_frozen(true);
     assert!(lifecycle.is_frozen());
 
- // Phase 6: Simulation Start
+    // Phase 6: Simulation Start
     lifecycle.advance().unwrap();
     lifecycle.finish().unwrap();
     assert!(lifecycle.is_finished());
@@ -530,4 +526,171 @@ fn manifest_serialization_includes_fingerprints() {
     let restored = manifest_from_bytes(&bytes).unwrap();
     assert_eq!(restored.mod_fingerprints.len(), 1);
     assert_eq!(restored.mod_fingerprints[0].mod_id, "mod_a");
+}
+
+// ------------------------------------------------------------------
+// Tier registry compilation tests
+// ------------------------------------------------------------------
+
+#[test]
+fn compiled_tables_registered_as_authority() {
+    let spec = make_actor_spec();
+    let mut rows: HashMap<String, Vec<String>> = HashMap::new();
+    rows.insert(
+        "actor_id".to_owned(),
+        vec!["FRA".to_owned(), "ENG".to_owned()],
+    );
+    rows.insert(
+        "name".to_owned(),
+        vec!["France".to_owned(), "England".to_owned()],
+    );
+
+    let def = RawTableDef { spec, rows };
+    let input = CompilationInput::new().with_table(def);
+    let compiler = ContentCompiler::new();
+    let output = compiler.compile(input).unwrap();
+
+    assert_eq!(output.tier_registry.table_count(), 1);
+    assert!(output.tier_registry.is_authority("actors"));
+    let meta = output.tier_registry.get("actors").unwrap();
+    assert_eq!(meta.tier, StateTier::Authority);
+    assert_eq!(meta.owner_subsystem, "content_loader");
+}
+
+#[test]
+fn compiled_output_includes_fingerprints() {
+    let input = CompilationInput::new();
+    let compiler = ContentCompiler::new();
+    let output = compiler.compile(input).unwrap();
+    assert!(output.fingerprints.is_empty());
+    assert!(output.relation_edges.is_empty());
+}
+
+#[test]
+fn tier_registry_only_contains_authority_tables() {
+    let spec = make_actor_spec();
+    let mut rows: HashMap<String, Vec<String>> = HashMap::new();
+    rows.insert("actor_id".to_owned(), vec!["FRA".to_owned()]);
+    rows.insert("name".to_owned(), vec!["France".to_owned()]);
+
+    let def = RawTableDef { spec, rows };
+    let input = CompilationInput::new().with_table(def);
+    let compiler = ContentCompiler::new();
+    let output = compiler.compile(input).unwrap();
+
+    let authority_names: Vec<&str> = output.tier_registry.authority_tables().collect();
+    assert_eq!(authority_names, vec!["actors"]);
+    assert_eq!(output.tier_registry.table_count(), 1);
+}
+
+// ------------------------------------------------------------------
+// Tier validation tests (deferred per tasks.md 15.8.3)
+// ------------------------------------------------------------------
+
+/// This test expresses the DESIRED behavior per content-loader spec:
+/// "Content compilation SHALL reject or report definitions that attempt
+/// to persist Derived or Ephemeral state as Authority tables"
+/// Currently DEFERRED (tasks.md 15.8.3). Remove #[ignore] when implemented.
+#[test]
+fn tier_validation_rejects_non_authority_table_compilation() {
+    let mut spec = TableSpec::new("heatmap_cache")
+        .with_column(ColumnSpec::new("province_id", FieldSemantic::Id, "utf8"))
+        .unwrap()
+        .with_column(ColumnSpec::new("heat_value", FieldSemantic::Quantity, "i64"))
+        .unwrap();
+    spec.tier = StateTier::Derived;
+
+    let mut rows = HashMap::new();
+    rows.insert("province_id".to_owned(), vec!["prov_001".to_owned()]);
+    rows.insert("heat_value".to_owned(), vec!["100".to_owned()]);
+
+    let def = RawTableDef { spec, rows };
+    let input = CompilationInput::new().with_table(def);
+    let compiler = ContentCompiler::new();
+    let result = compiler.compile(input);
+    assert!(result.is_err(), "compilation should reject Derived-tier tables");
+}
+
+#[test]
+fn tier_validation_rejects_ephemeral_table_compilation() {
+    let mut spec = TableSpec::new("temp_scratch")
+        .with_column(ColumnSpec::new("key", FieldSemantic::Id, "utf8"))
+        .unwrap()
+        .with_column(ColumnSpec::new("data", FieldSemantic::Raw, "i64"))
+        .unwrap();
+    spec.tier = StateTier::Ephemeral;
+
+    let mut rows = HashMap::new();
+    rows.insert("key".to_owned(), vec!["k1".to_owned()]);
+    rows.insert("data".to_owned(), vec!["42".to_owned()]);
+
+    let def = RawTableDef { spec, rows };
+    let input = CompilationInput::new().with_table(def);
+    let compiler = ContentCompiler::new();
+    let result = compiler.compile(input);
+    assert!(
+        result.is_err(),
+        "compilation should reject Ephemeral-tier tables"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("Ephemeral"),
+        "error should mention Ephemeral"
+    );
+}
+
+#[test]
+fn tier_validation_accepts_authority_table_compilation() {
+    let spec = TableSpec::new("authority_table")
+        .with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64"))
+        .unwrap()
+        .with_column(ColumnSpec::new("value", FieldSemantic::Quantity, "i64"))
+        .unwrap();
+
+    let mut rows = HashMap::new();
+    rows.insert("id".to_owned(), vec!["1".to_owned()]);
+    rows.insert("value".to_owned(), vec!["100".to_owned()]);
+
+    let def = RawTableDef { spec, rows };
+    let input = CompilationInput::new().with_table(def);
+    let compiler = ContentCompiler::new();
+    let result = compiler.compile(input);
+    assert!(
+        result.is_ok(),
+        "compilation should accept Authority-tier tables: {:?}",
+        result.err()
+    );
+}
+
+// ------------------------------------------------------------------
+// Additional compilation edge case tests
+// ------------------------------------------------------------------
+
+#[test]
+fn compile_empty_tables_ok() {
+    let input = CompilationInput::new();
+    let compiler = ContentCompiler::new();
+    let output = compiler.compile(input).unwrap();
+    assert_eq!(output.store.table_count().unwrap(), 0);
+    assert_eq!(output.registry.table_count(), 0);
+}
+
+#[test]
+fn compile_table_with_unicode_column_name() {
+    let spec = TableSpec::new("unicode_table")
+        .with_column(ColumnSpec::new("中文列名", FieldSemantic::Id, "utf8"))
+        .unwrap()
+        .with_column(ColumnSpec::new("valeur_fran蝪ise", FieldSemantic::Quantity, "i64"))
+        .unwrap();
+
+    let mut rows = HashMap::new();
+    rows.insert("中文列名".to_owned(), vec!["行1".to_owned()]);
+    rows.insert("valeur_fran蝪ise".to_owned(), vec!["42".to_owned()]);
+
+    let def = RawTableDef { spec, rows };
+    let input = CompilationInput::new().with_table(def);
+    let compiler = ContentCompiler::new();
+    let output = compiler.compile(input).unwrap();
+    assert_eq!(output.store.table_count().unwrap(), 1);
+    assert!(output.registry.contains("unicode_table"));
 }

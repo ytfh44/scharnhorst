@@ -20,7 +20,8 @@ impl RowPositionMap {
     }
 
     pub fn insert(&mut self, row_id: RowId, batch_index: usize, row_offset: usize) {
-        self.entries.insert(row_id.as_u64(), (batch_index, row_offset));
+        self.entries
+            .insert(row_id.as_u64(), (batch_index, row_offset));
     }
 
     pub fn remove(&mut self, row_id: &RowId) -> Option<(usize, usize)> {
@@ -47,7 +48,7 @@ impl RowPositionMap {
         self.entries.clear();
     }
 
- /// Returns an iterator over all RowIds currently stored in the position map.
+    /// Returns an iterator over all RowIds currently stored in the position map.
     pub fn row_ids(&self) -> impl Iterator<Item = RowId> + '_ {
         self.entries.keys().map(|&raw| RowId::new(raw))
     }

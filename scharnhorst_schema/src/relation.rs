@@ -6,11 +6,11 @@ use crate::error::{SchemaError, SchemaResult};
 /// The cardinality / kind of a relationship between two tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RelationKind {
- /// One-to-many: one row in `from` may relate to many rows in `to`.
+    /// One-to-many: one row in `from` may relate to many rows in `to`.
     OneToMany,
- /// Many-to-many: rows in both directions may have multiple links.
+    /// Many-to-many: rows in both directions may have multiple links.
     ManyToMany,
- /// Composition: rows in `to` are owned by a row in `from`.
+    /// Composition: rows in `to` are owned by a row in `from`.
     Composition,
 }
 
@@ -20,9 +20,9 @@ pub struct RelationEdge {
     pub from: String,
     pub to: String,
     pub kind: RelationKind,
- /// Column in `from` that stores the foreign key (REQUIRED).
+    /// Column in `from` that stores the foreign key (REQUIRED).
     pub from_column: String,
- /// Column in `to` that stores the foreign key (optional, falls back to target's primary key).
+    /// Column in `to` that stores the foreign key (optional, falls back to target's primary key).
     pub to_column: Option<String>,
 }
 
@@ -56,11 +56,16 @@ impl RelationGraph {
 
         let idx = self.edges.len();
         self.edges.push(edge);
-        self.adjacency
-            .entry(key.0)
-            .or_default()
-            .push(idx);
+        self.adjacency.entry(key.0).or_default().push(idx);
         Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn add_edge_unchecked(&mut self, edge: RelationEdge) {
+        let key = Self::edge_key(&edge.from, &edge.to);
+        let idx = self.edges.len();
+        self.edges.push(edge);
+        self.adjacency.entry(key.0).or_default().push(idx);
     }
 
     pub fn remove_edge(&mut self, from: &str, to: &str) -> SchemaResult<()> {
@@ -130,15 +135,22 @@ impl RelationGraph {
         false
     }
 
- /// Performs global cycle detection using DFS with three-color marking.
- /// Returns a list of cycle paths if cycles are found.
+    /// Performs global cycle detection using DFS with three-color marking.
+    /// Returns a list of cycle paths if cycles are found.
     pub fn detect_cycles(&self) -> Vec<Vec<String>> {
         #[derive(Clone, Copy, PartialEq, Eq)]
-        enum Color { White, Gray, Black }
+        enum Color {
+            White,
+            Gray,
+            Black,
+        }
         use std::collections::HashMap;
 
         let all_tables: Vec<String> = self.tables().into_iter().collect();
-        let mut colors: HashMap<String, Color> = all_tables.iter().map(|t| (t.clone(), Color::White)).collect();
+        let mut colors: HashMap<String, Color> = all_tables
+            .iter()
+            .map(|t| (t.clone(), Color::White))
+            .collect();
         let mut cycles = Vec::new();
         let mut path = Vec::new();
 
@@ -147,7 +159,7 @@ impl RelationGraph {
                 continue;
             }
             let mut stack: Vec<(bool, String)> = vec![(true, start_node.clone())];
-            
+
             while let Some((is_entering, node)) = stack.pop() {
                 if is_entering {
                     match colors.get(&node) {
@@ -163,8 +175,11 @@ impl RelationGraph {
                     path.push(node.clone());
                     stack.push((false, node.clone()));
                     for edge in self.edges_from(&node) {
-                        if matches!(colors.get(&edge.to), Some(Color::White)) {
-                            stack.push((true, edge.to.clone()));
+                        match colors.get(&edge.to) {
+                            Some(Color::White) | Some(Color::Gray) => {
+                                stack.push((true, edge.to.clone()));
+                            }
+                            _ => {}
                         }
                     }
                 } else {
@@ -202,7 +217,7 @@ mod tests {
         }
     }
 
- // ---- add_edge ----
+    // ---- add_edge ----
 
     #[test]
     fn add_edge_ok() -> SchemaResult<()> {
@@ -247,7 +262,7 @@ mod tests {
 
     #[test]
     fn cycle_detection_no_false_positive() -> SchemaResult<()> {
- // A -> B, A -> C, B -> D, C -> D should have no cycle
+        // A -> B, A -> C, B -> D, C -> D should have no cycle
         let mut g = RelationGraph::new();
         g.add_edge(edge("A", "B"))?;
         g.add_edge(edge("A", "C"))?;
@@ -257,7 +272,7 @@ mod tests {
         Ok(())
     }
 
- // ---- remove_edge ----
+    // ---- remove_edge ----
 
     #[test]
     fn remove_edge_ok() -> SchemaResult<()> {
@@ -278,7 +293,7 @@ mod tests {
         assert!(matches!(result, Err(SchemaError::RelationNotFound { .. })));
     }
 
- // ---- find_edge ----
+    // ---- find_edge ----
 
     #[test]
     fn find_edge_found() -> SchemaResult<()> {
@@ -296,7 +311,7 @@ mod tests {
         assert!(g.find_edge("A", "B").is_none());
     }
 
- // ---- edges_from ----
+    // ---- edges_from ----
 
     #[test]
     fn edges_from_multiple() -> SchemaResult<()> {
@@ -318,7 +333,7 @@ mod tests {
         assert!(edges.is_empty());
     }
 
- // ---- tables ----
+    // ---- tables ----
 
     #[test]
     fn tables_collects_all() -> SchemaResult<()> {
@@ -339,7 +354,7 @@ mod tests {
         assert!(g.tables().is_empty());
     }
 
- // ---- all edges ----
+    // ---- all edges ----
 
     #[test]
     fn all_edges_maintains_order() -> SchemaResult<()> {

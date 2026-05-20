@@ -1,4 +1,6 @@
-use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array,
+};
 use arrow_schema::DataType;
 use scharnhorst_core::{RowId, RowLookup};
 
@@ -19,13 +21,13 @@ pub enum ColumnKind {
 
 /// Trait for reading a strongly-typed value from an Arrow array at a given row.
 pub trait TypedColumnAccess<T> {
- /// Returns the value at `row` if it exists and is valid, otherwise an error.
+    /// Returns the value at `row` if it exists and is valid, otherwise an error.
     fn get(&self, row: usize) -> QueryResult<Option<T>>;
 
- /// Returns the number of rows in the column.
+    /// Returns the number of rows in the column.
     fn len(&self) -> usize;
 
- /// Returns true if the column has no rows.
+    /// Returns true if the column has no rows.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -75,7 +77,7 @@ impl ColumnView {
         self.array.is_empty()
     }
 
- /// Downcast to a specific Arrow array type and return a reference.
+    /// Downcast to a specific Arrow array type and return a reference.
     pub fn as_typed_array<A: Array + 'static>(&self) -> QueryResult<&A> {
         self.array
             .as_any()
@@ -143,10 +145,7 @@ pub struct RowCursor {
 
 impl RowCursor {
     pub fn new(columns: Vec<(String, ColumnView)>) -> QueryResult<Self> {
-        let row_count = columns
-            .first()
-            .map(|(_, view)| view.len())
-            .unwrap_or(0);
+        let row_count = columns.first().map(|(_, view)| view.len()).unwrap_or(0);
 
         let mismatched = columns
             .iter()
@@ -226,10 +225,7 @@ pub struct BatchColumnReader {
 
 impl BatchColumnReader {
     pub fn new(arrays: Vec<(String, ArrayRef)>) -> QueryResult<Self> {
-        let row_count = arrays
-            .first()
-            .map(|(_, arr)| arr.len())
-            .unwrap_or(0);
+        let row_count = arrays.first().map(|(_, arr)| arr.len()).unwrap_or(0);
 
         let mismatched = arrays
             .iter()
@@ -243,10 +239,7 @@ impl BatchColumnReader {
             )));
         }
 
-        Ok(Self {
-            arrays,
-            row_count,
-        })
+        Ok(Self { arrays, row_count })
     }
 
     pub fn row_count(&self) -> usize {
@@ -452,20 +445,16 @@ impl RowLookupView {
         self.lookup.row_id()
     }
 
- /// Resolve a column view for the target batch and column name.
+    /// Resolve a column view for the target batch and column name.
     fn column_view(&self, column: &str) -> QueryResult<ColumnView> {
         let batch_idx = self.lookup.batch_index();
-        let batch = self
-            .view
-            .batches()
-            .nth(batch_idx)
-            .ok_or_else(|| {
-                QueryError::InvalidQuery(format!(
-                    "batch index {} out of range for table '{}'",
-                    batch_idx,
-                    self.view.table_name()
-                ))
-            })?;
+        let batch = self.view.batches().nth(batch_idx).ok_or_else(|| {
+            QueryError::InvalidQuery(format!(
+                "batch index {} out of range for table '{}'",
+                batch_idx,
+                self.view.table_name()
+            ))
+        })?;
         let col_idx = batch
             .schema()
             .index_of(column)

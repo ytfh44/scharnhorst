@@ -6,20 +6,20 @@ use std::cmp::Ordering;
 /// Systems within the same phase may run in parallel if their write sets are disjoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Phase {
- /// Setup and command ingestion at tick boundary.
+    /// Setup and command ingestion at tick boundary.
     PreTick,
- /// Economy simulation (production, trade, resources).
+    /// Economy simulation (production, trade, resources).
     Economy,
- /// Diplomacy and political simulation.
+    /// Diplomacy and political simulation.
     Diplomacy,
- /// Military and combat resolution.
+    /// Military and combat resolution.
     Military,
- /// Post-tick cleanup, commit, and snapshot refresh.
+    /// Post-tick cleanup, commit, and snapshot refresh.
     PostTick,
 }
 
 impl Phase {
- /// Returns the canonical ordering index for this phase.
+    /// Returns the canonical ordering index for this phase.
     pub fn order_index(self) -> u8 {
         match self {
             Phase::PreTick => 0,
@@ -30,7 +30,7 @@ impl Phase {
         }
     }
 
- /// Returns all phases in execution order.
+    /// Returns all phases in execution order.
     pub fn all_in_order() -> impl Iterator<Item = Phase> {
         [
             Phase::PreTick,
@@ -42,7 +42,7 @@ impl Phase {
         .into_iter()
     }
 
- /// Returns the phase that follows this one, if any.
+    /// Returns the phase that follows this one, if any.
     pub fn next(self) -> Option<Phase> {
         match self {
             Phase::PreTick => Some(Phase::Economy),
@@ -114,7 +114,13 @@ mod tests {
 
     #[test]
     fn phase_sort_maintains_order() {
-        let mut phases = vec![Phase::PostTick, Phase::PreTick, Phase::Military, Phase::Economy, Phase::Diplomacy];
+        let mut phases = vec![
+            Phase::PostTick,
+            Phase::PreTick,
+            Phase::Military,
+            Phase::Economy,
+            Phase::Diplomacy,
+        ];
         phases.sort();
         assert_eq!(phases, Phase::all_in_order().collect::<Vec<_>>());
     }

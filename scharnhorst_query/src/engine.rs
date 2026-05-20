@@ -1,10 +1,13 @@
 use std::collections::HashMap;
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc, RwLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, RwLock,
+};
 
 use arrow_array::RecordBatch;
 use scharnhorst_arrow_store::SnapshotIngestor;
 use scharnhorst_arrow_store::WorldSnapshot;
-use scharnhorst_core::{Diff, RowId, RowLookup, RowPositionMap, Tick};
+use scharnhorst_core::{Diff, JournalSubmitToken, RowId, RowLookup, RowPositionMap, Tick};
 use scharnhorst_schema::{RelationEdge, SchemaRegistry, TableSpec};
 
 use crate::debug_write::{DebugWriteJournal, DebugWriteOp};
@@ -29,13 +32,13 @@ pub struct QueryEngine {
     sql_context: Arc<RwLock<SqlExecutionContext>>,
     inspector: Arc<RwLock<InspectorConsole>>,
     debug_journal: Arc<DebugWriteJournal>,
- /// In-memory cache of the latest tick for which we have snapshot data.
- /// INVARIANT: u64::MAX is reserved as the None sentinel.
+    /// In-memory cache of the latest tick for which we have snapshot data.
+    /// INVARIANT: u64::MAX is reserved as the None sentinel.
     latest_tick: Arc<AtomicU64>,
- /// Cached table views keyed by table name (populated on read).
+    /// Cached table views keyed by table name (populated on read).
     view_cache: Arc<RwLock<HashMap<String, TableReadView>>>,
- /// Cached reference to the latest WorldSnapshot, pushed via store_world_snapshot()
- /// during journal.commit(). Consumers obtain this via snapshot().
+    /// Cached reference to the latest WorldSnapshot, pushed via store_world_snapshot()
+    /// during journal.commit(). Consumers obtain this via snapshot().
     latest_snapshot: Arc<RwLock<Option<Arc<WorldSnapshot>>>>,
 }
 
@@ -53,17 +56,19 @@ impl QueryEngine {
         }
     }
 
- // ------------------------------------------------------------------
- // Schema registry access
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Schema registry access
+    // ------------------------------------------------------------------
 
-    pub fn schema_registry(&self) -> QueryResult<impl std::ops::Deref<Target = SchemaRegistry> + '_> {
+    pub fn schema_registry(
+        &self,
+    ) -> QueryResult<impl std::ops::Deref<Target = SchemaRegistry> + '_> {
         self.schema_registry
             .read()
             .map_err(|_| QueryError::SchemaRegistry("poisoned lock".to_owned()))
     }
 
-    pub fn schema_registry_mut(
+    pub(crate) fn schema_registry_mut(
         &self,
     ) -> QueryResult<impl std::ops::DerefMut<Target = SchemaRegistry> + '_> {
         self.schema_registry
@@ -74,10 +79,11 @@ impl QueryEngine {
     pub fn register_table_schema(&self, spec: TableSpec) -> QueryResult<()> {
         let mut reg = self.schema_registry_mut()?;
         reg.register(spec.clone())?;
-        self.inspector
+        let mut insp = self
+            .inspector
             .write()
-            .map_err(|_| QueryError::Inspector("poisoned lock".to_owned()))?
-            .register_schema(Arc::new(spec));
+            .map_err(|_| QueryError::Inspector("poisoned lock".to_owned()))?;
+        insp.register_schema(Arc::new(spec));
         Ok(())
     }
 
@@ -86,11 +92,11 @@ impl QueryEngine {
         reg.get(name).cloned().map_err(|e| e.into())
     }
 
- /// Resolve a relation edge by key (format: "{from} -> {to}").
- ///
- /// This is the exclusive access path to the [`RelationGraph`] for all
- /// consumers. The underlying relation graph is owned by the
- /// schema-registry; no consumer may query it directly.
+    /// Resolve a relation edge by key (format: "{from} -> {to}").
+    ///
+    /// This is the exclusive access path to the [`RelationGraph`] for all
+    /// consumers. The underlying relation graph is owned by the
+    /// schema-registry; no consumer may query it directly.
     pub fn resolve_relation_edge(&self, key: &str) -> QueryResult<RelationEdge> {
         let reg = self.schema_registry()?;
         let graph = reg.relation_graph();
@@ -105,15 +111,23 @@ impl QueryEngine {
             .ok_or_else(|| QueryError::RelationNotFound(key.to_owned()))
     }
 
- // ------------------------------------------------------------------
- // Unified read interface
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Unified read interface
+    // ------------------------------------------------------------------
 
     pub fn read(&self, request: ReadRequest) -> QueryResult<ReadResponse> {
+        let cache_tick = self.latest_tick()?;
         let cache = self
             .view_cache
             .read()
             .map_err(|_| QueryError::UnifiedRead("poisoned lock".to_owned()))?;
+
+        if request.tick != Tick::ZERO && cache_tick != Some(request.tick) {
+            return Err(QueryError::TicksMismatch {
+                requested: request.tick,
+                actual: cache_tick,
+            });
+        }
 
         let mut response = ReadResponse::new(request.tick);
         for name in &request.table_names {
@@ -132,16 +146,16 @@ impl QueryEngine {
         resp.get(table_name).cloned()
     }
 
- // ------------------------------------------------------------------
- // Snapshot ingestion (bridging from arrow_store)
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Snapshot ingestion (bridging from arrow_store)
+    // ------------------------------------------------------------------
 
     /// ORDERING INVARIANT: Readers MUST load `latest_tick()` BEFORE
- /// acquiring the `view_cache` read lock. Violating this order may
- /// cause stale cache data to be attributed to a newer tick.
- ///
- /// SENTINEL: `u64::MAX` is reserved. `tick.as_u64()` must never equal
- /// `u64::MAX` (see [`Tick::MAX`]).
+    /// acquiring the `view_cache` read lock. Violating this order may
+    /// cause stale cache data to be attributed to a newer tick.
+    ///
+    /// SENTINEL: `u64::MAX` is reserved. `tick.as_u64()` must never equal
+    /// `u64::MAX` (see [`Tick::MAX`]).
     pub fn ingest_snapshot(
         &self,
         tick: Tick,
@@ -149,10 +163,20 @@ impl QueryEngine {
         batches: Vec<RecordBatch>,
         position_map: RowPositionMap,
     ) -> QueryResult<()> {
-        debug_assert!(tick.as_u64() != u64::MAX, "Tick sentinel collision");
+        if tick.as_u64() == u64::MAX {
+            return Err(QueryError::UnsupportedOperation(
+                "Tick sentinel collision: u64::MAX is reserved".to_owned(),
+            ));
+        }
 
         let schema = self.table_schema(table_name)?;
-        let view = TableReadView::new(table_name, tick, batches, Arc::new(schema), Some(position_map));
+        let view = TableReadView::new(
+            table_name,
+            tick,
+            batches,
+            Arc::new(schema),
+            Some(position_map),
+        );
 
         let mut cache = self
             .view_cache
@@ -165,14 +189,14 @@ impl QueryEngine {
         Ok(())
     }
 
- /// Returns the latest tick for which snapshot data is available.
- ///
- /// NOTE: The (Release) store in [`ingest_snapshot`] pairs with this
- /// (Acquire) load. To maintain the ordering invariant, call this
- /// method BEFORE reading `view_cache`.
- ///
- /// INVARIANT: `u64::MAX` is reserved as the `None` sentinel.
- /// Returns `None` when no snapshot has been ingested yet.
+    /// Returns the latest tick for which snapshot data is available.
+    ///
+    /// NOTE: The (Release) store in [`ingest_snapshot`] pairs with this
+    /// (Acquire) load. To maintain the ordering invariant, call this
+    /// method BEFORE reading `view_cache`.
+    ///
+    /// INVARIANT: `u64::MAX` is reserved as the `None` sentinel.
+    /// Returns `None` when no snapshot has been ingested yet.
     pub fn latest_tick(&self) -> QueryResult<Option<Tick>> {
         let raw = self.latest_tick.load(Ordering::Acquire);
         if raw == u64::MAX {
@@ -182,11 +206,11 @@ impl QueryEngine {
         }
     }
 
- /// Store the latest WorldSnapshot produced during journal.commit().
- ///
- /// Called by the Journal after ingesting all table data. The stored snapshot
- /// can be retrieved by consumers (notably the bevy-bridge for entity
- /// materialization) via [`snapshot()`].
+    /// Store the latest WorldSnapshot produced during journal.commit().
+    ///
+    /// Called by the Journal after ingesting all table data. The stored snapshot
+    /// can be retrieved by consumers (notably the bevy-bridge for entity
+    /// materialization) via [`snapshot()`].
     pub fn store_world_snapshot(&self, snapshot: WorldSnapshot) -> QueryResult<()> {
         let mut guard = self
             .latest_snapshot
@@ -196,16 +220,16 @@ impl QueryEngine {
         Ok(())
     }
 
- /// Obtain the latest WorldSnapshot reference.
- ///
- /// The snapshot is pushed into query-engine during journal.commit() via
- /// [`store_world_snapshot()`]. This is NOT a pull-based tick lookup — it
- /// returns whatever snapshot was most recently stored.
- ///
- /// The bevy-bridge uses this for entity materialization (it needs direct
- /// `snapshot.get_table()` access to iterate batches and spawn Bevy entities).
- /// All general-purpose data reads should use the typed read APIs
- /// ([`column_view`], [`lookup_row`], [`batch_reader`], [`read`]).
+    /// Obtain the latest WorldSnapshot reference.
+    ///
+    /// The snapshot is pushed into query-engine during journal.commit() via
+    /// [`store_world_snapshot()`]. This is NOT a pull-based tick lookup — it
+    /// returns whatever snapshot was most recently stored.
+    ///
+    /// The bevy-bridge uses this for entity materialization (it needs direct
+    /// `snapshot.get_table()` access to iterate batches and spawn Bevy entities).
+    /// All general-purpose data reads should use the typed read APIs
+    /// ([`column_view`], [`lookup_row`], [`batch_reader`], [`read`]).
     pub fn snapshot(&self) -> QueryResult<Arc<WorldSnapshot>> {
         self.latest_snapshot
             .read()
@@ -214,11 +238,12 @@ impl QueryEngine {
             .ok_or_else(|| QueryError::InvalidQuery("no snapshot available".to_owned()))
     }
 
- // ------------------------------------------------------------------
- // Typed columnar access
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Typed columnar access
+    // ------------------------------------------------------------------
 
     pub fn column_view(&self, table_name: &str, column_name: &str) -> QueryResult<ColumnView> {
+        let _tick = self.latest_tick()?;
         let cache = self
             .view_cache
             .read()
@@ -237,6 +262,7 @@ impl QueryEngine {
     }
 
     pub fn row_cursor(&self, table_name: &str) -> QueryResult<RowCursor> {
+        let _tick = self.latest_tick()?;
         let cache = self
             .view_cache
             .read()
@@ -248,6 +274,7 @@ impl QueryEngine {
     }
 
     pub fn batch_reader(&self, table_name: &str) -> QueryResult<BatchColumnReader> {
+        let _tick = self.latest_tick()?;
         let cache = self
             .view_cache
             .read()
@@ -265,23 +292,24 @@ impl QueryEngine {
         let view = self.read_single_table(tick, table_name)?;
         let (batch_idx, offset) = {
             let pm = view.position_map();
-            pm.position_of(row_id)
-                .ok_or_else(|| {
-                    QueryError::InvalidQuery(format!(
-                        "row {:?} not found in table '{}'",
-                        row_id, table_name
-                    ))
-                })?
+            pm.position_of(row_id).ok_or_else(|| {
+                QueryError::InvalidQuery(format!(
+                    "row {:?} not found in table '{}'",
+                    row_id, table_name
+                ))
+            })?
         };
         let lookup = RowLookup::new(row_id, batch_idx, offset);
         Ok(RowLookupView::new(lookup, view))
     }
 
- // ------------------------------------------------------------------
- // SQL interface
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // SQL interface
+    // ------------------------------------------------------------------
 
-    pub fn sql_context(&self) -> QueryResult<impl std::ops::Deref<Target = SqlExecutionContext> + '_> {
+    pub fn sql_context(
+        &self,
+    ) -> QueryResult<impl std::ops::Deref<Target = SqlExecutionContext> + '_> {
         self.sql_context
             .read()
             .map_err(|_| QueryError::DataFusion("poisoned lock".to_owned()))
@@ -303,25 +331,25 @@ impl QueryEngine {
         self.sql_context()?.execute_sql(sql).await
     }
 
- // ------------------------------------------------------------------
- // Debug write journal
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Debug write journal
+    // ------------------------------------------------------------------
 
     pub fn debug_journal(&self) -> &DebugWriteJournal {
         &self.debug_journal
     }
 
- /// Execute a SQL write statement (UPDATE/INSERT/DELETE) through the debug write path.
- ///
- /// This is the compliant interception layer for debug builds:
- /// 1. Parse SQL into a [`scharnhorst_journal::sql_parser::SqlStatement`]
- /// 2. Convert to [`Diff`] using `SqlParser::statement_to_diff`
- /// 3. Record the operation in the [`DebugWriteJournal`] ring buffer
- /// 4. Submit the [`Diff`] to the journal-system for atomic commit
- ///
- /// Only available in debug builds (`#[cfg(debug_assertions)]`).
- /// In multiplayer sessions, the debug journal should be disabled via
- /// [`DebugWriteJournal::set_enabled(false)`].
+    /// Execute a SQL write statement (UPDATE/INSERT/DELETE) through the debug write path.
+    ///
+    /// This is the compliant interception layer for debug builds:
+    /// 1. Parse SQL into a [`scharnhorst_journal::sql_parser::SqlStatement`]
+    /// 2. Convert to [`Diff`] using `SqlParser::statement_to_diff`
+    /// 3. Record the operation in the [`DebugWriteJournal`] ring buffer
+    /// 4. Submit the [`Diff`] to the journal-system for atomic commit
+    ///
+    /// Only available in debug builds (`#[cfg(debug_assertions)]`).
+    /// In multiplayer sessions, the debug journal should be disabled via
+    /// [`DebugWriteJournal::set_enabled(false)`].
     #[cfg(debug_assertions)]
     pub fn execute_sql_write(
         &self,
@@ -331,31 +359,31 @@ impl QueryEngine {
     ) -> QueryResult<()> {
         use scharnhorst_journal::sql_parser::SqlParser;
 
- // Step 1: Parse SQL
+        // Step 1: Parse SQL
         let stmt = SqlParser::parse(sql)
             .map_err(|e| QueryError::SqlWrite(format!("SQL parse error: {e}")))?;
 
- // Step 2: Convert to Diff
+        // Step 2: Convert to Diff
         let diff = SqlParser::statement_to_diff(stmt)
             .map_err(|e| QueryError::SqlWrite(format!("SQL to Diff error: {e}")))?;
 
- // Step 3: Record in debug journal ring buffer
+        // Step 3: Record in debug journal ring buffer
         {
             let op = diff_to_debug_write_op(&diff, tick);
             self.debug_journal.record(op);
         }
 
- // Step 4: Submit to journal-system for atomic commit
+        // Step 4: Submit to journal-system for atomic commit
         journal
-            .submit_diff(diff)
+            .submit_diff(diff, &JournalSubmitToken::new())
             .map_err(|e| QueryError::SqlWrite(format!("journal submit error: {e}")))?;
 
         Ok(())
     }
 
- // ------------------------------------------------------------------
- // Inspector / console (developer tooling)
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Inspector / console (developer tooling)
+    // ------------------------------------------------------------------
 
     pub fn inspector(&self) -> QueryResult<impl std::ops::Deref<Target = InspectorConsole> + '_> {
         self.inspector
@@ -371,10 +399,8 @@ impl QueryEngine {
             .map_err(|_| QueryError::Inspector("poisoned lock".to_owned()))
     }
 
-    pub fn inspect_table_summary(
-        &self,
-        table_name: &str,
-    ) -> QueryResult<TableSummary> {
+    pub fn inspect_table_summary(&self, table_name: &str) -> QueryResult<TableSummary> {
+        let _tick = self.latest_tick()?;
         let cache = self
             .view_cache
             .read()
@@ -392,6 +418,7 @@ impl QueryEngine {
         page_index: usize,
         page_size: usize,
     ) -> QueryResult<InspectorPage> {
+        let _tick = self.latest_tick()?;
         let cache = self
             .view_cache
             .read()
@@ -408,9 +435,9 @@ impl QueryEngine {
         )
     }
 
- // ------------------------------------------------------------------
- // Cache management
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Cache management
+    // ------------------------------------------------------------------
 
     pub fn clear_cache(&self) -> QueryResult<()> {
         let mut cache = self
@@ -422,11 +449,37 @@ impl QueryEngine {
     }
 
     pub fn cached_table_names(&self) -> QueryResult<Vec<String>> {
+        let _tick = self.latest_tick()?;
         let cache = self
             .view_cache
             .read()
             .map_err(|_| QueryError::UnifiedRead("poisoned lock".to_owned()))?;
         Ok(cache.keys().cloned().collect())
+    }
+
+    // ------------------------------------------------------------------
+    // Schema freeze check (for scheduler initialization guard)
+    // ------------------------------------------------------------------
+
+    /// Returns true if the underlying schema registry is frozen.
+    ///
+    /// The scheduler calls this during [`initialize`] to ensure the
+    /// schema registry has been frozen before simulation starts.
+    /// If the registry is not frozen, the scheduler returns an error.
+    pub fn is_schema_frozen(&self) -> QueryResult<bool> {
+        let reg = self.schema_registry()?;
+        Ok(reg.is_frozen())
+    }
+
+    /// Freeze the underlying schema registry, preventing further table
+    /// registrations. Returns an error if the registry lock is poisoned.
+    pub fn freeze_schema_registry(&self) -> QueryResult<()> {
+        let mut reg = self
+            .schema_registry
+            .write()
+            .map_err(|_| QueryError::UnifiedRead("schema registry lock poisoned".to_owned()))?;
+        reg.freeze();
+        Ok(())
     }
 }
 

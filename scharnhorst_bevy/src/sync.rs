@@ -4,8 +4,8 @@ use scharnhorst_core::{RowId, Tick};
 use scharnhorst_query::engine::QueryEngine;
 use scharnhorst_query::unified_read::ReadRequest;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::error::{BevyBridgeError, BevyBridgeResult};
 use crate::view_of::ViewOf;
@@ -208,9 +208,10 @@ impl SyncState {
 
         for entity in entities_to_sync {
             if let Some(entry) = models.get(&entity) {
-                let _table_view = view_model.read_table_via_query_engine(query_engine, &entry.table)?;
- // In full implementation, component-specific sync fields
- // would be applied here. For now, we mark the sync complete.
+                let _table_view =
+                    view_model.read_table_via_query_engine(query_engine, &entry.table)?;
+                // In full implementation, component-specific sync fields
+                // would be applied here. For now, we mark the sync complete.
                 synced = synced.saturating_add(1);
             }
         }

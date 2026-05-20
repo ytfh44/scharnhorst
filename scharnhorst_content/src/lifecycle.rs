@@ -1,21 +1,21 @@
 use crate::error::{ContentError, ContentResult};
-use scharnhorst_schema::manifest::{MigratedSchemaManifest, SchemaManifest};
 use scharnhorst_schema::manifest::ModFingerprint;
+use scharnhorst_schema::manifest::{MigratedSchemaManifest, SchemaManifest};
 
 /// The six phases of the cold-start load lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LoadPhase {
- /// Phase 1: Parse SchemaManifest from save header.
+    /// Phase 1: Parse SchemaManifest from save header.
     SnapshotDeserialize,
- /// Phase 2: Compare ModFingerprint vs mods on disk.
+    /// Phase 2: Compare ModFingerprint vs mods on disk.
     ModCoordination,
- /// Phase 3: Apply migration functions to SchemaManifest.
+    /// Phase 3: Apply migration functions to SchemaManifest.
     SchemaMigration,
- /// Phase 4: Compile base + mods into Arrow tables.
+    /// Phase 4: Compile base + mods into Arrow tables.
     ContentCompilation,
- /// Phase 5: Freeze schema registry.
+    /// Phase 5: Freeze schema registry.
     SchemaFreeze,
- /// Phase 6: Begin simulation.
+    /// Phase 6: Begin simulation.
     SimulationStart,
 }
 
@@ -59,36 +59,38 @@ impl LoadLifecycle {
         Self::default()
     }
 
- /// Current active phase, if any.
+    /// Current active phase, if any.
     pub fn current_phase(&self) -> Option<LoadPhase> {
         self.current
     }
 
- /// Phases that have already completed.
+    /// Phases that have already completed.
     pub fn completed_phases(&self) -> &[LoadPhase] {
         &self.completed
     }
 
- /// Whether the given phase has been completed.
+    /// Whether the given phase has been completed.
     pub fn is_completed(&self, phase: LoadPhase) -> bool {
         self.completed.contains(&phase)
     }
 
- /// Advance to the next phase.
+    /// Advance to the next phase.
     pub fn advance(&mut self) -> ContentResult<LoadPhase> {
         let next = match self.current {
             None => LoadPhase::SnapshotDeserialize,
-            Some(phase) => phase.next().ok_or_else(|| {
-                ContentError::InvalidPhaseTransition {
+            Some(phase) => phase
+                .next()
+                .ok_or_else(|| ContentError::InvalidPhaseTransition {
                     from: phase.name().to_owned(),
                     to: "(none)".to_owned(),
-                }
-            })?,
+                })?,
         };
 
         if let Some(current) = self.current {
             if self.completed.contains(&current) {
-                return Err(ContentError::PhaseAlreadyCompleted(current.name().to_owned()));
+                return Err(ContentError::PhaseAlreadyCompleted(
+                    current.name().to_owned(),
+                ));
             }
             self.completed.push(current);
         }
@@ -97,7 +99,7 @@ impl LoadLifecycle {
         Ok(next)
     }
 
- /// Advance and mark the final phase as completed.
+    /// Advance and mark the final phase as completed.
     pub fn finish(&mut self) -> ContentResult<()> {
         if let Some(current) = self.current {
             if !self.completed.contains(&current) {
@@ -108,7 +110,7 @@ impl LoadLifecycle {
         Ok(())
     }
 
- /// Start a specific phase by name (for testing and recovery).
+    /// Start a specific phase by name (for testing and recovery).
     pub fn start_phase(&mut self, phase: LoadPhase) -> ContentResult<()> {
         if let Some(current) = self.current {
             if current >= phase {
@@ -122,9 +124,9 @@ impl LoadLifecycle {
         Ok(())
     }
 
- // ------------------------------------------------------------------
- // Phase outputs
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Phase outputs
+    // ------------------------------------------------------------------
 
     pub fn set_manifest(&mut self, manifest: SchemaManifest) {
         self.manifest = Some(manifest);
@@ -158,7 +160,7 @@ impl LoadLifecycle {
         self.frozen
     }
 
- /// True if all six phases are complete.
+    /// True if all six phases are complete.
     pub fn is_finished(&self) -> bool {
         self.completed.len() == 6
     }
@@ -172,7 +174,7 @@ impl LifecycleCoordinator {
         Self
     }
 
- /// Run the full lifecycle from start to finish.
+    /// Run the full lifecycle from start to finish.
     pub fn run<F>(mut lifecycle: LoadLifecycle, mut phase_runner: F) -> ContentResult<LoadLifecycle>
     where
         F: FnMut(&mut LoadLifecycle, LoadPhase) -> ContentResult<()>,
@@ -243,10 +245,7 @@ mod tests {
     #[test]
     fn set_final_mods_preserves_mods() {
         let mut lc = LoadLifecycle::new();
-        let mods = vec![
-            ModFingerprint::new("a", "1"),
-            ModFingerprint::new("b", "2"),
-        ];
+        let mods = vec![ModFingerprint::new("a", "1"), ModFingerprint::new("b", "2")];
         lc.set_final_mods(mods);
         assert_eq!(lc.final_mods().len(), 2);
     }

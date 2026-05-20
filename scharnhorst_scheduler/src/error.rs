@@ -52,6 +52,18 @@ pub enum SchedulerError {
     #[error("io error: {0}")]
     Io(String),
 
+    #[error("scheduler already initialized; cannot register new systems")]
+    Initialized,
+
+    #[error("scheduler not yet initialized; call initialize() first")]
+    NotInitialized,
+
+    #[error("system not found in refresh bus: {0}")]
+    RefreshBusLookupFailed(String),
+
+    #[error("schema registry is not frozen; freeze must complete before scheduler initialization")]
+    SchemaNotFrozen,
+
     #[error("generic error: {0}")]
     Generic(String),
 }

@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
-use scharnhorst_arrow_store::{ArrowStore, MutationMode};
-use scharnhorst_bevy::{SnapshotRefreshHandler, ViewModel};
+use scharnhorst_arrow_store::{ArrowStore, InitStore, MutationMode};
+use scharnhorst_bevy::{CommandSource, SnapshotRefreshHandler, ViewModel};
 use scharnhorst_core::Tick;
 use scharnhorst_integration_tests::harness::TestWorld;
 use scharnhorst_query::engine::QueryEngine;
@@ -43,17 +43,21 @@ fn refresh_handler_updates_view_model() {
         .unwrap_or_else(|_| TableSpec::new("actors"));
     query_engine.register_table_schema(spec.clone()).ok();
 
- // Set up the ArrowStore with a snapshot at tick 5 so the callback
- // can retrieve a real snapshot.
+    // Set up the ArrowStore with a snapshot at tick 5 so the callback
+    // can retrieve a real snapshot.
     let arrow_store = Arc::new(ArrowStore::default());
-    arrow_store
+    let init_store = InitStore::new(Arc::clone(&arrow_store));
+    init_store
         .create_table(&spec, MutationMode::AppendOnly)
         .expect("create table in arrow store");
-    arrow_store
+    let commit_store = init_store
+        .into_simulation()
+        .expect("advance to simulation");
+    commit_store
         .generate_snapshot(Tick(5))
         .expect("generate snapshot at tick 5");
 
- // Ingest a snapshot at tick >= 5 into the QueryEngine for read-back.
+    // Ingest a snapshot at tick >= 5 into the QueryEngine for read-back.
     {
         use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
         use arrow_schema::{DataType, Field, Schema};
@@ -65,14 +69,20 @@ fn refresh_handler_updates_view_model() {
         let id: ArrayRef = Arc::new(Int64Array::from(vec![1]));
         let name: ArrayRef = Arc::new(StringArray::from(vec!["alpha"]));
         let color: ArrayRef = Arc::new(StringArray::from(vec!["red"]));
-        let batch =
-            RecordBatch::try_new(schema, vec![id, name, color]).expect("build batch");
+        let batch = RecordBatch::try_new(schema, vec![id, name, color]).expect("build batch");
         query_engine
-            .ingest_snapshot(scharnhorst_core::Tick(10), "actors", vec![batch], scharnhorst_core::RowPositionMap::new())
+            .ingest_snapshot(
+                scharnhorst_core::Tick(10),
+                "actors",
+                vec![batch],
+                scharnhorst_core::RowPositionMap::new(),
+            )
             .expect("ingest snapshot");
- // Store the current WorldSnapshot in query-engine so snapshot() works.
+        // Store the current WorldSnapshot in query-engine so snapshot() works.
         let ws = arrow_store.get_snapshot(Tick(5)).expect("get snapshot");
-        query_engine.store_world_snapshot((*ws).clone()).expect("store snapshot");
+        query_engine
+            .store_world_snapshot((*ws).clone())
+            .expect("store snapshot");
     }
 
     let vm = Arc::new(ViewModel::new());
@@ -82,12 +92,15 @@ fn refresh_handler_updates_view_model() {
         Arc::clone(&arrow_store),
     );
 
- // Simulate a scheduler refresh broadcast.
+    // Simulate a scheduler refresh broadcast.
     let result = handler.callback()(5, 3);
     assert!(result.is_ok(), "refresh handler failed: {:?}", result);
 
     let gen = vm.generation().expect("read generation");
-    assert!(gen > 0, "generation should have bumped after callback refresh");
+    assert!(
+        gen > 0,
+        "generation should have bumped after callback refresh"
+    );
 }
 
 #[test]
@@ -100,10 +113,13 @@ fn input_command_buffer_drains_to_scheduler() {
         .expect("set tick");
     world
         .input_buffer
-        .submit_player_command("player_1", scharnhorst_journal::Command::Raw {
-            domain: "move".to_owned(),
-            payload: serde_json::Value::Null,
-        })
+        .submit_player_command(
+            CommandSource::Player { player_id: 1 },
+            scharnhorst_journal::Command::Raw {
+                domain: "move".to_owned(),
+                payload: serde_json::Value::Null,
+            },
+        )
         .expect("submit");
 
     let drained = world.input_buffer.drain().expect("drain");

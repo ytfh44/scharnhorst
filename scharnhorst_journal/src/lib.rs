@@ -29,4 +29,4 @@ pub use journal::DebugWriteJournal;
 
 // Re-export SQL parser types for debug builds
 #[cfg(debug_assertions)]
-pub use sql_parser::{SqlParser, SqlStatement, SqlValue, WhereCondition, ComparisonOp};
+pub use sql_parser::{ComparisonOp, SqlParser, SqlStatement, SqlValue, WhereCondition};

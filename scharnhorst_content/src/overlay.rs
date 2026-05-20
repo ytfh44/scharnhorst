@@ -5,39 +5,39 @@ use crate::error::{ContentError, ContentResult};
 /// Strategy for merging a mod overlay value into base content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MergeStrategy {
- /// Replace the base value entirely.
+    /// Replace the base value entirely.
     Replace,
- /// Merge collections by appending mod entries.
+    /// Merge collections by appending mod entries.
     Append,
- /// Merge collections by prepending mod entries.
+    /// Merge collections by prepending mod entries.
     Prepend,
- /// Numerically add mod value to base value.
+    /// Numerically add mod value to base value.
     Add,
- /// Take the minimum of base and mod values.
+    /// Take the minimum of base and mod values.
     Min,
- /// Take the maximum of base and mod values.
+    /// Take the maximum of base and mod values.
     Max,
 }
 
 /// A single overlay entry defining how a mod modifies a base value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayEntry {
- /// Dot-separated path within the content object (e.g. "actor.FRA.stability").
+    /// Dot-separated path within the content object (e.g. "actor.FRA.stability").
     pub path: String,
- /// The raw value to apply (interpretation depends on `strategy`).
+    /// The raw value to apply (interpretation depends on `strategy`).
     pub value: String,
- /// How this entry should be merged with the base value.
+    /// How this entry should be merged with the base value.
     pub strategy: MergeStrategy,
 }
 
 /// Represents a single mod's overlay layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayLayer {
- /// Mod identifier (e.g. "EuropaBarbarorum").
+    /// Mod identifier (e.g. "EuropaBarbarorum").
     pub mod_id: String,
- /// Mod priority; lower values apply first.
+    /// Mod priority; lower values apply first.
     pub priority: i32,
- /// Entries keyed by path for fast lookup.
+    /// Entries keyed by path for fast lookup.
     pub entries: HashMap<String, OverlayEntry>,
 }
 
@@ -80,11 +80,11 @@ impl OverlayResolver {
 
     pub fn add_layer(&mut self, layer: OverlayLayer) {
         self.layers.push(layer);
- // Higher priority values should be applied later, so sort ascending.
+        // Higher priority values should be applied later, so sort ascending.
         self.layers.sort_by_key(|l| l.priority);
     }
 
- /// Returns the fully-resolved value for `path`, or an error if none exists.
+    /// Returns the fully-resolved value for `path`, or an error if none exists.
     pub fn resolve(&self, path: &str) -> ContentResult<String> {
         let mut current = self
             .base
@@ -101,7 +101,7 @@ impl OverlayResolver {
         Ok(current)
     }
 
- /// Returns all paths known to the resolver (base + overlays).
+    /// Returns all paths known to the resolver (base + overlays).
     pub fn known_paths(&self) -> impl Iterator<Item = &str> {
         let base_keys = self.base.keys().map(|s| s.as_str());
         let overlay_keys = self
@@ -111,7 +111,7 @@ impl OverlayResolver {
         base_keys.chain(overlay_keys)
     }
 
- /// Apply all overlays at once, returning resolved values for every known path.
+    /// Apply all overlays at once, returning resolved values for every known path.
     pub fn apply(&self) -> ContentResult<HashMap<String, String>> {
         let paths: Vec<String> = self.known_paths().map(|s| s.to_owned()).collect();
         let mut result = HashMap::with_capacity(paths.len());
@@ -133,7 +133,10 @@ fn apply_strategy(base: &str, overlay: &str, strategy: MergeStrategy) -> Content
                 ContentError::OverlayConflict(format!("cannot add non-integer base: {}", base))
             })?;
             let o = overlay.parse::<i64>().map_err(|_| {
-                ContentError::OverlayConflict(format!("cannot add non-integer overlay: {}", overlay))
+                ContentError::OverlayConflict(format!(
+                    "cannot add non-integer overlay: {}",
+                    overlay
+                ))
             })?;
             Ok((b + o).to_string())
         }
@@ -142,7 +145,10 @@ fn apply_strategy(base: &str, overlay: &str, strategy: MergeStrategy) -> Content
                 ContentError::OverlayConflict(format!("cannot min non-integer base: {}", base))
             })?;
             let o = overlay.parse::<i64>().map_err(|_| {
-                ContentError::OverlayConflict(format!("cannot min non-integer overlay: {}", overlay))
+                ContentError::OverlayConflict(format!(
+                    "cannot min non-integer overlay: {}",
+                    overlay
+                ))
             })?;
             Ok(b.min(o).to_string())
         }
@@ -151,7 +157,10 @@ fn apply_strategy(base: &str, overlay: &str, strategy: MergeStrategy) -> Content
                 ContentError::OverlayConflict(format!("cannot max non-integer base: {}", base))
             })?;
             let o = overlay.parse::<i64>().map_err(|_| {
-                ContentError::OverlayConflict(format!("cannot max non-integer overlay: {}", overlay))
+                ContentError::OverlayConflict(format!(
+                    "cannot max non-integer overlay: {}",
+                    overlay
+                ))
             })?;
             Ok(b.max(o).to_string())
         }
@@ -203,10 +212,7 @@ mod tests {
 
     #[test]
     fn apply_strategy_min_max() {
-        assert_eq!(
-            apply_strategy("10", "5", MergeStrategy::Min).unwrap(),
-            "5"
-        );
+        assert_eq!(apply_strategy("10", "5", MergeStrategy::Min).unwrap(), "5");
         assert_eq!(
             apply_strategy("10", "20", MergeStrategy::Max).unwrap(),
             "20"
@@ -236,20 +242,16 @@ mod tests {
     #[test]
     fn multiple_layers_apply_in_order() {
         let mut resolver = OverlayResolver::new().with_base("v", "0");
-        resolver.add_layer(
-            OverlayLayer::new("layer1", 0).with_entry(OverlayEntry {
-                path: "v".to_owned(),
-                value: "10".to_owned(),
-                strategy: MergeStrategy::Add,
-            }),
-        );
-        resolver.add_layer(
-            OverlayLayer::new("layer2", 1).with_entry(OverlayEntry {
-                path: "v".to_owned(),
-                value: "5".to_owned(),
-                strategy: MergeStrategy::Add,
-            }),
-        );
+        resolver.add_layer(OverlayLayer::new("layer1", 0).with_entry(OverlayEntry {
+            path: "v".to_owned(),
+            value: "10".to_owned(),
+            strategy: MergeStrategy::Add,
+        }));
+        resolver.add_layer(OverlayLayer::new("layer2", 1).with_entry(OverlayEntry {
+            path: "v".to_owned(),
+            value: "5".to_owned(),
+            strategy: MergeStrategy::Add,
+        }));
         let result = resolver.apply().unwrap();
         assert_eq!(result.get("v").unwrap(), "15");
     }

@@ -1,14 +1,15 @@
 use std::collections::HashMap;
-
+use std::sync::Arc;
 
 use scharnhorst_schema::manifest::{MigratedSchemaManifest, SchemaManifest};
 use scharnhorst_schema::TableSpec;
 
 use crate::error::{SaveError, SaveResult};
 
-type MigrateTableFn = Box<dyn Fn(&mut TableSpec) -> SaveResult<()> + Send + Sync>;
+type MigrateTableFn = Arc<dyn Fn(&mut TableSpec) -> SaveResult<()> + Send + Sync>;
 
 /// A single schema migration step from one version to another.
+#[derive(Clone)]
 pub struct MigrationStep {
     pub from_version: String,
     pub to_version: String,
@@ -23,7 +24,7 @@ impl MigrationStep {
         Self {
             from_version: from.into(),
             to_version: to.into(),
-            migrate_table: Box::new(migrate_table),
+            migrate_table: Arc::new(migrate_table),
         }
     }
 }
@@ -46,7 +47,7 @@ impl std::fmt::Debug for MigrationPipeline {
 impl Clone for MigrationPipeline {
     fn clone(&self) -> Self {
         Self {
-            steps: Vec::new(),
+            steps: self.steps.clone(),
             target_version: self.target_version.clone(),
         }
     }
@@ -68,7 +69,7 @@ impl MigrationPipeline {
         self.steps.push(step);
     }
 
- /// Apply the full migration chain to a manifest.
+    /// Apply the full migration chain to a manifest.
     pub fn apply(&self, manifest: &SchemaManifest) -> SaveResult<MigratedSchemaManifest> {
         let mut current_version = manifest.schema_version.clone();
         let mut tables = manifest.tables.clone();
@@ -83,12 +84,10 @@ impl MigrationPipeline {
                 .ok_or_else(|| SaveError::NoMigrationPath(current_version.clone()))?;
 
             for table in &mut tables {
-                (next_step.migrate_table)(table).map_err(|e| {
-                    SaveError::MigrationFailed {
-                        from: next_step.from_version.clone(),
-                        to: next_step.to_version.clone(),
-                        reason: e.to_string(),
-                    }
+                (next_step.migrate_table)(table).map_err(|e| SaveError::MigrationFailed {
+                    from: next_step.from_version.clone(),
+                    to: next_step.to_version.clone(),
+                    reason: e.to_string(),
                 })?;
             }
 
@@ -103,7 +102,7 @@ impl MigrationPipeline {
             }
         }
 
- // Build a new SchemaManifest with the target version and copy over migrated tables/relations
+        // Build a new SchemaManifest with the target version and copy over migrated tables/relations
         let mut new_manifest = SchemaManifest::new(&self.target_version);
         for table in tables {
             new_manifest = new_manifest.with_table(table);
@@ -117,12 +116,12 @@ impl MigrationPipeline {
         ))
     }
 
- /// Return true if the given version is already at the target.
+    /// Return true if the given version is already at the target.
     pub fn is_up_to_date(&self, version: &str) -> bool {
         version == self.target_version
     }
 
- /// Return the number of registered steps.
+    /// Return the number of registered steps.
     pub fn step_count(&self) -> usize {
         self.steps.len()
     }
@@ -175,8 +174,7 @@ mod tests {
     #[test]
     fn no_migration_needed() -> SaveResult<()> {
         let pipeline = MigrationPipeline::new("1.0.0");
-        let manifest = SchemaManifest::new("1.0.0")
-            .with_table(dummy_table("actors"));
+        let manifest = SchemaManifest::new("1.0.0").with_table(dummy_table("actors"));
         let migrated = pipeline.apply(&manifest)?;
         assert_eq!(migrated_target_version(&migrated), "1.0.0");
         assert_eq!(migrated.tables().len(), 1);
@@ -193,14 +191,15 @@ mod tests {
                 if table.name == "actors" {
                     let idx = table.columns.len();
                     table.column_index.insert("mood".to_owned(), idx);
-                    table.columns.push(ColumnSpec::new("mood", FieldSemantic::Raw, "f64"));
+                    table
+                        .columns
+                        .push(ColumnSpec::new("mood", FieldSemantic::Raw, "f64"));
                 }
                 Ok(())
             },
         ));
 
-        let manifest = SchemaManifest::new("1.0.0")
-            .with_table(dummy_table("actors"));
+        let manifest = SchemaManifest::new("1.0.0").with_table(dummy_table("actors"));
         let migrated = pipeline.apply(&manifest)?;
         assert_eq!(migrated_target_version(&migrated), "1.1.0");
         let actors = migrated

@@ -17,7 +17,10 @@ fn deterministic_seed_produces_same_hashes() {
     let hash_a = world_a.tick().expect("tick a").state_hash;
     let hash_b = world_b.tick().expect("tick b").state_hash;
 
-    assert_eq!(hash_a, hash_b, "identical seed data must yield identical hashes");
+    assert_eq!(
+        hash_a, hash_b,
+        "identical seed data must yield identical hashes"
+    );
 }
 
 #[test]
@@ -28,7 +31,7 @@ fn deterministic_commands_produce_same_hashes() {
     world_a.seed_mvp_data().expect("seed a");
     world_b.seed_mvp_data().expect("seed b");
 
- // Enqueue identical transfer commands on both worlds.
+    // Enqueue identical transfer commands on both worlds.
     world_a
         .transfer_node_owner(RowId::new(3), RowId::new(0), RowId::new(1))
         .expect("enqueue a");

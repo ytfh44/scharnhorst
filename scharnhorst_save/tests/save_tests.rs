@@ -1,17 +1,18 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use scharnhorst_arrow_store::IpcBuffer;
 use scharnhorst_content::{
-    migrated_target_version, FingerprintRegistry, ModFingerprint, SchemaManifest,
+    migrated_target_version, FingerprintRegistry, LoadPhase, ModFingerprint, SchemaManifest,
 };
 use scharnhorst_core::Tick;
+use scharnhorst_core::{StateTier, TierRegistry};
 use scharnhorst_journal::{CommitRecord, Diff, SaveJournal};
-use scharnhorst_arrow_store::IpcBuffer;
 use scharnhorst_save::{
     CheckpointManager, CheckpointingSaveJournal, LoadReconstruction, LoadReconstructionBuilder,
-    MigrationPipeline, MigrationRegistry, MigrationStep, ModToleranceChecker,
-    ModLoadOutcome, RetentionPolicy, SnapshotHeader, SnapshotPersistence, PersistedSnapshot,
-    SaveError, SaveResult,
+    MigrationPipeline, MigrationRegistry, MigrationStep, ModLoadOutcome, ModToleranceChecker,
+    ModTolerancePolicy, PersistedSnapshot, RetentionPolicy, SaveError, SaveResult, SnapshotHeader,
+    SnapshotPersistence,
 };
 use scharnhorst_schema::{ColumnSpec, FieldSemantic, TableSpec};
 
@@ -19,7 +20,11 @@ static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn temp_dir() -> PathBuf {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("sch_save_integration_{}_{}", std::process::id(), id))
+    std::env::temp_dir().join(format!(
+        "sch_save_integration_{}_{}",
+        std::process::id(),
+        id
+    ))
 }
 
 fn cleanup(dir: &PathBuf) {
@@ -50,8 +55,9 @@ fn snapshot_list_and_latest() -> SaveResult<()> {
     let manifest = SchemaManifest::new("1.0.0");
 
     for gen in [10u64, 5, 20] {
-        let snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(gen), gen))
-            .with_table_data("actors", vec![1, 2, 3]);
+        let snapshot =
+            PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(gen), gen))
+                .with_table_data("actors", vec![1, 2, 3]);
         persistence.write_snapshot(&snapshot)?;
     }
 
@@ -67,6 +73,97 @@ fn snapshot_list_and_latest() -> SaveResult<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------------
+// Authority tier filtering
+// ------------------------------------------------------------------
+
+#[test]
+fn persisted_snapshot_filter_to_authority_removes_non_authority_tables() {
+    use scharnhorst_core::StateTier;
+
+    let mut tier_registry = TierRegistry::new();
+    let _ = tier_registry.register(
+        "actors",
+        StateTier::Authority,
+        "save_test",
+        "authority table",
+    );
+    let _ = tier_registry.register(
+        "ui_cache",
+        StateTier::Derived,
+        "save_test",
+        "derived cache",
+    );
+    let _ = tier_registry.register(
+        "input_buffer",
+        StateTier::Ephemeral,
+        "save_test",
+        "ephemeral state",
+    );
+    let _ = tier_registry.register(
+        "provinces",
+        StateTier::Authority,
+        "save_test",
+        "authority table",
+    );
+
+    let manifest = SchemaManifest::new("1.0.0")
+        .with_table(dummy_table("actors"))
+        .with_table(dummy_table("provinces"))
+        .with_table(dummy_table("ui_cache"))
+        .with_table(dummy_table("input_buffer"));
+
+    let mut snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest, Tick(100), 100))
+        .with_table_data("actors", vec![1u8])
+        .with_table_data("provinces", vec![2u8])
+        .with_table_data("ui_cache", vec![3u8])
+        .with_table_data("input_buffer", vec![4u8]);
+
+    assert_eq!(snapshot.table_data.len(), 4);
+
+    snapshot.filter_to_authority(&tier_registry);
+
+    assert_eq!(snapshot.table_data.len(), 2);
+    assert!(snapshot.table_data.contains_key("actors"));
+    assert!(snapshot.table_data.contains_key("provinces"));
+    assert!(!snapshot.table_data.contains_key("ui_cache"));
+    assert!(!snapshot.table_data.contains_key("input_buffer"));
+}
+
+#[test]
+fn filter_to_authority_without_registry_removes_all_unregistered() {
+    let manifest = SchemaManifest::new("1.0.0")
+        .with_table(dummy_table("actors"))
+        .with_table(dummy_table("ui_cache"));
+
+    let mut snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest, Tick(100), 100))
+        .with_table_data("actors", vec![1u8])
+        .with_table_data("ui_cache", vec![2u8]);
+
+    let empty_registry = TierRegistry::new();
+    snapshot.filter_to_authority(&empty_registry);
+    assert_eq!(snapshot.table_data.len(), 0,
+        "unregistered tables are treated as non-Authority per spec");
+}
+
+#[test]
+fn filter_to_authority_with_no_authority_tables_removes_all() {
+    let mut tier_registry = TierRegistry::new();
+    let _ = tier_registry.register(
+        "data",
+        StateTier::Derived,
+        "test",
+        "derived",
+    );
+
+    let manifest = SchemaManifest::new("1.0.0").with_table(dummy_table("data"));
+    let mut snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest, Tick(100), 100))
+        .with_table_data("data", vec![1u8]);
+
+    snapshot.filter_to_authority(&tier_registry);
+    assert_eq!(snapshot.table_data.len(), 0);
+}
+
 #[test]
 fn snapshot_delete_oldest() -> SaveResult<()> {
     let dir = temp_dir();
@@ -77,7 +174,8 @@ fn snapshot_delete_oldest() -> SaveResult<()> {
     let manifest = SchemaManifest::new("1.0.0");
 
     for gen in [1u64, 2, 3, 4] {
-        let snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(gen), gen));
+        let snapshot =
+            PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(gen), gen));
         persistence.write_snapshot(&snapshot)?;
     }
 
@@ -124,7 +222,8 @@ fn retention_enforces_max_snapshots() -> SaveResult<()> {
     let manifest = SchemaManifest::new("1.0.0");
 
     for gen in [1u64, 2, 3, 4] {
-        let snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(gen), gen));
+        let snapshot =
+            PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(gen), gen));
         persistence.write_snapshot(&snapshot)?;
     }
 
@@ -155,7 +254,9 @@ fn checkpointing_journal_records_and_truncates() -> SaveResult<()> {
     }
 
     assert_eq!(journal.len(), 5);
-    journal.truncate_before(Tick(3)).map_err(SaveError::Journal)?;
+    journal
+        .truncate_before(Tick(3))
+        .map_err(SaveError::Journal)?;
     assert_eq!(journal.len(), 3);
 
     let mgr = journal.manager_mut().unwrap();
@@ -199,7 +300,9 @@ fn migration_chain_applies_in_order() -> SaveResult<()> {
             if table.name == "actors" {
                 let idx = table.columns.len();
                 table.column_index.insert("health".to_owned(), idx);
-                table.columns.push(ColumnSpec::new("health", FieldSemantic::Raw, "i64"));
+                table
+                    .columns
+                    .push(ColumnSpec::new("health", FieldSemantic::Raw, "i64"));
             }
             Ok(())
         },
@@ -211,7 +314,9 @@ fn migration_chain_applies_in_order() -> SaveResult<()> {
             if table.name == "actors" {
                 let idx = table.columns.len();
                 table.column_index.insert("stamina".to_owned(), idx);
-                table.columns.push(ColumnSpec::new("stamina", FieldSemantic::Raw, "i64"));
+                table
+                    .columns
+                    .push(ColumnSpec::new("stamina", FieldSemantic::Raw, "i64"));
             }
             Ok(())
         },
@@ -267,7 +372,9 @@ fn tolerance_missing_mod_degrades() -> SaveResult<()> {
     let checker = ModToleranceChecker::default();
     let outcome = checker.check(&stored, &available)?;
     match outcome {
-        ModLoadOutcome::MissingMods { degraded_tables, .. } => {
+        ModLoadOutcome::MissingMods {
+            degraded_tables, ..
+        } => {
             assert!(degraded_tables.contains(&"bonus_table".to_owned()));
         }
         other => panic!("expected MissingMods, got {:?}", other),
@@ -369,6 +476,7 @@ fn phase2_produces_final_mods() -> SaveResult<()> {
 
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
+    recon.skip_to_phase(LoadPhase::SnapshotDeserialize)?;
     let final_mods = recon.phase2_mod_coordination(&stored, &available)?;
     assert_eq!(final_mods.len(), 2);
 
@@ -390,7 +498,9 @@ fn phase3_with_pipeline_migrates() -> SaveResult<()> {
             if table.name == "actors" {
                 let idx = table.columns.len();
                 table.column_index.insert("mood".to_owned(), idx);
-                table.columns.push(ColumnSpec::new("mood", FieldSemantic::Raw, "f64"));
+                table
+                    .columns
+                    .push(ColumnSpec::new("mood", FieldSemantic::Raw, "f64"));
             }
             Ok(())
         },
@@ -399,6 +509,7 @@ fn phase3_with_pipeline_migrates() -> SaveResult<()> {
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default())
         .with_migration_pipeline(pipeline);
+    recon.skip_to_phase(LoadPhase::ModCoordination)?;
     let manifest = SchemaManifest::new("1.0.0").with_table(dummy_table("actors"));
     let migrated = recon.phase3_schema_migration(&manifest)?;
     assert_eq!(migrated_target_version(&migrated), "1.1.0");
@@ -415,6 +526,7 @@ fn phase5_freezes_lifecycle() -> SaveResult<()> {
 
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
+    recon.skip_to_phase(LoadPhase::ContentCompilation)?;
     recon.phase5_schema_freeze()?;
     assert!(recon.lifecycle().is_frozen());
 
@@ -430,6 +542,7 @@ fn phase6_finishes_lifecycle() -> SaveResult<()> {
 
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
+    recon.skip_to_phase(LoadPhase::ContentCompilation)?;
     recon.phase5_schema_freeze()?;
     recon.phase6_simulation_start()?;
     assert!(recon.lifecycle().is_frozen());
@@ -446,11 +559,29 @@ fn replay_diffs_computes_hash() -> SaveResult<()> {
     let _ = std::fs::create_dir_all(&dir);
 
     let persistence = SnapshotPersistence::new(&dir);
+    let manifest = SchemaManifest::new("1.0.0");
+    let header = SnapshotHeader::new(manifest, Tick(0), 0);
+    let snapshot = PersistedSnapshot::new(header);
+    persistence.write_snapshot(&snapshot)?;
     let recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
     let records = vec![
-        CommitRecord::new(Tick(1), vec![Diff::Delete { table: "actors".to_owned(), row: scharnhorst_core::RowId::new(1) }], 10),
-        CommitRecord::new(Tick(2), vec![Diff::Delete { table: "actors".to_owned(), row: scharnhorst_core::RowId::new(2) }], 20),
+        CommitRecord::new(
+            Tick(1),
+            vec![Diff::Delete {
+                table: "actors".to_owned(),
+                row: scharnhorst_core::RowId::new(1),
+            }],
+            10,
+        ),
+        CommitRecord::new(
+            Tick(2),
+            vec![Diff::Delete {
+                table: "actors".to_owned(),
+                row: scharnhorst_core::RowId::new(2),
+            }],
+            20,
+        ),
     ];
 
     let hash = recon.replay_diffs(Tick(0), &records)?;
@@ -463,7 +594,13 @@ fn replay_diffs_computes_hash() -> SaveResult<()> {
 #[test]
 fn verify_state_hash_detects_mismatch() {
     let result = LoadReconstruction::verify_state_hash(1, 2);
-    assert!(matches!(result, Err(SaveError::StateHashMismatch { expected: 2, got: 1 })));
+    assert!(matches!(
+        result,
+        Err(SaveError::StateHashMismatch {
+            expected: 2,
+            got: 1
+        })
+    ));
 }
 
 // ------------------------------------------------------------------
@@ -482,9 +619,10 @@ fn full_save_and_list_snapshots() -> SaveResult<()> {
         .with_table(dummy_table("provinces"));
 
     for gen in [100u64, 200, 300] {
-        let snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(gen), gen))
-            .with_table_data("actors", vec![gen as u8])
-            .with_table_data("provinces", vec![(gen / 10) as u8]);
+        let snapshot =
+            PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(gen), gen))
+                .with_table_data("actors", vec![gen as u8])
+                .with_table_data("provinces", vec![(gen / 10) as u8]);
         persistence.write_snapshot(&snapshot)?;
     }
 
@@ -497,4 +635,107 @@ fn full_save_and_list_snapshots() -> SaveResult<()> {
 
     cleanup(&dir);
     Ok(())
+}
+
+// ------------------------------------------------------------------
+// Edge case tests
+// ------------------------------------------------------------------
+
+#[test]
+fn load_with_corrupt_manifest_returns_error() {
+    let dir = temp_dir();
+    cleanup(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let persistence = SnapshotPersistence::new(&dir);
+    let corrupt_path = persistence.snapshot_path(Tick(1));
+
+    // Write a snapshot file with invalid JSON in the header
+    use std::io::Write;
+    let mut file = std::fs::File::create(&corrupt_path).unwrap();
+    let fake_header_len: u64 = 7;
+    file.write_all(&fake_header_len.to_le_bytes()).unwrap();
+    file.write_all(b"NOTJSON").unwrap();
+    file.write_all(&0u64.to_le_bytes()).unwrap(); // zero tables
+
+    let result = persistence.read_snapshot(Tick(1));
+    assert!(
+        matches!(result, Err(SaveError::IpcDeserialization(_))),
+        "expected IpcDeserialization"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn load_phase_out_of_order_returns_error() -> SaveResult<()> {
+    let dir = temp_dir();
+    cleanup(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| SaveError::Io(e.to_string()))?;
+
+    let persistence = SnapshotPersistence::new(&dir);
+    let manifest = SchemaManifest::new("1.0.0").with_table(dummy_table("actors"));
+    let snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(7), 0x1234));
+    persistence.write_snapshot(&snapshot)?;
+
+    let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
+
+    // Run phase 1
+    recon.phase1_snapshot_deserialize()?;
+
+    // Attempt phase 3 directly, skipping phase 2 — should fail
+    let result = recon.phase3_schema_migration(&manifest);
+    assert!(
+        matches!(result, Err(SaveError::InvalidPhaseTransition { .. })),
+        "expected InvalidPhaseTransition, got {:?}",
+        result
+    );
+
+    cleanup(&dir);
+    Ok(())
+}
+
+#[test]
+fn replay_diffs_with_no_snapshot_returns_error() {
+    let dir = temp_dir();
+    cleanup(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let persistence = SnapshotPersistence::new(&dir);
+    let recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
+
+    let records: Vec<CommitRecord> = vec![];
+    let result = recon.replay_diffs(Tick(999), &records);
+    assert!(
+        matches!(result, Err(SaveError::SnapshotNotFound(_))),
+        "expected SnapshotNotFound, got {:?}",
+        result
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn mod_tolerance_strict_rejects_missing_mod() {
+    let mut stored = FingerprintRegistry::new();
+    stored.register(fp("base", "1.0", "abc"));
+    stored.register(fp("dlc", "1.0", "def"));
+
+    // Available mods don't include "dlc"
+    let available = vec![fp("base", "1.0", "abc")];
+
+    let checker = ModToleranceChecker::new(ModTolerancePolicy::Strict);
+    let result = checker.check(&stored, &available);
+    assert!(
+        result.is_err(),
+        "Strict policy should reject missing mod, got {:?}",
+        result
+    );
+
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, SaveError::Generic(_)),
+        "expected Generic error about missing mod, got {:?}",
+        err
+    );
 }

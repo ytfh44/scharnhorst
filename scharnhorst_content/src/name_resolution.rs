@@ -17,8 +17,8 @@ impl NameResolver {
         Self::default()
     }
 
- /// Register a name, assigning a new stable ID.
- /// Returns an error if the name already exists.
+    /// Register a name, assigning a new stable ID.
+    /// Returns an error if the name already exists.
     pub fn register(&mut self, name: impl Into<String>) -> ContentResult<RowId> {
         let name = name.into();
         if self.name_to_id.contains_key(&name) {
@@ -31,7 +31,7 @@ impl NameResolver {
         Ok(id)
     }
 
- /// Lookup the ID for a name.
+    /// Lookup the ID for a name.
     pub fn resolve(&self, name: &str) -> ContentResult<RowId> {
         self.name_to_id
             .get(name)
@@ -39,7 +39,7 @@ impl NameResolver {
             .ok_or_else(|| ContentError::NameResolutionFailed(name.to_owned()))
     }
 
- /// Reverse lookup: get the name for an ID.
+    /// Reverse lookup: get the name for an ID.
     pub fn name_of(&self, id: RowId) -> ContentResult<String> {
         self.id_to_name
             .get(&id)
@@ -47,17 +47,17 @@ impl NameResolver {
             .ok_or_else(|| ContentError::NameResolutionFailed(format!("{}", id.0)))
     }
 
- /// Returns true if the name is known.
+    /// Returns true if the name is known.
     pub fn contains_name(&self, name: &str) -> bool {
         self.name_to_id.contains_key(name)
     }
 
- /// Returns true if the ID is known.
+    /// Returns true if the ID is known.
     pub fn contains_id(&self, id: RowId) -> bool {
         self.id_to_name.contains_key(&id)
     }
 
- /// Resolve a name to its ID, or auto-assign a new ID if unknown.
+    /// Resolve a name to its ID, or auto-assign a new ID if unknown.
     pub fn resolve_or_assign(&mut self, name: impl Into<String>) -> RowId {
         let name = name.into();
         if let Some(&id) = self.name_to_id.get(&name) {
@@ -70,17 +70,17 @@ impl NameResolver {
         id
     }
 
- /// Iterate over all registered names.
+    /// Iterate over all registered names.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.name_to_id.keys().map(|s| s.as_str())
     }
 
- /// Iterate over all registered IDs.
+    /// Iterate over all registered IDs.
     pub fn ids(&self) -> impl Iterator<Item = RowId> + '_ {
         self.id_to_name.keys().copied()
     }
 
- /// Number of registered entries.
+    /// Number of registered entries.
     pub fn len(&self) -> usize {
         self.name_to_id.len()
     }
@@ -102,19 +102,19 @@ impl NamespaceResolver {
         Self::default()
     }
 
- /// Ensure a namespace exists, returning a mutable reference.
+    /// Ensure a namespace exists, returning a mutable reference.
     pub fn namespace(&mut self, table: impl Into<String>) -> &mut NameResolver {
         let resolver = self.tables.entry(table.into()).or_default();
         resolver.next_id = self.next_id;
         resolver
     }
 
- /// Bump the shared next_id after registering in a namespace.
+    /// Bump the shared next_id after registering in a namespace.
     pub fn sync_next_id(&mut self) {
         self.next_id = self.tables.values().map(|r| r.next_id).max().unwrap_or(0);
     }
 
- /// Resolve a name within a specific table namespace.
+    /// Resolve a name within a specific table namespace.
     pub fn resolve(&self, table: &str, name: &str) -> ContentResult<RowId> {
         self.tables
             .get(table)
@@ -122,7 +122,7 @@ impl NamespaceResolver {
             .resolve(name)
     }
 
- /// Resolve a name to its ID within a namespace, or auto-assign if unknown.
+    /// Resolve a name to its ID within a namespace, or auto-assign if unknown.
     pub fn resolve_or_assign(&mut self, table: &str, name: &str) -> RowId {
         let resolver = self.tables.entry(table.to_owned()).or_default();
         resolver.next_id = self.next_id;
@@ -131,7 +131,7 @@ impl NamespaceResolver {
         id
     }
 
- /// Reverse lookup within a table namespace.
+    /// Reverse lookup within a table namespace.
     pub fn name_of(&self, table: &str, id: RowId) -> ContentResult<String> {
         self.tables
             .get(table)
@@ -139,7 +139,7 @@ impl NamespaceResolver {
             .name_of(id)
     }
 
- /// Returns all known table names.
+    /// Returns all known table names.
     pub fn table_names(&self) -> impl Iterator<Item = &str> {
         self.tables.keys().map(|s| s.as_str())
     }

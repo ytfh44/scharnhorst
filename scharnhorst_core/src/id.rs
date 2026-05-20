@@ -7,24 +7,28 @@ use crate::error::{CoreError, CoreResult};
 /// A monotonically increasing simulation tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Tick(
- /// Deprecated: use [`Tick::as_u64`] instead.
+    /// Deprecated: use [`Tick::as_u64`] instead.
     pub u64,
 );
 
 impl Tick {
     pub const ZERO: Self = Self(0);
 
- /// Maximum valid tick value. `u64::MAX` is reserved as a sentinel
- /// for "no tick" in atomic storage contexts (e.g. QueryEngine `latest_tick`).
+    /// Maximum valid tick value. `u64::MAX` is reserved as a sentinel
+    /// for "no tick" in atomic storage contexts (e.g. QueryEngine `latest_tick`).
     pub const MAX: Self = Self(u64::MAX - 1);
 
- /// Access the inner `u64` value.
+    /// Access the inner `u64` value.
     pub fn as_u64(self) -> u64 {
         self.0
     }
 
     pub fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+        if self.0 >= Self::MAX.0 {
+            Self::MAX
+        } else {
+            Self(self.0 + 1)
+        }
     }
 
     pub fn prev(self) -> Option<Self> {
@@ -41,7 +45,7 @@ impl fmt::Display for Tick {
 /// Opaque identifier for a table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TableId(
- /// Deprecated: use [`TableId::as_u64`] instead.
+    /// Deprecated: use [`TableId::as_u64`] instead.
     pub u64,
 );
 
@@ -50,7 +54,7 @@ impl TableId {
         Self(raw)
     }
 
- /// Access the inner `u64` value.
+    /// Access the inner `u64` value.
     pub fn as_u64(self) -> u64 {
         self.0
     }
@@ -82,7 +86,7 @@ impl FromStr for TableId {
 /// [`RowId::as_u64`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RowId(
- /// Soft-deprecated: use [`RowId::as_u64`] instead.
+    /// Soft-deprecated: use [`RowId::as_u64`] instead.
     pub u64,
 );
 
@@ -91,7 +95,7 @@ impl RowId {
         Self(raw)
     }
 
- /// Access the inner `u64` value.
+    /// Access the inner `u64` value.
     pub fn as_u64(self) -> u64 {
         self.0
     }
@@ -120,7 +124,7 @@ impl FromStr for RowId {
 mod tests {
     use super::*;
 
- // ---- Tick ----
+    // ---- Tick ----
 
     #[test]
     fn tick_zero() {
@@ -132,8 +136,8 @@ mod tests {
     fn tick_next() {
         assert_eq!(Tick(0).next(), Tick(1));
         assert_eq!(Tick(41).next(), Tick(42));
- // saturating: max + 1 = max
-        assert_eq!(Tick(u64::MAX).next(), Tick(u64::MAX));
+        assert_eq!(Tick::MAX.next(), Tick::MAX);
+        assert_eq!(Tick(u64::MAX).next(), Tick::MAX);
     }
 
     #[test]
@@ -158,7 +162,7 @@ mod tests {
         assert!(Tick(7) >= Tick(7));
     }
 
- // ---- TableId ----
+    // ---- TableId ----
 
     #[test]
     fn table_id_new() {
@@ -210,7 +214,7 @@ mod tests {
         assert_eq!(t, back);
     }
 
- // ---- RowId ----
+    // ---- RowId ----
 
     #[test]
     fn row_id_new() {
@@ -262,7 +266,7 @@ mod tests {
         assert_eq!(r, back);
     }
 
- // ---- additional coverage ----
+    // ---- additional coverage ----
 
     #[test]
     fn tick_serialize_roundtrip() {
@@ -281,22 +285,25 @@ mod tests {
     fn tick_debug() {
         assert_eq!(format!("{:?}", Tick(0)), "Tick(0)");
         assert_eq!(format!("{:?}", Tick(42)), "Tick(42)");
-        assert_eq!(format!("{:?}", Tick(u64::MAX)), format!("Tick({})", u64::MAX));
+        assert_eq!(
+            format!("{:?}", Tick(u64::MAX)),
+            format!("Tick({})", u64::MAX)
+        );
     }
 
     #[test]
     fn tick_zero_identity() {
- // Tick::ZERO equals Tick(0)
+        // Tick::ZERO equals Tick(0)
         assert_eq!(Tick::ZERO, Tick(0));
- // next from ZERO yields Tick(1)
+        // next from ZERO yields Tick(1)
         assert_eq!(Tick::ZERO.next(), Tick(1));
- // prev from ZERO yields None
+        // prev from ZERO yields None
         assert!(Tick::ZERO.prev().is_none());
     }
 
     #[test]
     fn tick_next_n_equivalent() {
- // calling next n times on Tick(0) reaches Tick(n)
+        // calling next n times on Tick(0) reaches Tick(n)
         let mut t = Tick(0);
         for i in 1..=5 {
             t = t.next();
@@ -322,7 +329,7 @@ mod tests {
         b.hash(&mut hb);
         assert_eq!(ha.finish(), hb.finish());
 
- // different values should have different hashes (highly likely)
+        // different values should have different hashes (highly likely)
         let c = TableId(99);
         let mut hc = DefaultHasher::new();
         c.hash(&mut hc);
@@ -367,10 +374,21 @@ mod tests {
 
     #[test]
     fn row_id_new_and_into() {
- // RowId::new wraps a u64
+        // RowId::new wraps a u64
         let r = RowId::new(7);
         assert_eq!(r.0, 7);
- // field access is equivalent to new
+        // field access is equivalent to new
         assert_eq!(r, RowId(7));
+    }
+
+    /// Would have failed: Tick::next() at Tick::MAX should saturate
+    /// instead of overflowing to 0, breaking monotonicity.
+    #[test]
+    fn tick_saturates_at_max() {
+        let t = Tick::MAX;
+        let next = t.next();
+        assert_eq!(next, Tick::MAX);
+        let next2 = next.next();
+        assert_eq!(next2, Tick::MAX);
     }
 }

@@ -19,12 +19,8 @@ pub fn manifest_from_registry(
         .table_names()
         .filter_map(|name| registry.get(name).ok().cloned())
         .collect();
-    let relations: Vec<RelationEdge> = registry
-        .relation_graph()
-        .all_edges()
-        .to_vec();
-    let mut manifest = SchemaManifest::new(&ev)
-        .with_metadata("engine_version", &ev);
+    let relations: Vec<RelationEdge> = registry.relation_graph().all_edges().to_vec();
+    let mut manifest = SchemaManifest::new(&ev).with_metadata("engine_version", &ev);
     for table in tables {
         manifest = manifest.with_table(table);
     }
@@ -39,30 +35,26 @@ pub fn manifest_from_registry(
 
 /// Serialize a SchemaManifest to JSON bytes.
 pub fn manifest_to_bytes(manifest: &SchemaManifest) -> Result<Vec<u8>, ContentError> {
-    serde_json::to_vec(manifest).map_err(|e| {
-        ContentError::ManifestSerialization(format!("json: {}", e))
-    })
+    serde_json::to_vec(manifest)
+        .map_err(|e| ContentError::ManifestSerialization(format!("json: {}", e)))
 }
 
 /// Deserialize a SchemaManifest from JSON bytes.
 pub fn manifest_from_bytes(bytes: &[u8]) -> Result<SchemaManifest, ContentError> {
-    serde_json::from_slice(bytes).map_err(|e| {
-        ContentError::ManifestSerialization(format!("json: {}", e))
-    })
+    serde_json::from_slice(bytes)
+        .map_err(|e| ContentError::ManifestSerialization(format!("json: {}", e)))
 }
 
 /// Serialize a SchemaManifest to a TOML string.
 pub fn manifest_to_toml(manifest: &SchemaManifest) -> Result<String, ContentError> {
-    toml::to_string_pretty(manifest).map_err(|e| {
-        ContentError::ManifestSerialization(format!("toml: {}", e))
-    })
+    toml::to_string_pretty(manifest)
+        .map_err(|e| ContentError::ManifestSerialization(format!("toml: {}", e)))
 }
 
 /// Deserialize a SchemaManifest from a TOML string.
 pub fn manifest_from_toml(toml_str: &str) -> Result<SchemaManifest, ContentError> {
-    toml::from_str(toml_str).map_err(|e| {
-        ContentError::ManifestSerialization(format!("toml: {}", e))
-    })
+    toml::from_str(toml_str)
+        .map_err(|e| ContentError::ManifestSerialization(format!("toml: {}", e)))
 }
 
 /// Retrieve the engine version from a SchemaManifest's metadata.
@@ -97,7 +89,7 @@ pub fn migrated_from_manifest(
     for fp in &manifest.mod_fingerprints {
         new_manifest = new_manifest.with_mod_fingerprint(fp.clone());
     }
- // Copy metadata
+    // Copy metadata
     for (key, value) in &manifest.metadata {
         new_manifest = new_manifest.with_metadata(key, value);
     }
@@ -160,10 +152,7 @@ mod tests {
         let toml_str = manifest_to_toml(&manifest).unwrap();
         assert!(!toml_str.is_empty());
         let restored = manifest_from_toml(&toml_str).unwrap();
-        assert_eq!(
-            manifest.schema_version,
-            restored.schema_version
-        );
+        assert_eq!(manifest.schema_version, restored.schema_version);
         assert_eq!(manifest.tables.len(), restored.tables.len());
     }
 
@@ -211,10 +200,7 @@ mod tests {
             .with_table(TableSpec::new("actors"));
         let bytes = manifest_to_bytes(&manifest).unwrap();
         let restored = manifest_from_bytes(&bytes).unwrap();
-        assert_eq!(
-            manifest.schema_version,
-            restored.schema_version
-        );
+        assert_eq!(manifest.schema_version, restored.schema_version);
         assert_eq!(manifest.tables.len(), restored.tables.len());
     }
 }

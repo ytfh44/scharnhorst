@@ -7,22 +7,18 @@ use crate::error::{SaveError, SaveResult};
 /// Outcome of comparing stored mod fingerprints against available mods.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModLoadOutcome {
- /// All mods match exactly.
+    /// All mods match exactly.
     ExactMatch,
- /// Some mods have version or content hash mismatches; load proceeds with warnings.
-    VersionMismatch {
-        warnings: Vec<String>,
-    },
- /// Mods present in save but missing on disk; affected tables are degraded.
+    /// Some mods have version or content hash mismatches; load proceeds with warnings.
+    VersionMismatch { warnings: Vec<String> },
+    /// Mods present in save but missing on disk; affected tables are degraded.
     MissingMods {
         missing: Vec<ModFingerprint>,
         degraded_tables: Vec<String>,
     },
- /// Extra mods on disk not present in save; they apply from cold start.
-    ExtraMods {
-        extra: Vec<ModFingerprint>,
-    },
- /// Combined mismatches and missing mods.
+    /// Extra mods on disk not present in save; they apply from cold start.
+    ExtraMods { extra: Vec<ModFingerprint> },
+    /// Combined mismatches and missing mods.
     Degraded {
         warnings: Vec<String>,
         degraded_tables: Vec<String>,
@@ -32,11 +28,11 @@ pub enum ModLoadOutcome {
 /// Policy for handling mod mismatches during load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModTolerancePolicy {
- /// Strict: reject any mismatch.
+    /// Strict: reject any mismatch.
     Strict,
- /// Warn but allow mismatches.
+    /// Warn but allow mismatches.
     Warn,
- /// Silent: ignore mismatches.
+    /// Silent: ignore mismatches.
     Silent,
 }
 
@@ -67,7 +63,7 @@ impl ModToleranceChecker {
         self.critical_mods.contains(mod_id)
     }
 
- /// Compare stored fingerprints against available mods and return the load outcome.
+    /// Compare stored fingerprints against available mods and return the load outcome.
     pub fn check(
         &self,
         stored: &FingerprintRegistry,
@@ -79,6 +75,33 @@ impl ModToleranceChecker {
             if self.is_critical(&missing.mod_id) {
                 return Err(SaveError::CriticalModMissing(missing.mod_id.clone()));
             }
+        }
+
+        if self.policy == ModTolerancePolicy::Strict {
+            if available.len() != stored.len() {
+                return Err(SaveError::Generic(format!(
+                    "strict mode: mod count mismatch: stored={}, available={}",
+                    stored.len(),
+                    available.len()
+                )));
+            }
+            if let Some(missing) = comparison.missing.first() {
+                return Err(SaveError::Generic(format!(
+                    "strict mode: mod mismatch detected: mod '{}' is missing from available mods",
+                    missing.mod_id
+                )));
+            }
+            if let Some((stored_fp, avail_fp)) = comparison.mismatched.first() {
+                return Err(SaveError::Generic(format!(
+                    "strict mode: mod mismatch detected: mod '{}' version/content differs (stored v{} vs available v{})",
+                    stored_fp.mod_id, stored_fp.version, avail_fp.version
+                )));
+            }
+            return Ok(ModLoadOutcome::ExactMatch);
+        }
+
+        if self.policy == ModTolerancePolicy::Silent {
+            return Ok(ModLoadOutcome::ExactMatch);
         }
 
         let warnings: Vec<String> = comparison
@@ -104,9 +127,7 @@ impl ModToleranceChecker {
             return Ok(ModLoadOutcome::ExactMatch);
         }
 
-        if !comparison.mismatched.is_empty()
-            && !comparison.missing.is_empty()
-            && !extra.is_empty()
+        if !comparison.mismatched.is_empty() && !comparison.missing.is_empty() && !extra.is_empty()
         {
             return Ok(ModLoadOutcome::Degraded {
                 warnings,
@@ -132,7 +153,7 @@ impl ModToleranceChecker {
         Ok(ModLoadOutcome::ExactMatch)
     }
 
- /// Produce the final mod list to use for compilation.
+    /// Produce the final mod list to use for compilation.
     pub fn final_mod_list(
         &self,
         stored: &FingerprintRegistry,

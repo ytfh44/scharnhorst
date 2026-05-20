@@ -101,11 +101,7 @@ impl EntityMaterializationRegistry {
         Ok(())
     }
 
-    pub fn lookup(
-        &self,
-        table_name: &str,
-        row_id: RowId,
-    ) -> BevyBridgeResult<Option<Entity>> {
+    pub fn lookup(&self, table_name: &str, row_id: RowId) -> BevyBridgeResult<Option<Entity>> {
         let map = self
             .inner
             .lock()
@@ -113,11 +109,7 @@ impl EntityMaterializationRegistry {
         Ok(map.get(&(table_name.to_owned(), row_id)).copied())
     }
 
-    pub fn unregister(
-        &self,
-        table_name: &str,
-        row_id: RowId,
-    ) -> BevyBridgeResult<Option<Entity>> {
+    pub fn unregister(&self, table_name: &str, row_id: RowId) -> BevyBridgeResult<Option<Entity>> {
         let mut map = self
             .inner
             .lock()
@@ -202,11 +194,7 @@ impl EntityMaterializationRegistry {
         Ok(spawned)
     }
 
-    pub fn dematerialize(
-        &self,
-        commands: &mut Commands,
-        entity: Entity,
-    ) -> BevyBridgeResult<()> {
+    pub fn dematerialize(&self, commands: &mut Commands, entity: Entity) -> BevyBridgeResult<()> {
         let map = self
             .inner
             .lock()
@@ -225,7 +213,9 @@ impl EntityMaterializationRegistry {
                 commands.entity(entity).despawn();
                 Ok(())
             }
-            None => Err(BevyBridgeError::EntityNotFound(entity.index().index() as u64)),
+            None => Err(BevyBridgeError::EntityNotFound(
+                entity.index().index() as u64
+            )),
         }
     }
 
@@ -315,8 +305,8 @@ mod tests {
 
     #[test]
     fn materialization_config_with_filter() {
-        let config = MaterializationConfig::new("provinces")
-            .with_filter(MaterializationFilter::AllRows);
+        let config =
+            MaterializationConfig::new("provinces").with_filter(MaterializationFilter::AllRows);
         assert!(config.filter.is_some());
     }
 
@@ -388,7 +378,11 @@ mod tests {
     fn registry_len_and_is_empty() -> BevyBridgeResult<()> {
         let reg = EntityMaterializationRegistry::new();
         assert!(reg.is_empty()?);
-        reg.register("t", RowId::new(1), bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"))?;
+        reg.register(
+            "t",
+            RowId::new(1),
+            bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"),
+        )?;
         assert_eq!(reg.len()?, 1);
         assert!(!reg.is_empty()?);
         Ok(())
@@ -397,9 +391,21 @@ mod tests {
     #[test]
     fn registry_table_names() -> BevyBridgeResult<()> {
         let reg = EntityMaterializationRegistry::new();
-        reg.register("a", RowId::new(1), bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"))?;
-        reg.register("a", RowId::new(2), bevy::prelude::Entity::from_raw_u32(2).expect("Entity index must be valid"))?;
-        reg.register("b", RowId::new(3), bevy::prelude::Entity::from_raw_u32(3).expect("Entity index must be valid"))?;
+        reg.register(
+            "a",
+            RowId::new(1),
+            bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"),
+        )?;
+        reg.register(
+            "a",
+            RowId::new(2),
+            bevy::prelude::Entity::from_raw_u32(2).expect("Entity index must be valid"),
+        )?;
+        reg.register(
+            "b",
+            RowId::new(3),
+            bevy::prelude::Entity::from_raw_u32(3).expect("Entity index must be valid"),
+        )?;
         let mut names = reg.table_names()?;
         names.sort();
         assert_eq!(names, vec!["a", "b"]);

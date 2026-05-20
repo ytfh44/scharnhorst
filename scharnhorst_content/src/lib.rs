@@ -14,7 +14,7 @@ pub use error::{ContentError, ContentResult};
 pub use fingerprint::{FingerprintComparison, FingerprintRegistry, ModFingerprintExt};
 pub use lifecycle::{LifecycleCoordinator, LoadLifecycle, LoadPhase};
 pub use manifest::{
-    manifest_from_bytes, manifest_from_registry, manifest_from_toml, manifest_engine_version,
+    manifest_engine_version, manifest_from_bytes, manifest_from_registry, manifest_from_toml,
     manifest_to_bytes, manifest_to_toml, migrated_from_manifest, migrated_table_by_name,
     migrated_target_version,
 };

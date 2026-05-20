@@ -57,6 +57,11 @@ fn mvp_history_records_commits() {
     world.tick().expect("tick");
     world.tick().expect("tick");
 
-    let history_len = world.journal.history().len();
+    let history_len = world
+        .scheduler
+        .journal_mut()
+        .expect("lock journal")
+        .history()
+        .len();
     assert!(history_len >= 1, "expected at least 1 commit in history");
 }

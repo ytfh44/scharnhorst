@@ -47,15 +47,13 @@ pub enum SqlValue {
 }
 
 impl SqlValue {
- /// Convert the SQL value to a JSON value for Diff storage.
+    /// Convert the SQL value to a JSON value for Diff storage.
     pub fn to_json(&self) -> Value {
         match self {
             SqlValue::Integer(i) => Value::Number((*i).into()),
-            SqlValue::Float(f) => {
-                serde_json::Number::from_f64(*f)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null)
-            }
+            SqlValue::Float(f) => serde_json::Number::from_f64(*f)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
             SqlValue::String(s) => Value::String(s.clone()),
             SqlValue::Boolean(b) => Value::Bool(*b),
             SqlValue::Null => Value::Null,
@@ -74,26 +72,26 @@ pub struct WhereCondition {
 /// Comparison operators supported in WHERE clauses.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComparisonOp {
-    Eq,  // =
-    Lt,  // <
-    Gt,  // >
-    Le,  // <=
-    Ge,  // >=
-    Ne,  // != or <>
+    Eq, // =
+    Lt, // <
+    Gt, // >
+    Le, // <=
+    Ge, // >=
+    Ne, // != or <>
 }
 
 /// SQL parser for debug write operations.
 pub struct SqlParser;
 
 impl SqlParser {
- /// Parse a SQL string into a SqlStatement.
+    /// Parse a SQL string into a SqlStatement.
     pub fn parse(sql: &str) -> JournalResult<SqlStatement> {
         let trimmed = sql.trim();
         if trimmed.is_empty() {
             return Err(JournalError::SqlParse("empty SQL statement".to_owned()));
         }
 
- // Determine statement type by looking at the first keyword
+        // Determine statement type by looking at the first keyword
         let first_word = trimmed
             .split_whitespace()
             .next()
@@ -111,10 +109,10 @@ impl SqlParser {
         }
     }
 
- /// Convert a SqlStatement into a Diff.
- ///
- /// For UPDATE and DELETE, the WHERE condition must identify a single row
- /// by primary key (e.g., `WHERE actor_id = 1`).
+    /// Convert a SqlStatement into a Diff.
+    ///
+    /// For UPDATE and DELETE, the WHERE condition must identify a single row
+    /// by primary key (e.g., `WHERE actor_id = 1`).
     pub fn statement_to_diff(stmt: SqlStatement) -> JournalResult<Diff> {
         match stmt {
             SqlStatement::Update {
@@ -142,7 +140,7 @@ impl SqlParser {
                     ));
                 }
 
- // Find the row_id from the columns if present
+                // Find the row_id from the columns if present
                 let mut row_id = None;
                 let mut value_map = serde_json::Map::new();
 
@@ -157,9 +155,7 @@ impl SqlParser {
                 }
 
                 let row_id = row_id.ok_or_else(|| {
-                    JournalError::SqlParse(
-                        "INSERT must specify a row identifier column".to_owned(),
-                    )
+                    JournalError::SqlParse("INSERT must specify a row identifier column".to_owned())
                 })?;
 
                 Ok(Diff::Insert {
@@ -175,11 +171,11 @@ impl SqlParser {
         }
     }
 
- /// Parse an UPDATE statement.
- ///
- /// Syntax: UPDATE table SET col = val WHERE condition
+    /// Parse an UPDATE statement.
+    ///
+    /// Syntax: UPDATE table SET col = val WHERE condition
     fn parse_update(sql: &str) -> JournalResult<SqlStatement> {
- // Remove the UPDATE keyword
+        // Remove the UPDATE keyword
         let after_update = sql
             .trim()
             .strip_prefix("UPDATE")
@@ -188,19 +184,19 @@ impl SqlParser {
 
         let mut tokens = Tokenizer::new(after_update);
 
- // Parse table name
+        // Parse table name
         let table = tokens
             .next_identifier()
             .ok_or_else(|| JournalError::SqlParse("expected table name after UPDATE".to_owned()))?;
 
- // Expect SET
+        // Expect SET
         if !tokens.consume_keyword("SET") {
             return Err(JournalError::SqlParse(
                 "expected SET after table name".to_owned(),
             ));
         }
 
- // Parse column = value
+        // Parse column = value
         let column = tokens
             .next_identifier()
             .ok_or_else(|| JournalError::SqlParse("expected column name after SET".to_owned()))?;
@@ -215,11 +211,9 @@ impl SqlParser {
             .next_value()
             .ok_or_else(|| JournalError::SqlParse("expected value after =".to_owned()))?;
 
- // Expect WHERE
+        // Expect WHERE
         if !tokens.consume_keyword("WHERE") {
-            return Err(JournalError::SqlParse(
-                "expected WHERE clause".to_owned(),
-            ));
+            return Err(JournalError::SqlParse("expected WHERE clause".to_owned()));
         }
 
         let condition = Self::parse_where_clause(&mut tokens)?;
@@ -232,9 +226,9 @@ impl SqlParser {
         })
     }
 
- /// Parse an INSERT statement.
- ///
- /// Syntax: INSERT INTO table (col1, col2) VALUES (val1, val2)
+    /// Parse an INSERT statement.
+    ///
+    /// Syntax: INSERT INTO table (col1, col2) VALUES (val1, val2)
     fn parse_insert(sql: &str) -> JournalResult<SqlStatement> {
         let after_insert = sql
             .trim()
@@ -244,34 +238,34 @@ impl SqlParser {
 
         let mut tokens = Tokenizer::new(after_insert);
 
- // Expect INTO
+        // Expect INTO
         if !tokens.consume_keyword("INTO") {
             return Err(JournalError::SqlParse(
                 "expected INTO after INSERT".to_owned(),
             ));
         }
 
- // Parse table name
+        // Parse table name
         let table = tokens
             .next_identifier()
             .ok_or_else(|| JournalError::SqlParse("expected table name after INTO".to_owned()))?;
 
- // Parse column list (col1, col2,...)
-        let columns = tokens
-            .next_paren_list()
-            .ok_or_else(|| JournalError::SqlParse("expected column list (col1, col2, ...)".to_owned()))?;
+        // Parse column list (col1, col2,...)
+        let columns = tokens.next_paren_list().ok_or_else(|| {
+            JournalError::SqlParse("expected column list (col1, col2, ...)".to_owned())
+        })?;
 
- // Expect VALUES
+        // Expect VALUES
         if !tokens.consume_keyword("VALUES") {
             return Err(JournalError::SqlParse(
                 "expected VALUES after column list".to_owned(),
             ));
         }
 
- // Parse value list (val1, val2,...)
-        let values = tokens
-            .next_paren_values()
-            .ok_or_else(|| JournalError::SqlParse("expected value list (val1, val2, ...)".to_owned()))?;
+        // Parse value list (val1, val2,...)
+        let values = tokens.next_paren_values().ok_or_else(|| {
+            JournalError::SqlParse("expected value list (val1, val2, ...)".to_owned())
+        })?;
 
         if columns.len() != values.len() {
             return Err(JournalError::SqlParse(format!(
@@ -288,9 +282,9 @@ impl SqlParser {
         })
     }
 
- /// Parse a DELETE statement.
- ///
- /// Syntax: DELETE FROM table WHERE condition
+    /// Parse a DELETE statement.
+    ///
+    /// Syntax: DELETE FROM table WHERE condition
     fn parse_delete(sql: &str) -> JournalResult<SqlStatement> {
         let after_delete = sql
             .trim()
@@ -300,23 +294,21 @@ impl SqlParser {
 
         let mut tokens = Tokenizer::new(after_delete);
 
- // Expect FROM
+        // Expect FROM
         if !tokens.consume_keyword("FROM") {
             return Err(JournalError::SqlParse(
                 "expected FROM after DELETE".to_owned(),
             ));
         }
 
- // Parse table name
+        // Parse table name
         let table = tokens
             .next_identifier()
             .ok_or_else(|| JournalError::SqlParse("expected table name after FROM".to_owned()))?;
 
- // Expect WHERE
+        // Expect WHERE
         if !tokens.consume_keyword("WHERE") {
-            return Err(JournalError::SqlParse(
-                "expected WHERE clause".to_owned(),
-            ));
+            return Err(JournalError::SqlParse("expected WHERE clause".to_owned()));
         }
 
         let condition = Self::parse_where_clause(&mut tokens)?;
@@ -324,15 +316,15 @@ impl SqlParser {
         Ok(SqlStatement::Delete { table, condition })
     }
 
- /// Parse a WHERE clause: column op value
+    /// Parse a WHERE clause: column op value
     fn parse_where_clause(tokens: &mut Tokenizer) -> JournalResult<WhereCondition> {
         let column = tokens
             .next_identifier()
             .ok_or_else(|| JournalError::SqlParse("expected column name in WHERE".to_owned()))?;
 
-        let operator = tokens
-            .next_comparison_op()
-            .ok_or_else(|| JournalError::SqlParse("expected comparison operator in WHERE".to_owned()))?;
+        let operator = tokens.next_comparison_op().ok_or_else(|| {
+            JournalError::SqlParse("expected comparison operator in WHERE".to_owned())
+        })?;
 
         let value = tokens
             .next_value()
@@ -345,18 +337,18 @@ impl SqlParser {
         })
     }
 
- /// Extract a RowId from a WHERE condition that identifies a single row.
- ///
- /// Currently only supports simple equality conditions on id-like columns.
+    /// Extract a RowId from a WHERE condition that identifies a single row.
+    ///
+    /// Currently only supports simple equality conditions on id-like columns.
     fn extract_row_id_from_condition(condition: &WhereCondition) -> JournalResult<RowId> {
- // Only support equality operator for row identification
+        // Only support equality operator for row identification
         if condition.operator != ComparisonOp::Eq {
             return Err(JournalError::SqlUnsupported(
                 "WHERE clause must use = operator for row identification".to_owned(),
             ));
         }
 
- // Check if the column is an id-like column
+        // Check if the column is an id-like column
         let col_lower = condition.column.to_ascii_lowercase();
         if !col_lower.ends_with("_id") && col_lower != "id" && col_lower != "row_id" {
             return Err(JournalError::SqlUnsupported(format!(
@@ -368,7 +360,7 @@ impl SqlParser {
         Self::sql_value_to_row_id(&condition.value)
     }
 
- /// Convert a SQL value to a RowId.
+    /// Convert a SQL value to a RowId.
     fn sql_value_to_row_id(value: &SqlValue) -> JournalResult<RowId> {
         match value {
             SqlValue::Integer(i) if *i >= 0 => Ok(RowId::new(*i as u64)),
@@ -391,7 +383,7 @@ impl<'a> Tokenizer<'a> {
         Self { input, pos: 0 }
     }
 
- /// Skip whitespace.
+    /// Skip whitespace.
     fn skip_whitespace(&mut self) {
         while self.pos < self.input.len() {
             let c = self.input[self.pos..].chars().next().unwrap_or('\0');
@@ -403,13 +395,13 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
- /// Peek at the next non-whitespace character.
+    /// Peek at the next non-whitespace character.
     fn peek_char(&mut self) -> Option<char> {
         self.skip_whitespace();
         self.input[self.pos..].chars().next()
     }
 
- /// Consume a keyword (case-insensitive).
+    /// Consume a keyword (case-insensitive).
     fn consume_keyword(&mut self, keyword: &str) -> bool {
         self.skip_whitespace();
         let remaining = &self.input[self.pos..];
@@ -418,7 +410,7 @@ impl<'a> Tokenizer<'a> {
         if remaining.len() >= keyword_len {
             let prefix = &remaining[..keyword_len];
             if prefix.eq_ignore_ascii_case(keyword) {
- // Make sure it's a complete word (followed by whitespace or special char)
+                // Make sure it's a complete word (followed by whitespace or special char)
                 if remaining.len() == keyword_len
                     || !remaining.as_bytes()[keyword_len].is_ascii_alphanumeric()
                         && remaining[keyword_len..].chars().next().unwrap_or('\0') != '_'
@@ -431,7 +423,7 @@ impl<'a> Tokenizer<'a> {
         false
     }
 
- /// Consume an operator.
+    /// Consume an operator.
     fn consume_operator(&mut self, op: &str) -> bool {
         self.skip_whitespace();
         let remaining = &self.input[self.pos..];
@@ -442,7 +434,7 @@ impl<'a> Tokenizer<'a> {
         false
     }
 
- /// Get the next identifier (table name, column name, etc.).
+    /// Get the next identifier (table name, column name, etc.).
     fn next_identifier(&mut self) -> Option<String> {
         self.skip_whitespace();
 
@@ -467,7 +459,7 @@ impl<'a> Tokenizer<'a> {
         Some(ident.to_owned())
     }
 
- /// Get the next comparison operator.
+    /// Get the next comparison operator.
     fn next_comparison_op(&mut self) -> Option<ComparisonOp> {
         self.skip_whitespace();
         let remaining = &self.input[self.pos..];
@@ -495,7 +487,7 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
- /// Get the next value (integer, float, string, boolean, null).
+    /// Get the next value (integer, float, string, boolean, null).
     fn next_value(&mut self) -> Option<SqlValue> {
         self.skip_whitespace();
         let remaining = &self.input[self.pos..];
@@ -506,17 +498,17 @@ impl<'a> Tokenizer<'a> {
 
         let first_char = remaining.chars().next()?;
 
- // String literal (single or double quotes)
+        // String literal (single or double quotes)
         if first_char == '\'' || first_char == '"' {
             return self.parse_string_literal(first_char);
         }
 
- // Boolean or NULL
+        // Boolean or NULL
         if first_char.is_ascii_alphabetic() {
             return self.parse_keyword_value();
         }
 
- // Number (integer or float)
+        // Number (integer or float)
         if first_char.is_ascii_digit() || first_char == '-' || first_char == '+' {
             return self.parse_number();
         }
@@ -524,7 +516,7 @@ impl<'a> Tokenizer<'a> {
         None
     }
 
- /// Parse a string literal.
+    /// Parse a string literal.
     fn parse_string_literal(&mut self, quote_char: char) -> Option<SqlValue> {
         self.skip_whitespace();
         let remaining = &self.input[self.pos..];
@@ -539,7 +531,7 @@ impl<'a> Tokenizer<'a> {
         while self.pos < self.input.len() {
             let c = self.input[self.pos..].chars().next().unwrap_or('\0');
             if c == quote_char {
- // Check for escaped quote (double quote)
+                // Check for escaped quote (double quote)
                 if self.pos + 1 < self.input.len()
                     && self.input[self.pos + 1..].chars().next().unwrap_or('\0') == quote_char
                 {
@@ -547,8 +539,11 @@ impl<'a> Tokenizer<'a> {
                 } else {
                     let value = &self.input[start..self.pos];
                     self.pos += 1; // Skip closing quote
- // Handle escaped quotes by replacing doubled quotes with single
-                    let unescaped = value.replace(&format!("{}{}", quote_char, quote_char), &quote_char.to_string());
+                                   // Handle escaped quotes by replacing doubled quotes with single
+                    let unescaped = value.replace(
+                        &format!("{}{}", quote_char, quote_char),
+                        &quote_char.to_string(),
+                    );
                     return Some(SqlValue::String(unescaped));
                 }
             } else {
@@ -559,7 +554,7 @@ impl<'a> Tokenizer<'a> {
         None // Unterminated string
     }
 
- /// Parse a keyword value (TRUE, FALSE, NULL).
+    /// Parse a keyword value (TRUE, FALSE, NULL).
     fn parse_keyword_value(&mut self) -> Option<SqlValue> {
         self.skip_whitespace();
         let remaining = &self.input[self.pos..];
@@ -589,7 +584,7 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
- /// Parse a number (integer or float).
+    /// Parse a number (integer or float).
     fn parse_number(&mut self) -> Option<SqlValue> {
         self.skip_whitespace();
         let remaining = &self.input[self.pos..];
@@ -618,19 +613,13 @@ impl<'a> Tokenizer<'a> {
         self.pos += end_pos;
 
         if has_dot {
-            num_str
-                .parse::<f64>()
-                .ok()
-                .map(SqlValue::Float)
+            num_str.parse::<f64>().ok().map(SqlValue::Float)
         } else {
-            num_str
-                .parse::<i64>()
-                .ok()
-                .map(SqlValue::Integer)
+            num_str.parse::<i64>().ok().map(SqlValue::Integer)
         }
     }
 
- /// Parse a parenthesized list of identifiers: (col1, col2, col3)
+    /// Parse a parenthesized list of identifiers: (col1, col2, col3)
     fn next_paren_list(&mut self) -> Option<Vec<String>> {
         self.skip_whitespace();
         let remaining = &self.input[self.pos..];
@@ -650,15 +639,14 @@ impl<'a> Tokenizer<'a> {
                 break;
             }
 
-            if let Some(ident) = self.next_identifier() {
+            {
+                let ident = self.next_identifier()?;
                 items.push(ident);
-            } else {
-                return None;
             }
 
             self.skip_whitespace();
 
- // Check for comma or closing paren
+            // Check for comma or closing paren
             if self.peek_char() == Some(',') {
                 self.pos += 1;
             } else if self.peek_char() == Some(')') {
@@ -672,7 +660,7 @@ impl<'a> Tokenizer<'a> {
         Some(items)
     }
 
- /// Parse a parenthesized list of values: (val1, val2, val3)
+    /// Parse a parenthesized list of values: (val1, val2, val3)
     fn next_paren_values(&mut self) -> Option<Vec<SqlValue>> {
         self.skip_whitespace();
         let remaining = &self.input[self.pos..];
@@ -692,15 +680,14 @@ impl<'a> Tokenizer<'a> {
                 break;
             }
 
-            if let Some(val) = self.next_value() {
+            {
+                let val = self.next_value()?;
                 values.push(val);
-            } else {
-                return None;
             }
 
             self.skip_whitespace();
 
- // Check for comma or closing paren
+            // Check for comma or closing paren
             if self.peek_char() == Some(',') {
                 self.pos += 1;
             } else if self.peek_char() == Some(')') {
@@ -875,11 +862,7 @@ mod tests {
         let diff = SqlParser::statement_to_diff(stmt).unwrap();
 
         match diff {
-            Diff::Insert {
-                table,
-                row,
-                values,
-            } => {
+            Diff::Insert { table, row, values } => {
                 assert_eq!(table, "actor_state");
                 assert_eq!(row, RowId::new(5));
                 assert_eq!(values.get("treasury"), Some(&serde_json::json!(10000)));
@@ -918,7 +901,7 @@ mod tests {
 
     #[test]
     fn parse_where_with_comparison_operators() {
- // Test various comparison operators - note: only = is supported for row identification
+        // Test various comparison operators - note: only = is supported for row identification
         let sql = "UPDATE actor_state SET treasury = 100 WHERE actor_id = 1";
         let stmt = SqlParser::parse(sql).unwrap();
 

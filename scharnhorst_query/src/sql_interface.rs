@@ -25,7 +25,7 @@ impl SqlExecutionContext {
         }
     }
 
- /// Register a named table so that it can be referenced in SQL queries.
+    /// Register a named table so that it can be referenced in SQL queries.
     pub fn register_table(&self, name: &str, batches: Vec<RecordBatch>) -> QueryResult<()> {
         if name.is_empty() {
             return Err(QueryError::InvalidQuery(
@@ -34,15 +34,15 @@ impl SqlExecutionContext {
         }
         if batches.is_empty() {
             self.ctx
-                .register_batch(name, RecordBatch::new_empty(Arc::new(
-                    arrow_schema::Schema::empty(),
-                )))
+                .register_batch(
+                    name,
+                    RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty())),
+                )
                 .map_err(|e| QueryError::DataFusion(e.to_string()))?;
         } else {
             let schema = batches[0].schema();
-            let merged =
-                concat_batches(&schema, &batches)
-                    .map_err(|e| QueryError::DataFusion(e.to_string()))?;
+            let merged = concat_batches(&schema, &batches)
+                .map_err(|e| QueryError::DataFusion(e.to_string()))?;
             self.ctx
                 .register_batch(name, merged)
                 .map_err(|e| QueryError::DataFusion(e.to_string()))?;
@@ -56,7 +56,7 @@ impl SqlExecutionContext {
         Ok(())
     }
 
- /// Unregister a previously registered table.
+    /// Unregister a previously registered table.
     pub fn unregister_table(&self, name: &str) -> QueryResult<()> {
         self.ctx
             .deregister_table(name)
@@ -70,7 +70,7 @@ impl SqlExecutionContext {
         Ok(())
     }
 
- /// Execute a SQL query and return the resulting record batches.
+    /// Execute a SQL query and return the resulting record batches.
     pub async fn execute_sql(&self, sql: &str) -> QueryResult<Vec<RecordBatch>> {
         let df = self
             .ctx
@@ -86,7 +86,7 @@ impl SqlExecutionContext {
         Ok(batches)
     }
 
- /// Execute a SQL query and return at most `limit` rows.
+    /// Execute a SQL query and return at most `limit` rows.
     pub async fn execute_sql_limited(
         &self,
         sql: &str,
@@ -97,7 +97,7 @@ impl SqlExecutionContext {
         Ok(batches)
     }
 
- /// Return the list of tables currently registered in this context.
+    /// Return the list of tables currently registered in this context.
     pub fn registered_tables(&self) -> QueryResult<Vec<String>> {
         let guard = self
             .tables
@@ -134,7 +134,7 @@ impl PreparedSql {
         Self { sql: sql.into() }
     }
 
- /// Execute the prepared statement against the given context.
+    /// Execute the prepared statement against the given context.
     pub async fn execute(&self, ctx: &SqlExecutionContext) -> QueryResult<Vec<RecordBatch>> {
         ctx.execute_sql(&self.sql).await
     }

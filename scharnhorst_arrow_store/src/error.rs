@@ -21,6 +21,9 @@ pub enum ArrowStoreError {
     #[error("index not found: {0}")]
     IndexNotFound(String),
 
+    #[error("duplicate RowId {row_id:?} in table '{table}'")]
+    DuplicateRowId { table: String, row_id: u64 },
+
     #[error("primary key violation: duplicate key {key} in table {table}")]
     PrimaryKeyViolation { table: String, key: String },
 
@@ -41,6 +44,9 @@ pub enum ArrowStoreError {
 
     #[error("lock poisoned: {0}")]
     LockPoisoned(String),
+
+    #[error("lifecycle error: {0}")]
+    Lifecycle(String),
 
     #[error("unimplemented: {0}")]
     Unimplemented(String),

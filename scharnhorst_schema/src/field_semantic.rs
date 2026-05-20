@@ -4,45 +4,50 @@ use serde::{Deserialize, Serialize};
 /// (query, rules, UI) can reason about it without hard-coding names.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FieldSemantic {
- /// Primary key or row identifier.
+    /// Primary key or row identifier.
     Id,
- /// Foreign key referencing another table.
+    /// Foreign key referencing another table.
     ForeignKey { target_table: String },
- /// Human-readable name or label.
+    /// Human-readable name or label.
     Name,
- /// A categorical tag / enum value.
+    /// A categorical tag / enum value.
     Tag,
- /// Position in 2D space (x, y).
+    /// Position in 2D space (x, y).
     Position2D,
- /// Position in 3D space (x, y, z).
+    /// Position in 3D space (x, y, z).
     Position3D,
- /// A fixed-point quantity (e.g. money, resources).
+    /// A fixed-point quantity (e.g. money, resources).
     Quantity,
- /// A percentage in the range [0, 100].
+    /// A percentage in the range [0, 100].
     Percent,
- /// A duration measured in simulation ticks.
+    /// A duration measured in simulation ticks.
     DurationTicks,
- /// A timestamp (simulation tick).
+    /// A timestamp (simulation tick).
     Timestamp,
- /// Raw binary or text payload with no special meaning.
+    /// Raw binary or text payload with no special meaning.
     Raw,
 }
 
 impl FieldSemantic {
- /// Returns true if the semantic implies a numeric representation.
+    /// Returns true if the semantic implies a numeric representation.
     pub fn is_numeric(&self) -> bool {
         matches!(
             self,
-            Self::Quantity | Self::Percent | Self::DurationTicks | Self::Timestamp | Self::Position2D | Self::Position3D
+            Self::Quantity
+                | Self::Percent
+                | Self::DurationTicks
+                | Self::Timestamp
+                | Self::Position2D
+                | Self::Position3D
         )
     }
 
- /// Returns true if the semantic represents a spatial coordinate.
+    /// Returns true if the semantic represents a spatial coordinate.
     pub fn is_spatial(&self) -> bool {
         matches!(self, Self::Position2D | Self::Position3D)
     }
 
- /// Returns true if the semantic is a reference to another entity.
+    /// Returns true if the semantic is a reference to another entity.
     pub fn is_reference(&self) -> bool {
         matches!(self, Self::ForeignKey { .. })
     }
@@ -52,7 +57,7 @@ impl FieldSemantic {
 mod tests {
     use super::*;
 
- // ---- is_numeric ----
+    // ---- is_numeric ----
 
     #[test]
     fn id_is_not_numeric() {
@@ -112,7 +117,7 @@ mod tests {
         assert!(!FieldSemantic::Raw.is_numeric());
     }
 
- // ---- is_spatial ----
+    // ---- is_spatial ----
 
     #[test]
     fn id_is_not_spatial() {
@@ -172,7 +177,7 @@ mod tests {
         assert!(!FieldSemantic::Raw.is_spatial());
     }
 
- // ---- is_reference ----
+    // ---- is_reference ----
 
     #[test]
     fn id_is_not_reference() {

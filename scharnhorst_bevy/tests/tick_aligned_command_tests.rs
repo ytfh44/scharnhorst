@@ -30,7 +30,7 @@ fn commands_consumed_at_tick_boundary() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
     buffer.set_tick(Tick(1))?;
 
- // Push commands during tick 1
+    // Push commands during tick 1
     buffer.push(Command::Raw {
         domain: "move".to_owned(),
         payload: serde_json::json!({"unit": 1}),
@@ -42,12 +42,12 @@ fn commands_consumed_at_tick_boundary() -> BevyBridgeResult<()> {
 
     assert_eq!(buffer.len()?, 2);
 
- // Prepare and consume at tick 2 boundary
+    // Prepare and consume at tick 2 boundary
     buffer.prepare_for_tick(Tick(2))?;
     let batch = buffer.drain_commands(Tick(2))?;
 
     assert_eq!(batch.tick, Tick(2));
-    assert_eq!(batch.count, 2);
+    assert_eq!(batch.commands.len(), 2);
     assert!(buffer.is_empty()?);
     assert_eq!(buffer.last_consumed_tick()?, Tick(2));
 
@@ -63,7 +63,7 @@ fn commands_accumulate_within_tick() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
     buffer.set_tick(Tick(5))?;
 
- // Push multiple commands during tick 5
+    // Push multiple commands during tick 5
     for i in 0..5 {
         buffer.push(Command::Raw {
             domain: "action".to_owned(),
@@ -74,11 +74,11 @@ fn commands_accumulate_within_tick() -> BevyBridgeResult<()> {
     assert_eq!(buffer.len()?, 5);
     assert_eq!(buffer.pending_count()?, 5);
 
- // All commands should be available at tick 6
+    // All commands should be available at tick 6
     buffer.prepare_for_tick(Tick(6))?;
     let batch = buffer.drain_commands(Tick(6))?;
 
-    assert_eq!(batch.count, 5);
+    assert_eq!(batch.commands.len(), 5);
 
     Ok(())
 }
@@ -91,7 +91,7 @@ fn commands_consumed_in_fifo_order() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
     buffer.set_tick(Tick(1))?;
 
- // Push commands in specific order
+    // Push commands in specific order
     let commands = vec![
         Command::Raw {
             domain: "first".to_owned(),
@@ -111,7 +111,7 @@ fn commands_consumed_in_fifo_order() -> BevyBridgeResult<()> {
         buffer.push(cmd.clone())?;
     }
 
- // Consume and verify order
+    // Consume and verify order
     buffer.prepare_for_tick(Tick(2))?;
     let batch = buffer.drain_commands(Tick(2))?;
 
@@ -120,7 +120,7 @@ fn commands_consumed_in_fifo_order() -> BevyBridgeResult<()> {
     assert_eq!(batch.commands[1].source, "player_0");
     assert_eq!(batch.commands[2].source, "player_0");
 
- // Verify payload order
+    // Verify payload order
     for (i, env) in batch.commands.iter().enumerate() {
         if let Command::Raw { payload, .. } = &env.command {
             let order = payload.get("order").and_then(|v| v.as_i64()).unwrap_or(-1);
@@ -144,7 +144,7 @@ fn multiple_clicks_within_tick_all_captured() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
     buffer.set_tick(Tick(1))?;
 
- // Simulate player clicking "Move" three times within tick 1
+    // Simulate player clicking "Move" three times within tick 1
     buffer.push(Command::Raw {
         domain: "move".to_owned(),
         payload: serde_json::json!({"target": "province_A", "click": 1}),
@@ -158,17 +158,17 @@ fn multiple_clicks_within_tick_all_captured() -> BevyBridgeResult<()> {
         payload: serde_json::json!({"target": "province_C", "click": 3}),
     })?;
 
- // Verify all three commands are buffered
+    // Verify all three commands are buffered
     assert_eq!(buffer.len()?, 3);
 
- // Scheduler pulls all three at tick 2 start
+    // Scheduler pulls all three at tick 2 start
     buffer.prepare_for_tick(Tick(2))?;
     let batch = buffer.consume_commands(Tick(2))?;
 
-    assert_eq!(batch.count, 3);
+    assert_eq!(batch.commands.len(), 3);
     assert!(buffer.is_empty()?);
 
- // Verify all commands are "move" commands
+    // Verify all commands are "move" commands
     for env in &batch.commands {
         if let Command::Raw { domain, .. } = &env.command {
             assert_eq!(domain, "move");
@@ -186,24 +186,30 @@ fn multiple_player_commands_tracked() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
     buffer.set_tick(Tick(1))?;
 
- // Player 1 commands
-    buffer.submit_player_command("player_1", Command::Raw {
-        domain: "declare_war".to_owned(),
-        payload: serde_json::json!({"target": "nation_B"}),
-    })?;
+    // Player 1 commands
+    buffer.submit_player_command(
+        CommandSource::Player { player_id: 1 },
+        Command::Raw {
+            domain: "declare_war".to_owned(),
+            payload: serde_json::json!({"target": "nation_B"}),
+        },
+    )?;
 
- // Player 2 commands
-    buffer.submit_player_command("player_2", Command::Raw {
-        domain: "move_army".to_owned(),
-        payload: serde_json::json!({"from": "X", "to": "Y"}),
-    })?;
+    // Player 2 commands
+    buffer.submit_player_command(
+        CommandSource::Player { player_id: 2 },
+        Command::Raw {
+            domain: "move_army".to_owned(),
+            payload: serde_json::json!({"from": "X", "to": "Y"}),
+        },
+    )?;
 
     buffer.prepare_for_tick(Tick(2))?;
     let batch = buffer.drain_commands(Tick(2))?;
 
-    assert_eq!(batch.count, 2);
+    assert_eq!(batch.commands.len(), 2);
 
- // Verify sources are preserved
+    // Verify sources are preserved
     let sources: Vec<_> = batch.commands.iter().map(|e| e.source.clone()).collect();
     assert!(sources.contains(&"player_1".to_string()));
     assert!(sources.contains(&"player_2".to_string()));
@@ -224,7 +230,7 @@ fn scheduler_consumes_commands_at_tick_start() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
     buffer.set_tick(Tick(1))?;
 
- // Simulate network input arriving at 50ms into a 200ms tick
+    // Simulate network input arriving at 50ms into a 200ms tick
     buffer.push(Command::Raw {
         domain: "MoveArmy".to_owned(),
         payload: serde_json::json!({
@@ -236,14 +242,14 @@ fn scheduler_consumes_commands_at_tick_start() -> BevyBridgeResult<()> {
 
     assert_eq!(buffer.len()?, 1);
 
- // Scheduler consumes at tick 2 start
+    // Scheduler consumes at tick 2 start
     buffer.prepare_for_tick(Tick(2))?;
     let batch = buffer.consume_commands(Tick(2))?;
 
-    assert_eq!(batch.count, 1);
+    assert_eq!(batch.commands.len(), 1);
     assert_eq!(batch.tick, Tick(2));
 
- // Verify command details
+    // Verify command details
     let env = &batch.commands[0];
     if let Command::Raw { domain, payload } = &env.command {
         assert_eq!(domain, "MoveArmy");
@@ -258,7 +264,7 @@ fn scheduler_consumes_commands_at_tick_start() -> BevyBridgeResult<()> {
 /// Scenario: Scheduler uses the trait to consume commands.
 #[test]
 fn command_buffer_consumer_trait_works() -> BevyBridgeResult<()> {
- // Need to set tick through concrete type first
+    // Need to set tick through concrete type first
     let concrete = InputCommandBuffer::new();
     concrete.set_tick(Tick(1))?;
     concrete.push(Command::Raw {
@@ -266,10 +272,10 @@ fn command_buffer_consumer_trait_works() -> BevyBridgeResult<()> {
         payload: serde_json::Value::Null,
     })?;
 
- // Use the trait method
+    // Use the trait method
     let batch = concrete.consume_commands(Tick(2))?;
 
-    assert_eq!(batch.count, 1);
+    assert_eq!(batch.commands.len(), 1);
     assert_eq!(batch.tick, Tick(2));
 
     Ok(())
@@ -292,17 +298,17 @@ fn peek_pending_commands() -> BevyBridgeResult<()> {
         payload: serde_json::json!({"id": 2}),
     })?;
 
- // Peek without consuming
+    // Peek without consuming
     let pending = buffer.peek_pending()?;
     assert_eq!(pending.len(), 2);
 
- // Buffer should still have commands
+    // Buffer should still have commands
     assert_eq!(buffer.len()?, 2);
 
- // Now consume
+    // Now consume
     buffer.prepare_for_tick(Tick(2))?;
     let batch = buffer.drain_commands(Tick(2))?;
-    assert_eq!(batch.count, 2);
+    assert_eq!(batch.commands.len(), 2);
 
     Ok(())
 }
@@ -319,24 +325,30 @@ fn player_commands_accepted() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
     buffer.set_tick(Tick(1))?;
 
- // Player command via source enum
+    // Player command via source enum
     let player_source = CommandSource::Player { player_id: 42 };
-    buffer.push_with_source(player_source, Command::Raw {
-        domain: "move".to_owned(),
-        payload: serde_json::Value::Null,
-    })?;
+    buffer.push_with_source(
+        player_source,
+        Command::Raw {
+            domain: "move".to_owned(),
+            payload: serde_json::Value::Null,
+        },
+    )?;
 
- // Player command via string
-    buffer.submit_player_command("player_99", Command::Raw {
-        domain: "attack".to_owned(),
-        payload: serde_json::Value::Null,
-    })?;
+    // Player command via string
+    buffer.submit_player_command(
+        CommandSource::Player { player_id: 99 },
+        Command::Raw {
+            domain: "attack".to_owned(),
+            payload: serde_json::Value::Null,
+        },
+    )?;
 
     assert_eq!(buffer.len()?, 2);
 
     buffer.prepare_for_tick(Tick(2))?;
     let batch = buffer.drain_commands(Tick(2))?;
-    assert_eq!(batch.count, 2);
+    assert_eq!(batch.commands.len(), 2);
 
     Ok(())
 }
@@ -364,7 +376,7 @@ fn ai_commands_rejected() {
 
     let result = buffer.push_with_source(ai_source, cmd);
     assert!(
-        matches!(result, Err(BevyBridgeError::AiCommandRejected)),
+        matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)),
         "AI commands should be rejected by bridge"
     );
 }
@@ -389,7 +401,7 @@ fn internal_commands_rejected() {
 
     let result = buffer.push_with_source(internal_source, cmd);
     assert!(
-        matches!(result, Err(BevyBridgeError::AiCommandRejected)),
+        matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)),
         "Internal commands should be rejected by bridge"
     );
 }
@@ -406,7 +418,7 @@ fn push_ai_always_rejects() {
     };
 
     let result = buffer.push_ai(cmd);
-    assert!(matches!(result, Err(BevyBridgeError::AiCommandRejected)));
+    assert!(matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)));
 }
 
 /// Test: AI command via string prefix rejected
@@ -422,11 +434,21 @@ fn ai_string_prefix_rejected() {
         payload: serde_json::Value::Null,
     };
 
-    let result = buffer.submit_player_command("ai_general", cmd.clone());
-    assert!(matches!(result, Err(BevyBridgeError::AiCommandRejected)));
+    let result = buffer.submit_player_command(
+        CommandSource::Ai {
+            ai_id: "general".to_string(),
+        },
+        cmd.clone(),
+    );
+    assert!(matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)));
 
-    let result = buffer.submit_player_command("internal_system", cmd);
-    assert!(matches!(result, Err(BevyBridgeError::AiCommandRejected)));
+    let result = buffer.submit_player_command(
+        CommandSource::Internal {
+            system: "system".to_string(),
+        },
+        cmd,
+    );
+    assert!(matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)));
 }
 
 // ===================================================================
@@ -440,10 +462,10 @@ fn ai_string_prefix_rejected() {
 fn tick_cannot_go_backwards() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
 
- // Prepare for tick 5
+    // Prepare for tick 5
     buffer.prepare_for_tick(Tick(5))?;
 
- // Trying to prepare for tick 3 should fail
+    // Trying to prepare for tick 3 should fail
     let result = buffer.prepare_for_tick(Tick(3));
     assert!(
         matches!(result, Err(BevyBridgeError::TickAlignmentError { expected, actual, .. }) if expected == Tick(5) && actual == Tick(3)),
@@ -482,7 +504,7 @@ fn drain_requires_prepare() -> BevyBridgeResult<()> {
         payload: serde_json::Value::Null,
     })?;
 
- // drain_commands without prepare_for_tick should fail
+    // drain_commands without prepare_for_tick should fail
     let result = buffer.drain_commands(Tick(1));
     let is_tick_alignment_error = matches!(
         &result,
@@ -511,10 +533,10 @@ fn drain_tick_must_match_prepare() -> BevyBridgeResult<()> {
         payload: serde_json::Value::Null,
     })?;
 
- // Prepare for tick 5
+    // Prepare for tick 5
     buffer.prepare_for_tick(Tick(5))?;
 
- // Try to drain with tick 6 - should fail
+    // Try to drain with tick 6 - should fail
     let result = buffer.drain_commands(Tick(6));
     assert!(
         matches!(result, Err(BevyBridgeError::TickAlignmentError { expected, actual, .. }) if expected == Tick(5) && actual == Tick(6)),
@@ -532,14 +554,14 @@ fn drain_tick_must_match_prepare() -> BevyBridgeResult<()> {
 fn preparation_state_tracking() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
 
- // Initially not prepared
+    // Initially not prepared
     assert!(!buffer.is_prepared()?);
 
- // After prepare_for_tick
+    // After prepare_for_tick
     buffer.prepare_for_tick(Tick(5))?;
     assert!(buffer.is_prepared()?);
 
- // After drain, should be reset
+    // After drain, should be reset
     buffer.drain_commands(Tick(5))?;
     assert!(!buffer.is_prepared()?);
 
@@ -554,10 +576,10 @@ fn last_consumed_tick_tracking() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
     buffer.set_tick(Tick(1))?;
 
- // Initially zero
+    // Initially zero
     assert_eq!(buffer.last_consumed_tick()?, Tick::ZERO);
 
- // Push and consume at tick 5
+    // Push and consume at tick 5
     buffer.push(Command::Raw {
         domain: "test".to_owned(),
         payload: serde_json::Value::Null,
@@ -567,7 +589,7 @@ fn last_consumed_tick_tracking() -> BevyBridgeResult<()> {
 
     assert_eq!(buffer.last_consumed_tick()?, Tick(5));
 
- // Push and consume at tick 10
+    // Push and consume at tick 10
     buffer.push(Command::Raw {
         domain: "test".to_owned(),
         payload: serde_json::Value::Null,
@@ -614,14 +636,18 @@ fn drain_without_prepare_error() {
     let buffer = InputCommandBuffer::new();
     buffer.set_tick(Tick(1)).unwrap();
 
-    buffer.push(Command::Raw {
-        domain: "test".to_owned(),
-        payload: serde_json::Value::Null,
-    })
-    .unwrap();
+    buffer
+        .push(Command::Raw {
+            domain: "test".to_owned(),
+            payload: serde_json::Value::Null,
+        })
+        .unwrap();
 
     let result = buffer.drain_commands(Tick(1));
-    assert!(matches!(result, Err(BevyBridgeError::TickAlignmentError { .. })));
+    assert!(matches!(
+        result,
+        Err(BevyBridgeError::TickAlignmentError { .. })
+    ));
 }
 
 /// Test: AI command via push_with_source returns error
@@ -642,7 +668,7 @@ fn ai_command_via_source_error() {
         },
     );
 
-    assert!(matches!(result, Err(BevyBridgeError::AiCommandRejected)));
+    assert!(matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)));
 }
 
 /// Test: CommandBatch empty state
@@ -652,7 +678,7 @@ fn ai_command_via_source_error() {
 fn command_batch_empty_state() {
     let empty_batch = CommandBatch::new(Tick(1));
     assert!(empty_batch.is_empty());
-    assert_eq!(empty_batch.count, 0);
+    assert_eq!(empty_batch.commands.len(), 0);
 
     let commands = vec![CommandEnvelope::new(
         Tick(1),
@@ -664,7 +690,7 @@ fn command_batch_empty_state() {
     )];
     let non_empty = CommandBatch::with_commands(Tick(1), commands);
     assert!(!non_empty.is_empty());
-    assert_eq!(non_empty.count, 1);
+    assert_eq!(non_empty.commands.len(), 1);
 }
 
 // ===================================================================
@@ -713,15 +739,15 @@ fn refresh_snapshot_updates_generation() -> BevyBridgeResult<()> {
 
     let handler = SnapshotRefreshHandler::new(vm.clone(), qe, store);
 
- // Initial state
+    // Initial state
     assert_eq!(handler.current_generation()?, 0);
 
- // Signal and refresh
+    // Signal and refresh
     let _ = handler.on_refresh_signal();
     let snapshot = scharnhorst_arrow_store::WorldSnapshot::new(Tick(5));
     handler.refresh_snapshot(snapshot)?;
 
- // After refresh
+    // After refresh
     assert!(!handler.should_refresh()?);
     assert_eq!(handler.current_generation()?, 1);
     assert_eq!(vm.generation()?, 1);
@@ -743,11 +769,11 @@ fn multiple_refresh_cycles() -> BevyBridgeResult<()> {
     let handler = SnapshotRefreshHandler::new(vm.clone(), qe, store);
 
     for i in 1..=3 {
- // Signal from scheduler
+        // Signal from scheduler
         let _ = handler.on_refresh_signal();
         assert!(handler.should_refresh()?);
 
- // Bridge refreshes snapshot
+        // Bridge refreshes snapshot
         let snapshot = scharnhorst_arrow_store::WorldSnapshot::new(Tick(i));
         handler.refresh_snapshot(snapshot)?;
 
@@ -781,10 +807,10 @@ fn refresh_handler_config_creation() {
 fn complete_tick_lifecycle() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
 
- // T+0: Set initial tick
+    // T+0: Set initial tick
     buffer.set_tick(Tick(0))?;
 
- // During tick 0: Player submits commands
+    // During tick 0: Player submits commands
     buffer.push(Command::Raw {
         domain: "build".to_owned(),
         payload: serde_json::json!({"building": "factory"}),
@@ -796,43 +822,42 @@ fn complete_tick_lifecycle() -> BevyBridgeResult<()> {
 
     assert_eq!(buffer.len()?, 2);
 
- // T+1 Start: Scheduler prepares and consumes
+    // T+1 Start: Scheduler prepares and consumes
     buffer.prepare_for_tick(Tick(1))?;
     let batch = buffer.drain_commands(Tick(1))?;
 
-    assert_eq!(batch.count, 2);
+    assert_eq!(batch.commands.len(), 2);
     assert_eq!(batch.tick, Tick(1));
     assert!(buffer.is_empty()?);
 
- // During tick 1: More commands
+    // During tick 1: More commands
     buffer.push(Command::Raw {
         domain: "move".to_owned(),
         payload: serde_json::json!({"unit": 1}),
     })?;
 
- // T+2 Start: Scheduler consumes
+    // T+2 Start: Scheduler consumes
     buffer.prepare_for_tick(Tick(2))?;
     let batch = buffer.drain_commands(Tick(2))?;
-    assert_eq!(batch.count, 1);
+    assert_eq!(batch.commands.len(), 1);
 
     Ok(())
 }
 
+#[test]
 /// Test: Empty batch when no commands
 ///
 /// Scenario: Tick boundary with no pending commands.
-#[test]
 fn empty_batch_when_no_commands() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
     buffer.set_tick(Tick(1))?;
 
- // No commands pushed
+    // No commands pushed
 
     buffer.prepare_for_tick(Tick(2))?;
     let batch = buffer.drain_commands(Tick(2))?;
 
     assert!(batch.is_empty());
-    assert_eq!(batch.count, 0);
     assert_eq!(batch.commands.len(), 0);
 
     Ok(())
@@ -854,7 +879,7 @@ fn commands_cleared_after_drain() -> BevyBridgeResult<()> {
     buffer.prepare_for_tick(Tick(2))?;
     buffer.drain_commands(Tick(2))?;
 
- // Buffer should be empty
+    // Buffer should be empty
     assert!(buffer.is_empty()?);
     assert_eq!(buffer.len()?, 0);
     assert_eq!(buffer.peek()?, None);
@@ -978,12 +1003,12 @@ fn peek_returns_front_without_removal() -> BevyBridgeResult<()> {
     buffer.push(cmd1.clone())?;
     buffer.push(cmd2.clone())?;
 
- // Peek should return first command
+    // Peek should return first command
     let peeked = buffer.peek()?;
     assert!(peeked.is_some());
     assert_eq!(peeked.unwrap().command, cmd1);
 
- // Buffer should still have both commands
+    // Buffer should still have both commands
     assert_eq!(buffer.len()?, 2);
 
     Ok(())
@@ -994,13 +1019,13 @@ fn peek_returns_front_without_removal() -> BevyBridgeResult<()> {
 /// Scenario: Set and get player ID.
 #[test]
 fn player_id_management() -> BevyBridgeResult<()> {
-    let buffer = InputCommandBuffer::new().with_player_id(42);
+    let buffer = InputCommandBuffer::new().with_player_id(42)?;
     assert_eq!(buffer.player_id()?, 42);
 
     buffer.set_player_id(99)?;
     assert_eq!(buffer.player_id()?, 99);
 
- // Commands should use current player ID
+    // Commands should use current player ID
     buffer.set_tick(Tick(1))?;
     buffer.push(Command::Raw {
         domain: "test".to_owned(),
@@ -1020,7 +1045,7 @@ fn player_id_management() -> BevyBridgeResult<()> {
 fn current_tick_tracking() -> BevyBridgeResult<()> {
     let buffer = InputCommandBuffer::new();
 
- // Default is ZERO
+    // Default is ZERO
     assert_eq!(buffer.current_tick()?, Tick::ZERO);
 
     buffer.set_tick(Tick(100))?;
@@ -1042,7 +1067,7 @@ fn commands_stamped_with_push_tick() -> BevyBridgeResult<()> {
         payload: serde_json::Value::Null,
     })?;
 
- // Even though we consume at tick 51, envelope should have tick 50
+    // Even though we consume at tick 51, envelope should have tick 50
     buffer.prepare_for_tick(Tick(51))?;
     let batch = buffer.drain_commands(Tick(51))?;
 

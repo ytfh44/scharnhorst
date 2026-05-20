@@ -10,7 +10,11 @@ pub enum QueryError {
     ColumnNotFound { column: String, table: String },
 
     #[error("type mismatch for column {column}: expected {expected}, got {got}")]
-    TypeMismatch { column: String, expected: String, got: String },
+    TypeMismatch {
+        column: String,
+        expected: String,
+        got: String,
+    },
 
     #[error("snapshot not available for tick {0}")]
     SnapshotNotAvailable(u64),
@@ -35,6 +39,12 @@ pub enum QueryError {
 
     #[error("relation not found: {0}")]
     RelationNotFound(String),
+
+    #[error("tick mismatch: requested {requested:?}, actual {actual:?}")]
+    TicksMismatch {
+        requested: scharnhorst_core::Tick,
+        actual: Option<scharnhorst_core::Tick>,
+    },
 
     #[error("invalid query: {0}")]
     InvalidQuery(String),

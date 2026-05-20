@@ -16,9 +16,9 @@ use crate::versioned_table::VersionedTable;
 #[derive(Debug, Clone)]
 pub struct WorldSnapshot {
     tick: Tick,
- /// Table name -> reference to the versioned table at this tick.
+    /// Table name -> reference to the versioned table at this tick.
     tables: HashMap<String, Arc<VersionedTable>>,
- /// Cached view of partition snapshots per table.
+    /// Cached view of partition snapshots per table.
     partition_views: HashMap<String, HashMap<String, PartitionSnapshot>>,
 }
 
@@ -54,17 +54,14 @@ impl WorldSnapshot {
             .ok_or_else(|| crate::error::ArrowStoreError::TableNotFound(name.to_owned()))
     }
 
- /// Returns the record batches for a table at this snapshot's tick, if any.
+    /// Returns the record batches for a table at this snapshot's tick, if any.
     pub fn table_batches(&self, name: &str) -> ArrowStoreResult<Vec<RecordBatch>> {
         let table = self.get_table(name)?;
-        let batches = table
-            .get_version(self.tick)
-            .cloned()
-            .unwrap_or_default();
+        let batches = table.get_version(self.tick).cloned().unwrap_or_default();
         Ok(batches)
     }
 
- /// Returns a partition snapshot for the given table and region.
+    /// Returns a partition snapshot for the given table and region.
     pub fn partition_snapshot(
         &self,
         table_name: &str,
@@ -82,7 +79,7 @@ impl WorldSnapshot {
             })
     }
 
- /// Registers a partition snapshot for a table.
+    /// Registers a partition snapshot for a table.
     pub fn register_partition_snapshot(
         &mut self,
         table_name: impl Into<String>,
@@ -94,12 +91,12 @@ impl WorldSnapshot {
             .insert(snapshot.region_id.clone(), snapshot);
     }
 
- /// Returns true if the snapshot contains data for the given table.
+    /// Returns true if the snapshot contains data for the given table.
     pub fn has_table(&self, name: &str) -> bool {
         self.tables.contains_key(name)
     }
 
- /// Returns true if the snapshot contains the specified partition.
+    /// Returns true if the snapshot contains the specified partition.
     pub fn has_partition(&self, table_name: &str, region_id: &str) -> bool {
         self.partition_views
             .get(table_name)

@@ -73,7 +73,7 @@ fn execute_sql_write_is_recorded_in_debug_journal() {
         .execute_sql_write(sql, &mut journal, Tick(1))
         .unwrap();
 
- // The debug journal ring buffer must have recorded the operation
+    // The debug journal ring buffer must have recorded the operation
     assert_eq!(engine.debug_journal().len(), 1);
 
     let ops = engine.debug_journal().ops();
@@ -88,7 +88,7 @@ fn execute_sql_write_disabled_journal_still_submits_diff() {
     let engine = make_engine();
     let mut journal = Journal::default();
 
- // Simulate multiplayer session: disable the debug journal ring buffer
+    // Simulate multiplayer session: disable the debug journal ring buffer
     engine.debug_journal().set_enabled(false);
 
     let sql = "DELETE FROM actor_state WHERE actor_id = 3";
@@ -96,9 +96,9 @@ fn execute_sql_write_disabled_journal_still_submits_diff() {
         .execute_sql_write(sql, &mut journal, Tick(1))
         .unwrap();
 
- // The diff must still be submitted to the journal system
+    // The diff must still be submitted to the journal system
     assert_eq!(journal.pending_diff_count(), 1);
- // But the debug journal ring buffer must be empty (no-op when disabled)
+    // But the debug journal ring buffer must be empty (no-op when disabled)
     assert!(engine.debug_journal().is_empty());
 }
 
@@ -108,12 +108,8 @@ fn execute_sql_write_invalid_sql_returns_error() {
     let engine = make_engine();
     let mut journal = Journal::default();
 
- // SELECT is not a write statement
-    let result = engine.execute_sql_write(
-        "SELECT * FROM actor_state",
-        &mut journal,
-        Tick(1),
-    );
+    // SELECT is not a write statement
+    let result = engine.execute_sql_write("SELECT * FROM actor_state", &mut journal, Tick(1));
     assert!(result.is_err());
 }
 
@@ -155,8 +151,8 @@ fn execute_sql_write_multiple_ops_accumulate() {
 
 #[test]
 fn debug_write_journal_set_enabled_toggle() {
- // Verify the enabled/disabled toggle works independently of SQL execution.
- // This is the mechanism used to disable the debug journal in multiplayer.
+    // Verify the enabled/disabled toggle works independently of SQL execution.
+    // This is the mechanism used to disable the debug journal in multiplayer.
     let journal = DebugWriteJournal::default();
 
     assert!(journal.enabled());
@@ -179,7 +175,7 @@ fn debug_write_journal_disabled_ignores_records() {
         row_count: 1,
     });
 
- // When disabled, records are silently dropped
+    // When disabled, records are silently dropped
     assert!(journal.is_empty());
     assert_eq!(journal.len(), 0);
 }

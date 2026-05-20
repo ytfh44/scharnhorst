@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use scharnhorst_core::RowId;
 
@@ -11,26 +11,23 @@ use crate::expr::Expr;
 /// submitted as Diff objects through the journal-system.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Effect {
- /// Update a column value on the current scope row.
+    /// Update a column value on the current scope row.
     UpdateColumn {
         table: String,
         column: String,
- /// Expression evaluated to produce the new value.
+        /// Expression evaluated to produce the new value.
         value: Expr,
     },
- /// Insert a new row into a table.
+    /// Insert a new row into a table.
     InsertRow {
         table: String,
         row: RowId,
- /// Column-name -> expression mappings, evaluated to produce row values.
+        /// Column-name -> expression mappings, evaluated to produce row values.
         values: HashMap<String, Expr>,
     },
- /// Set a variable binding in the evaluator's scope.
-    SetVariable {
-        name: String,
-        value: Expr,
-    },
- /// Execute a sequence of effects in order.
+    /// Set a variable binding in the evaluator's scope.
+    SetVariable { name: String, value: Expr },
+    /// Execute a sequence of effects in order.
     Sequence(Vec<Effect>),
 }
 
@@ -52,7 +49,10 @@ mod tests {
     #[test]
     fn effect_insert_row_construction() {
         let mut values = HashMap::new();
-        values.insert("treasury".to_owned(), Expr::constant(scharnhorst_core::FixedPoint::from_i64(500, 2).unwrap()));
+        values.insert(
+            "treasury".to_owned(),
+            Expr::constant(scharnhorst_core::FixedPoint::from_i64(500, 2).unwrap()),
+        );
         let effect = Effect::InsertRow {
             table: "actor_state".to_owned(),
             row: RowId::new(99),

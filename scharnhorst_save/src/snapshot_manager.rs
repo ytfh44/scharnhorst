@@ -7,8 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use scharnhorst_core::Tick;
 use scharnhorst_content::SchemaManifest;
+use scharnhorst_core::Tick;
 
 use crate::error::{SaveError, SaveResult};
 use crate::snapshot_persistence::{PersistedSnapshot, SnapshotHeader, SnapshotPersistence};
@@ -16,30 +16,30 @@ use crate::snapshot_persistence::{PersistedSnapshot, SnapshotHeader, SnapshotPer
 /// Configuration for snapshot retention and journal management.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotConfig {
- /// Maximum number of snapshots to retain (default: 3)
+    /// Maximum number of snapshots to retain (default: 3)
     pub max_snapshots: usize,
- /// Maximum number of diffs in journal before auto-checkpoint (default: 1000)
+    /// Maximum number of diffs in journal before auto-checkpoint (default: 1000)
     pub max_journal_diffs: usize,
 }
 
 impl SnapshotConfig {
- /// Default maximum number of snapshots to retain.
+    /// Default maximum number of snapshots to retain.
     pub const DEFAULT_MAX_SNAPSHOTS: usize = 3;
- /// Default maximum journal size before auto-checkpoint.
+    /// Default maximum journal size before auto-checkpoint.
     pub const DEFAULT_MAX_JOURNAL_DIFFS: usize = 1000;
 
- /// Create a new config with default values.
+    /// Create a new config with default values.
     pub fn new() -> Self {
         Self::default()
     }
 
- /// Set the maximum number of snapshots to retain.
+    /// Set the maximum number of snapshots to retain.
     pub fn with_max_snapshots(mut self, n: usize) -> Self {
         self.max_snapshots = n;
         self
     }
 
- /// Set the maximum journal size before auto-checkpoint.
+    /// Set the maximum journal size before auto-checkpoint.
     pub fn with_max_journal_diffs(mut self, n: usize) -> Self {
         self.max_journal_diffs = n;
         self
@@ -58,14 +58,14 @@ impl Default for SnapshotConfig {
 /// Information about a snapshot file on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotInfo {
- /// Generation number (tick) of the snapshot.
+    /// Generation number (tick) of the snapshot.
     pub generation: Tick,
- /// Path to the snapshot file.
+    /// Path to the snapshot file.
     pub path: PathBuf,
 }
 
 impl SnapshotInfo {
- /// Create a new snapshot info.
+    /// Create a new snapshot info.
     pub fn new(generation: Tick, path: PathBuf) -> Self {
         Self { generation, path }
     }
@@ -82,13 +82,13 @@ pub struct SnapshotManager {
 }
 
 impl SnapshotManager {
- /// Create a new snapshot manager.
- ///
- /// # Arguments
- ///
- /// * `base_dir` - Directory where snapshots are stored
- /// * `config` - Configuration for retention policy
- /// * `journal_path` - Path to the save journal file
+    /// Create a new snapshot manager.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_dir` - Directory where snapshots are stored
+    /// * `config` - Configuration for retention policy
+    /// * `journal_path` - Path to the save journal file
     pub fn new(
         base_dir: impl AsRef<Path>,
         config: SnapshotConfig,
@@ -101,24 +101,24 @@ impl SnapshotManager {
         }
     }
 
- /// Get the configuration.
+    /// Get the configuration.
     pub fn config(&self) -> &SnapshotConfig {
         &self.config
     }
 
- /// Get the base directory for snapshots.
+    /// Get the base directory for snapshots.
     pub fn base_dir(&self) -> &Path {
         self.persistence.base_dir()
     }
 
- /// Get the journal path.
+    /// Get the journal path.
     pub fn journal_path(&self) -> &Path {
         &self.journal_path
     }
 
- /// List all snapshots in the base directory, sorted by generation ascending.
- ///
- /// Returns a vector of (generation, path) tuples, sorted from oldest to newest.
+    /// List all snapshots in the base directory, sorted by generation ascending.
+    ///
+    /// Returns a vector of (generation, path) tuples, sorted from oldest to newest.
     pub fn list_snapshots(&self) -> SaveResult<Vec<SnapshotInfo>> {
         let snapshots = self.persistence.list_snapshots()?;
         Ok(snapshots
@@ -127,13 +127,13 @@ impl SnapshotManager {
             .collect())
     }
 
- /// Get the latest (most recent) snapshot, if any.
+    /// Get the latest (most recent) snapshot, if any.
     pub fn get_latest_snapshot(&self) -> SaveResult<Option<SnapshotInfo>> {
         let snapshots = self.list_snapshots()?;
         Ok(snapshots.into_iter().last())
     }
 
- /// Get a specific snapshot by generation.
+    /// Get a specific snapshot by generation.
     pub fn get_snapshot(&self, generation: Tick) -> SaveResult<Option<SnapshotInfo>> {
         let path = self.persistence.snapshot_path(generation);
         if path.exists() {
@@ -143,15 +143,15 @@ impl SnapshotManager {
         }
     }
 
- /// Get the snapshot for rollback to a specific generation.
- ///
- /// This returns the snapshot at the exact generation specified.
- /// The caller is responsible for replaying diffs from that generation
- /// to the desired tick.
- ///
- /// # Errors
- ///
- /// Returns `SaveError::SnapshotNotFound` if no snapshot exists at the given generation.
+    /// Get the snapshot for rollback to a specific generation.
+    ///
+    /// This returns the snapshot at the exact generation specified.
+    /// The caller is responsible for replaying diffs from that generation
+    /// to the desired tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SaveError::SnapshotNotFound` if no snapshot exists at the given generation.
     pub fn get_snapshot_for_rollback(&self, generation: Tick) -> SaveResult<SnapshotInfo> {
         let path = self.persistence.snapshot_path(generation);
         if path.exists() {
@@ -164,25 +164,25 @@ impl SnapshotManager {
         }
     }
 
- /// Read a snapshot's full data from disk.
+    /// Read a snapshot's full data from disk.
     pub fn read_snapshot(&self, generation: Tick) -> SaveResult<PersistedSnapshot> {
         self.persistence.read_snapshot(generation)
     }
 
- /// Save a new snapshot and enforce retention policy.
- ///
- /// This method:
- /// 1. Writes the snapshot to a temporary file
- /// 2. Renames it to the final location (atomic operation)
- /// 3. Cleans up old snapshots if exceeding retention limit
- ///
- /// # Arguments
- ///
- /// * `snapshot` - The snapshot to save
- ///
- /// # Returns
- ///
- /// The path to the saved snapshot file.
+    /// Save a new snapshot and enforce retention policy.
+    ///
+    /// This method:
+    /// 1. Writes the snapshot to a temporary file
+    /// 2. Renames it to the final location (atomic operation)
+    /// 3. Cleans up old snapshots if exceeding retention limit
+    ///
+    /// # Arguments
+    ///
+    /// * `snapshot` - The snapshot to save
+    ///
+    /// # Returns
+    ///
+    /// The path to the saved snapshot file.
     pub fn save_snapshot(&self, snapshot: &PersistedSnapshot) -> SaveResult<PathBuf> {
         let temp_path = self.temp_snapshot_path(snapshot.header.generation);
         let final_path = self.persistence.snapshot_path(snapshot.header.generation);
@@ -204,7 +204,7 @@ impl SnapshotManager {
         Ok(final_path)
     }
 
- /// Write snapshot data to a temporary file.
+    /// Write snapshot data to a temporary file.
     fn write_snapshot_to_temp(
         &self,
         snapshot: &PersistedSnapshot,
@@ -254,17 +254,17 @@ impl SnapshotManager {
         Ok(())
     }
 
- /// Get a temporary path for atomic snapshot writing.
+    /// Get a temporary path for atomic snapshot writing.
     fn temp_snapshot_path(&self, generation: Tick) -> PathBuf {
         self.persistence
             .base_dir()
             .join(format!(".tmp_snapshot_gen_{}.arrow", generation))
     }
 
- /// Clean up old snapshots to enforce the retention policy.
- ///
- /// Deletes the oldest snapshots if the total count exceeds `max_snapshots`.
- /// This is called automatically after saving a new snapshot.
+    /// Clean up old snapshots to enforce the retention policy.
+    ///
+    /// Deletes the oldest snapshots if the total count exceeds `max_snapshots`.
+    /// This is called automatically after saving a new snapshot.
     pub fn cleanup_old_snapshots(&self) -> SaveResult<()> {
         let snapshots = self.list_snapshots()?;
 
@@ -276,38 +276,37 @@ impl SnapshotManager {
         let snapshots_to_delete: Vec<_> = snapshots.into_iter().take(to_remove).collect();
 
         for snapshot_info in snapshots_to_delete {
-            self.persistence
-                .delete_snapshot(snapshot_info.generation)?;
+            self.persistence.delete_snapshot(snapshot_info.generation)?;
         }
 
         Ok(())
     }
 
- /// Delete a specific snapshot by generation.
+    /// Delete a specific snapshot by generation.
     pub fn delete_snapshot(&self, generation: Tick) -> SaveResult<()> {
         self.persistence.delete_snapshot(generation)
     }
 
- /// Check if a snapshot exists for the given generation.
+    /// Check if a snapshot exists for the given generation.
     pub fn has_snapshot(&self, generation: Tick) -> bool {
         self.persistence.snapshot_path(generation).exists()
     }
 
- /// Get the count of retained snapshots.
+    /// Get the count of retained snapshots.
     pub fn snapshot_count(&self) -> SaveResult<usize> {
         self.list_snapshots().map(|v| v.len())
     }
 
- /// Determine if an auto-checkpoint should be triggered based on journal size.
- ///
- /// # Arguments
- ///
- /// * `journal_entries` - Number of entries in the current journal
+    /// Determine if an auto-checkpoint should be triggered based on journal size.
+    ///
+    /// # Arguments
+    ///
+    /// * `journal_entries` - Number of entries in the current journal
     pub fn should_auto_checkpoint(&self, journal_entries: usize) -> bool {
         journal_entries >= self.config.max_journal_diffs
     }
 
- /// Create a new persisted snapshot with the given parameters.
+    /// Create a new persisted snapshot with the given parameters.
     pub fn create_snapshot(
         &self,
         schema_manifest: SchemaManifest,
@@ -328,11 +327,7 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!(
-            "sch_snap_mgr_test_{}_{}",
-            std::process::id(),
-            id
-        ))
+        std::env::temp_dir().join(format!("sch_snap_mgr_test_{}_{}", std::process::id(), id))
     }
 
     fn cleanup(dir: &Path) {
@@ -341,12 +336,9 @@ mod tests {
 
     fn create_test_snapshot(manager: &SnapshotManager, generation: u64) -> SaveResult<PathBuf> {
         let manifest = SchemaManifest::new("1.0.0");
-        let persisted = PersistedSnapshot::new(SnapshotHeader::new(
-            manifest,
-            Tick(generation),
-            generation,
-        ))
-        .with_table_data("test_table", vec![generation as u8]);
+        let persisted =
+            PersistedSnapshot::new(SnapshotHeader::new(manifest, Tick(generation), generation))
+                .with_table_data("test_table", vec![generation as u8]);
         manager.save_snapshot(&persisted)
     }
 
@@ -373,7 +365,7 @@ mod tests {
         std::fs::create_dir_all(&dir).map_err(|e| SaveError::Io(e.to_string()))?;
 
         let journal = dir.join("journal.bin");
- // Use a higher max_snapshots to avoid retention policy deleting snapshots during test
+        // Use a higher max_snapshots to avoid retention policy deleting snapshots during test
         let config = SnapshotConfig::new().with_max_snapshots(10);
         let manager = SnapshotManager::new(&dir, config, &journal);
 
@@ -619,7 +611,8 @@ mod tests {
         let manager = SnapshotManager::new(&dir, SnapshotConfig::default(), &journal);
 
         let manifest = SchemaManifest::new("1.0.0");
-        let snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(100), 0x1234));
+        let snapshot =
+            PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(100), 0x1234));
 
         manager.save_snapshot(&snapshot).unwrap();
 

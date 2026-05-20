@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use scharnhorst_core::StateTier;
+
 use crate::error::{SchemaError, SchemaResult};
 use crate::field_semantic::FieldSemantic;
 
@@ -9,13 +11,17 @@ use crate::field_semantic::FieldSemantic;
 pub struct ColumnSpec {
     pub name: String,
     pub semantic: FieldSemantic,
- /// Storage type hint (e.g. "i64", "f64", "utf8", "bool").
+    /// Storage type hint (e.g. "i64", "f64", "utf8", "bool").
     pub storage_type: String,
     pub nullable: bool,
 }
 
 impl ColumnSpec {
-    pub fn new(name: impl Into<String>, semantic: FieldSemantic, storage_type: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        semantic: FieldSemantic,
+        storage_type: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             semantic,
@@ -31,15 +37,29 @@ impl ColumnSpec {
 }
 
 /// Specification for a table (entity archetype) in the simulation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// `PartialEq` is implemented manually to exclude `column_index` —
+/// a serialized-and-deserialized `TableSpec` compares equal to the
+/// original even though `column_index` is rebuilt during deserialization.
+#[derive(Debug, Clone, Serialize)]
 pub struct TableSpec {
     pub name: String,
     pub columns: Vec<ColumnSpec>,
- /// Map from column name -> index in `columns` for fast lookup.
- /// Skipped during serialization, rebuilt on deserialization.
+    /// Map from column name -> index in `columns` for fast lookup.
+    /// Skipped during serialization, rebuilt on deserialization,
+    /// and excluded from `PartialEq` comparison.
     #[serde(skip)]
     pub column_index: HashMap<String, usize>,
+    pub tier: StateTier,
 }
+
+impl PartialEq for TableSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.columns == other.columns && self.tier == other.tier
+    }
+}
+
+impl Eq for TableSpec {}
 
 impl<'de> serde::Deserialize<'de> for TableSpec {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -50,12 +70,20 @@ impl<'de> serde::Deserialize<'de> for TableSpec {
         struct Helper {
             name: String,
             columns: Vec<ColumnSpec>,
+            #[serde(default = "default_tier")]
+            tier: StateTier,
         }
+
+        fn default_tier() -> StateTier {
+            StateTier::Authority
+        }
+
         let helper = Helper::deserialize(deserializer)?;
         let mut spec = TableSpec {
             name: helper.name,
             columns: helper.columns,
             column_index: HashMap::new(),
+            tier: helper.tier,
         };
         spec.rebuild_index();
         Ok(spec)
@@ -68,6 +96,7 @@ impl TableSpec {
             name: name.into(),
             columns: Vec::new(),
             column_index: HashMap::new(),
+            tier: StateTier::Authority,
         }
     }
 
@@ -92,17 +121,22 @@ impl TableSpec {
     }
 
     pub fn primary_key_column(&self) -> Option<&ColumnSpec> {
-        self.columns.iter().find(|c| matches!(c.semantic, FieldSemantic::Id))
+        self.columns
+            .iter()
+            .find(|c| matches!(c.semantic, FieldSemantic::Id))
     }
 
     pub fn foreign_key_columns(&self) -> impl Iterator<Item = &ColumnSpec> {
         self.columns.iter().filter(|c| c.semantic.is_reference())
     }
 
- /// Rebuild the column index from the columns vector.
- /// Called after deserialization since `column_index` is `#[serde(skip)]`.
+    /// Rebuild the column index from the columns vector.
+    /// Called after deserialization since `column_index` is `#[serde(skip)]`.
     pub fn rebuild_index(&mut self) {
-        self.column_index = self.columns.iter().enumerate()
+        self.column_index = self
+            .columns
+            .iter()
+            .enumerate()
             .map(|(i, c)| (c.name.clone(), i))
             .collect();
     }
@@ -130,7 +164,7 @@ mod tests {
         )
     }
 
- // ---- ColumnSpec ----
+    // ---- ColumnSpec ----
 
     #[test]
     fn column_spec_construction() {
@@ -153,7 +187,7 @@ mod tests {
         assert!(!col.nullable);
     }
 
- // ---- TableSpec::with_column ----
+    // ---- TableSpec::with_column ----
 
     #[test]
     fn table_spec_with_column() -> SchemaResult<()> {
@@ -174,7 +208,7 @@ mod tests {
         assert_eq!(result, Err(SchemaError::DuplicateColumn("id".to_string())));
     }
 
- // ---- column_by_name ----
+    // ---- column_by_name ----
 
     #[test]
     fn column_by_name_found() -> SchemaResult<()> {
@@ -193,7 +227,7 @@ mod tests {
         assert!(spec.column_by_name("nonexistent").is_none());
     }
 
- // ---- column_index_of ----
+    // ---- column_index_of ----
 
     #[test]
     fn column_index_of_found() -> SchemaResult<()> {
@@ -211,7 +245,7 @@ mod tests {
         assert_eq!(spec.column_index_of("nope"), None);
     }
 
- // ---- primary_key_column ----
+    // ---- primary_key_column ----
 
     #[test]
     fn primary_key_column_found() -> SchemaResult<()> {
@@ -230,7 +264,7 @@ mod tests {
         assert!(spec.primary_key_column().is_none());
     }
 
- // ---- foreign_key_columns ----
+    // ---- foreign_key_columns ----
 
     #[test]
     fn foreign_key_columns_present() -> SchemaResult<()> {
@@ -253,7 +287,7 @@ mod tests {
         Ok(())
     }
 
- // ---- Serialize/Deserialize ----
+    // ---- Serialize/Deserialize ----
 
     #[test]
     fn table_spec_serialize_roundtrip() -> SchemaResult<()> {
@@ -263,7 +297,21 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         let back: TableSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "Unit");
- // Note: column_index is serde(skip), so after deserialization it will be empty
+        assert_eq!(spec, back);
+        Ok(())
+    }
+
+    #[test]
+    fn table_spec_roundtrip_preserves_column_index() -> SchemaResult<()> {
+        let spec = TableSpec::new("Unit")
+            .with_column(make_id_col())?
+            .with_column(make_name_col())?;
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: TableSpec = serde_json::from_str(&json).unwrap();
+        assert!(back.column_by_name("id").is_some());
+        assert!(back.column_by_name("name").is_some());
+        assert_eq!(spec.column_index_of("id"), back.column_index_of("id"));
+        assert_eq!(spec.column_index_of("name"), back.column_index_of("name"));
         Ok(())
     }
 }

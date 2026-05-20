@@ -5,7 +5,7 @@ use scharnhorst_core::{RowId, Tick};
 /// Maps a primary key value to its row location within a specific tick's batches.
 #[derive(Debug, Clone, Default)]
 pub struct PrimaryKeyIndex {
- /// key -> (tick, batch_index, row_index)
+    /// key -> (tick, batch_index, row_index)
     entries: HashMap<String, Vec<(Tick, usize, usize)>>,
 }
 
@@ -53,7 +53,7 @@ impl PrimaryKeyIndex {
 pub struct ForeignKeyIndex {
     pub column_name: String,
     pub target_table: String,
- /// target_key -> [(tick, batch_index, row_index)]
+    /// target_key -> [(tick, batch_index, row_index)]
     entries: HashMap<String, Vec<(Tick, usize, usize)>>,
 }
 

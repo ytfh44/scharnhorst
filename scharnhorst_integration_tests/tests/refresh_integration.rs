@@ -1,4 +1,3 @@
-
 //! REFRESH_SIGNAL integration tests: verify that the rule-ir Evaluator
 //! registers a refresh callback with the scheduler and that the callback clears
 //! the prefetch cache at tick boundaries.
@@ -10,21 +9,19 @@ use scharnhorst_core::{RowId, Tick};
 use scharnhorst_journal::Journal;
 use scharnhorst_query::QueryEngine;
 use scharnhorst_rules::Evaluator;
+use scharnhorst_scheduler::{RefreshCallback, Scheduler, SchedulerError};
 use scharnhorst_schema::SchemaRegistry;
-use scharnhorst_scheduler::{
-    RefreshCallback, Scheduler, SchedulerError,
-};
 
 fn make_test_scheduler() -> Scheduler {
     Scheduler::new(
-        Journal::new(ArrowStore::new()),
+        Journal::new(Arc::new(ArrowStore::new())),
         QueryEngine::new(SchemaRegistry::new()),
     )
 }
 
 fn make_test_evaluator() -> Evaluator {
     let query_engine = Arc::new(RwLock::new(QueryEngine::new(SchemaRegistry::new())));
-    let journal = Arc::new(RwLock::new(Journal::new(ArrowStore::new())));
+    let journal = Arc::new(RwLock::new(Journal::new(Arc::new(ArrowStore::new()))));
     Evaluator::new(query_engine, journal, "test", RowId::new(0))
 }
 
@@ -32,9 +29,9 @@ fn make_test_evaluator() -> Evaluator {
 /// evaluator and calls advance_tick_u64 to clear the prefetch cache.
 fn evaluator_refresh_callback(ev: Arc<RwLock<Evaluator>>) -> RefreshCallback {
     Arc::new(move |tick: u64, _gen: u64| {
-        let mut guard = ev.write().map_err(|e| {
-            SchedulerError::Generic(format!("evaluator lock poisoned: {e}"))
-        })?;
+        let mut guard = ev
+            .write()
+            .map_err(|e| SchedulerError::Generic(format!("evaluator lock poisoned: {e}")))?;
         guard.advance_tick_u64(tick);
         Ok(())
     })
@@ -50,15 +47,15 @@ fn evaluator_registers_refresh_callback() {
     let ev = Arc::new(RwLock::new(make_test_evaluator()));
     let cb = evaluator_refresh_callback(Arc::clone(&ev));
 
- // Register the evaluator as a refresh-signal consumer.
+    // Register the evaluator as a refresh-signal consumer.
     let handle = scheduler
         .register_consumer("rule-ir", cb)
         .expect("register_consumer should succeed");
 
- // The handle should be non-empty.
+    // The handle should be non-empty.
     assert!(!handle.0.is_empty());
 
- // Verify "rule-ir" appears in the consumer list.
+    // Verify "rule-ir" appears in the consumer list.
     let names = scheduler
         .consumer_names()
         .expect("consumer_names should succeed");
@@ -84,12 +81,12 @@ fn refresh_signal_clears_evaluator_cache() {
         .register_consumer("rule-ir", cb)
         .expect("register_consumer should succeed");
 
- // Simulate a scheduler broadcast: tick=5, generation=1.
+    // Simulate a scheduler broadcast: tick=5, generation=1.
     scheduler
         .broadcast_refresh(Tick(5), 1)
         .expect("broadcast_refresh should succeed");
 
- // Read-back: the evaluator should have advanced to tick 5 with an empty cache.
+    // Read-back: the evaluator should have advanced to tick 5 with an empty cache.
     let guard = ev.read().expect("read lock should succeed");
     assert_eq!(
         guard.current_tick(),
@@ -141,10 +138,9 @@ fn multiple_evaluators_receive_refresh_signal() {
 fn evaluator_callback_error_propagates() {
     let scheduler = make_test_scheduler();
 
- // A callback that always fails.
-    let bad_cb: RefreshCallback = Arc::new(|_tick, _gen| {
-        Err(SchedulerError::Generic("simulated failure".to_owned()))
-    });
+    // A callback that always fails.
+    let bad_cb: RefreshCallback =
+        Arc::new(|_tick, _gen| Err(SchedulerError::Generic("simulated failure".to_owned())));
 
     scheduler
         .register_consumer("bad-consumer", bad_cb)

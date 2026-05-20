@@ -15,31 +15,31 @@ use crate::rng::DeterministicRng;
 /// to the world via the query engine, and may emit [`Diff`] objects
 /// that are collected into the journal for atomic commit.
 pub trait SimSystem: Send + Sync {
- /// Unique identifier for this system (used for RNG seeding and logging).
+    /// Unique identifier for this system (used for RNG seeding and logging).
     fn id(&self) -> &str;
 
- /// The execution phase this system belongs to.
+    /// The execution phase this system belongs to.
     fn phase(&self) -> Phase;
 
- /// Table names this system reads from.
+    /// Table names this system reads from.
     fn read_tables(&self) -> Vec<String>;
 
- /// Table names this system may write diffs to.
+    /// Table names this system may write diffs to.
     fn write_tables(&self) -> Vec<String>;
 
- /// Optional refresh-signal callback if the system maintains caches.
+    /// Optional refresh-signal callback if the system maintains caches.
     fn refresh_callback(&self) -> Option<RefreshCallback> {
         None
     }
 
- /// Execute the system for the current tick.
- ///
- /// * `rng` 鈥?deterministic stream seeded with `(self.id, tick)`.
- /// * `query` 鈥?read-only view of the world snapshot.
- /// * `phase` 鈥?the current simulation phase.
- /// * `tick` 鈥?the current simulation tick.
- ///
- /// Returns a vector of diffs to be applied atomically at commit time.
+    /// Execute the system for the current tick.
+    ///
+    /// * `rng` 鈥?deterministic stream seeded with `(self.id, tick)`.
+    /// * `query` 鈥?read-only view of the world snapshot.
+    /// * `phase` 鈥?the current simulation phase.
+    /// * `tick` 鈥?the current simulation tick.
+    ///
+    /// Returns a vector of diffs to be applied atomically at commit time.
     fn execute(
         &self,
         rng: &mut DeterministicRng,
@@ -75,7 +75,7 @@ impl std::fmt::Debug for SystemRegistration {
 }
 
 impl SystemRegistration {
- /// Create a new registration from a [`SimSystem`] implementation.
+    /// Create a new registration from a [`SimSystem`] implementation.
     pub fn from_system(system: &dyn SimSystem) -> Self {
         Self {
             system_id: system.id().to_owned(),
@@ -86,22 +86,22 @@ impl SystemRegistration {
         }
     }
 
- /// Returns true if this system writes to any table.
+    /// Returns true if this system writes to any table.
     pub fn is_writer(&self) -> bool {
         !self.write_tables.is_empty()
     }
 
- /// Returns true if this system and another have disjoint write sets.
+    /// Returns true if this system and another have disjoint write sets.
     pub fn write_sets_disjoint(&self, other: &Self) -> bool {
         self.write_tables.is_disjoint(&other.write_tables)
     }
 
- /// Returns true if this system has a write conflict with another in the same phase.
+    /// Returns true if this system has a write conflict with another in the same phase.
     pub fn has_write_conflict(&self, other: &Self) -> bool {
         self.phase == other.phase && !self.write_sets_disjoint(other)
     }
 
- /// Returns the set of conflicting table names with another registration.
+    /// Returns the set of conflicting table names with another registration.
     pub fn conflicting_tables(&self, other: &Self) -> HashSet<String> {
         self.write_tables
             .intersection(&other.write_tables)
@@ -127,13 +127,27 @@ mod tests {
             callback: Option<RefreshCallback>,
         }
         impl SimSystem for TestSys {
-            fn id(&self) -> &str { &self.id }
-            fn phase(&self) -> Phase { self.phase }
-            fn read_tables(&self) -> Vec<String> { self.reads.clone() }
-            fn write_tables(&self) -> Vec<String> { self.writes.clone() }
-            fn refresh_callback(&self) -> Option<RefreshCallback> { self.callback.clone() }
+            fn id(&self) -> &str {
+                &self.id
+            }
+            fn phase(&self) -> Phase {
+                self.phase
+            }
+            fn read_tables(&self) -> Vec<String> {
+                self.reads.clone()
+            }
+            fn write_tables(&self) -> Vec<String> {
+                self.writes.clone()
+            }
+            fn refresh_callback(&self) -> Option<RefreshCallback> {
+                self.callback.clone()
+            }
             fn execute(
-                &self, _rng: &mut DeterministicRng, _query: &QueryEngine, _phase: Phase, _tick: u64,
+                &self,
+                _rng: &mut DeterministicRng,
+                _query: &QueryEngine,
+                _phase: Phase,
+                _tick: u64,
             ) -> SchedulerResult<Vec<scharnhorst_journal::diff::Diff>> {
                 Ok(Vec::new())
             }
@@ -169,13 +183,17 @@ mod tests {
     #[test]
     fn write_sets_disjoint_returns_true() {
         let a = SystemRegistration {
-            system_id: "a".into(), phase: Phase::Economy,
-            read_tables: HashSet::new(), write_tables: ["x"].into_iter().map(String::from).collect(),
+            system_id: "a".into(),
+            phase: Phase::Economy,
+            read_tables: HashSet::new(),
+            write_tables: ["x"].into_iter().map(String::from).collect(),
             refresh_callback: None,
         };
         let b = SystemRegistration {
-            system_id: "b".into(), phase: Phase::Economy,
-            read_tables: HashSet::new(), write_tables: ["y"].into_iter().map(String::from).collect(),
+            system_id: "b".into(),
+            phase: Phase::Economy,
+            read_tables: HashSet::new(),
+            write_tables: ["y"].into_iter().map(String::from).collect(),
             refresh_callback: None,
         };
         assert!(a.write_sets_disjoint(&b));
@@ -184,13 +202,17 @@ mod tests {
     #[test]
     fn write_sets_disjoint_returns_false_on_overlap() {
         let a = SystemRegistration {
-            system_id: "a".into(), phase: Phase::Economy,
-            read_tables: HashSet::new(), write_tables: ["x", "y"].into_iter().map(String::from).collect(),
+            system_id: "a".into(),
+            phase: Phase::Economy,
+            read_tables: HashSet::new(),
+            write_tables: ["x", "y"].into_iter().map(String::from).collect(),
             refresh_callback: None,
         };
         let b = SystemRegistration {
-            system_id: "b".into(), phase: Phase::Economy,
-            read_tables: HashSet::new(), write_tables: ["y", "z"].into_iter().map(String::from).collect(),
+            system_id: "b".into(),
+            phase: Phase::Economy,
+            read_tables: HashSet::new(),
+            write_tables: ["y", "z"].into_iter().map(String::from).collect(),
             refresh_callback: None,
         };
         assert!(!a.write_sets_disjoint(&b));
@@ -199,13 +221,17 @@ mod tests {
     #[test]
     fn has_write_conflict_same_phase_overlap() {
         let a = SystemRegistration {
-            system_id: "a".into(), phase: Phase::Economy,
-            read_tables: HashSet::new(), write_tables: ["t1"].into_iter().map(String::from).collect(),
+            system_id: "a".into(),
+            phase: Phase::Economy,
+            read_tables: HashSet::new(),
+            write_tables: ["t1"].into_iter().map(String::from).collect(),
             refresh_callback: None,
         };
         let b = SystemRegistration {
-            system_id: "b".into(), phase: Phase::Economy,
-            read_tables: HashSet::new(), write_tables: ["t1"].into_iter().map(String::from).collect(),
+            system_id: "b".into(),
+            phase: Phase::Economy,
+            read_tables: HashSet::new(),
+            write_tables: ["t1"].into_iter().map(String::from).collect(),
             refresh_callback: None,
         };
         assert!(a.has_write_conflict(&b));
@@ -214,13 +240,17 @@ mod tests {
     #[test]
     fn has_write_conflict_different_phase_no_conflict() {
         let a = SystemRegistration {
-            system_id: "a".into(), phase: Phase::Economy,
-            read_tables: HashSet::new(), write_tables: ["t1"].into_iter().map(String::from).collect(),
+            system_id: "a".into(),
+            phase: Phase::Economy,
+            read_tables: HashSet::new(),
+            write_tables: ["t1"].into_iter().map(String::from).collect(),
             refresh_callback: None,
         };
         let b = SystemRegistration {
-            system_id: "b".into(), phase: Phase::Diplomacy,
-            read_tables: HashSet::new(), write_tables: ["t1"].into_iter().map(String::from).collect(),
+            system_id: "b".into(),
+            phase: Phase::Diplomacy,
+            read_tables: HashSet::new(),
+            write_tables: ["t1"].into_iter().map(String::from).collect(),
             refresh_callback: None,
         };
         assert!(!a.has_write_conflict(&b));
@@ -229,13 +259,15 @@ mod tests {
     #[test]
     fn conflicting_tables_returns_intersection() {
         let a = SystemRegistration {
-            system_id: "a".into(), phase: Phase::Economy,
+            system_id: "a".into(),
+            phase: Phase::Economy,
             read_tables: HashSet::new(),
             write_tables: ["t1", "t2", "t3"].into_iter().map(String::from).collect(),
             refresh_callback: None,
         };
         let b = SystemRegistration {
-            system_id: "b".into(), phase: Phase::Economy,
+            system_id: "b".into(),
+            phase: Phase::Economy,
             read_tables: HashSet::new(),
             write_tables: ["t2", "t3", "t4"].into_iter().map(String::from).collect(),
             refresh_callback: None,

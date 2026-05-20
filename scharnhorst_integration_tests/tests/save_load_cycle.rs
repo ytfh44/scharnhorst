@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use scharnhorst_content::{migrated_target_version, SchemaManifest};
 use scharnhorst_core::Tick;
 use scharnhorst_save::{
-    CheckpointManager, MigrationPipeline, MigrationStep, MigrationRegistry,
-    RetentionPolicy, SnapshotHeader, SnapshotPersistence, PersistedSnapshot,
+    CheckpointManager, MigrationPipeline, MigrationRegistry, MigrationStep, PersistedSnapshot,
+    RetentionPolicy, SnapshotHeader, SnapshotPersistence,
 };
 use scharnhorst_schema::{ColumnSpec, FieldSemantic, TableSpec};
 
@@ -34,7 +34,9 @@ fn save_load_snapshot_roundtrip() {
         .with_table_data("actors", vec![1, 2, 3])
         .with_table_data("spatial_nodes", vec![4, 5, 6]);
 
-    let written = persistence.write_snapshot(&snapshot).expect("write snapshot");
+    let written = persistence
+        .write_snapshot(&snapshot)
+        .expect("write snapshot");
     assert!(written.exists());
 
     let loaded = persistence.read_snapshot(Tick(7)).expect("read snapshot");
@@ -62,12 +64,18 @@ fn migration_pipeline_upgrades_manifest() {
         },
     ));
 
-    let manifest = SchemaManifest::new("1.0.0")
-        .with_table(TableSpec::new("actors").with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64")).unwrap_or_else(|_| TableSpec::new("actors")));
+    let manifest = SchemaManifest::new("1.0.0").with_table(
+        TableSpec::new("actors")
+            .with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64"))
+            .unwrap_or_else(|_| TableSpec::new("actors")),
+    );
 
     let migrated = pipeline.apply(&manifest).expect("apply migration");
     assert_eq!(migrated_target_version(&migrated), "1.1.0");
-    let actors = migrated.manifest().get_table("actors").expect("actors table");
+    let actors = migrated
+        .manifest()
+        .get_table("actors")
+        .expect("actors table");
     assert!(actors.column_by_name("mood").is_some());
 }
 
@@ -97,8 +105,7 @@ fn migration_registry_routes_to_pipeline() {
     let mut registry = MigrationRegistry::new();
     registry.register(MigrationPipeline::new("2.0.0"));
 
-    let manifest = SchemaManifest::new("2.0.0")
-        .with_table(TableSpec::new("actors"));
+    let manifest = SchemaManifest::new("2.0.0").with_table(TableSpec::new("actors"));
 
     let migrated = registry.migrate(&manifest, "2.0.0").expect("migrate");
     assert_eq!(migrated_target_version(&migrated), "2.0.0");

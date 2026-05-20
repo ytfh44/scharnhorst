@@ -1,13 +1,14 @@
-use scharnhorst_arrow_store::ArrowStore;
+use scharnhorst_arrow_store::{ArrowStore, InitStore};
 use scharnhorst_bevy::{
-    BevyBridgeError, BevyBridgeResult, EntityMaterializationRegistry, InputCommandBuffer,
-    MaterializationConfig, MaterializationFilter, MaterializeRequest, NullSyncField,
-    RefreshHandlerConfig, SnapshotRefreshHandler, SyncField, SyncState, ViewModel, ViewOf,
+    BevyBridgeError, BevyBridgeResult, CommandSource, EntityMaterializationRegistry,
+    InputCommandBuffer, MaterializationConfig, MaterializationFilter, MaterializeRequest,
+    NullSyncField, RefreshHandlerConfig, SnapshotRefreshHandler, SyncField, SyncState, ViewModel,
+    ViewOf,
 };
 use scharnhorst_core::{RowId, Tick};
 use scharnhorst_journal::command::Command;
 use scharnhorst_query::engine::QueryEngine;
-use scharnhorst_schema::SchemaRegistry;
+use scharnhorst_schema::{ColumnSpec, FieldSemantic, SchemaRegistry, TableSpec};
 use std::sync::Arc;
 
 // ------------------------------------------------------------------
@@ -83,7 +84,11 @@ fn registry_len_and_is_empty() -> BevyBridgeResult<()> {
     let reg = EntityMaterializationRegistry::new();
     assert!(reg.is_empty()?);
 
-    reg.register("t", RowId::new(1), bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"))?;
+    reg.register(
+        "t",
+        RowId::new(1),
+        bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"),
+    )?;
     assert_eq!(reg.len()?, 1);
     assert!(!reg.is_empty()?);
     Ok(())
@@ -92,9 +97,21 @@ fn registry_len_and_is_empty() -> BevyBridgeResult<()> {
 #[test]
 fn registry_table_names() -> BevyBridgeResult<()> {
     let reg = EntityMaterializationRegistry::new();
-    reg.register("a", RowId::new(1), bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"))?;
-    reg.register("a", RowId::new(2), bevy::prelude::Entity::from_raw_u32(2).expect("Entity index must be valid"))?;
-    reg.register("b", RowId::new(3), bevy::prelude::Entity::from_raw_u32(3).expect("Entity index must be valid"))?;
+    reg.register(
+        "a",
+        RowId::new(1),
+        bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid"),
+    )?;
+    reg.register(
+        "a",
+        RowId::new(2),
+        bevy::prelude::Entity::from_raw_u32(2).expect("Entity index must be valid"),
+    )?;
+    reg.register(
+        "b",
+        RowId::new(3),
+        bevy::prelude::Entity::from_raw_u32(3).expect("Entity index must be valid"),
+    )?;
 
     let mut names = reg.table_names()?;
     names.sort();
@@ -167,7 +184,7 @@ fn buffer_push_ai_rejects() {
         payload: serde_json::Value::Null,
     };
     let result = buf.push_ai(cmd);
-    assert!(matches!(result, Err(BevyBridgeError::AiCommandRejected)));
+    assert!(matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)));
 }
 
 #[test]
@@ -179,7 +196,7 @@ fn buffer_accepts_player_command_via_submit() -> BevyBridgeResult<()> {
         table: "provinces".to_owned(),
         row: RowId::new(7),
     };
-    buf.submit_player_command("player_1", cmd)?;
+    buf.submit_player_command(CommandSource::Player { player_id: 1 }, cmd)?;
 
     assert_eq!(buf.len()?, 1);
     let drained = buf.drain()?;
@@ -197,10 +214,15 @@ fn buffer_rejects_ai_command_via_submit() {
         payload: serde_json::Value::Null,
     };
 
-    let result = buf.submit_player_command("ai_general", cmd);
+    let result = buf.submit_player_command(
+        CommandSource::Ai {
+            ai_id: "general".to_string(),
+        },
+        cmd,
+    );
     assert!(
-        matches!(result, Err(BevyBridgeError::AiCommandRejected)),
-        "expected AiCommandRejected, got {:?}",
+        matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)),
+        "expected NonPlayerCommandRejected, got {:?}",
         result
     );
 }
@@ -232,11 +254,14 @@ fn buffer_drains_fifo() -> BevyBridgeResult<()> {
         })
         .collect();
 
-    assert_eq!(payloads, vec![
-        serde_json::json!({"x": 1}),
-        serde_json::json!({"x": 2}),
-        serde_json::json!({"x": 3}),
-    ]);
+    assert_eq!(
+        payloads,
+        vec![
+            serde_json::json!({"x": 1}),
+            serde_json::json!({"x": 2}),
+            serde_json::json!({"x": 3}),
+        ]
+    );
     Ok(())
 }
 
@@ -280,7 +305,7 @@ fn buffer_tick_stamped_correctly() -> BevyBridgeResult<()> {
 
 #[test]
 fn buffer_player_id_tracks() -> BevyBridgeResult<()> {
-    let buf = InputCommandBuffer::new().with_player_id(99);
+    let buf = InputCommandBuffer::new().with_player_id(99)?;
     assert_eq!(buf.player_id()?, 99);
 
     buf.set_player_id(42)?;
@@ -475,4 +500,105 @@ fn materialization_config_builder_pattern() {
     assert_eq!(config.table, "provinces");
     assert!(config.filter.is_some());
     assert_eq!(config.max_entities, Some(100));
+}
+
+// ------------------------------------------------------------------
+// Edge case tests
+// ------------------------------------------------------------------
+
+#[test]
+fn input_buffer_drain_with_wrong_tick_rejected() -> BevyBridgeResult<()> {
+    let buf = InputCommandBuffer::new();
+    buf.set_tick(Tick(1))?;
+
+    buf.push(Command::Raw {
+        domain: "test".to_owned(),
+        payload: serde_json::Value::Null,
+    })?;
+
+    buf.prepare_for_tick(Tick(5))?;
+
+    // drain_commands with tick different from prepared tick should fail
+    let result = buf.drain_commands(Tick(6));
+    assert!(
+        matches!(result, Err(BevyBridgeError::TickAlignmentError { .. })),
+        "expected TickAlignmentError, got {:?}",
+        result
+    );
+
+    // Verify the expected/actual values in the error
+    if let Err(BevyBridgeError::TickAlignmentError { expected, actual, .. }) = result {
+        assert_eq!(expected, Tick(5));
+        assert_eq!(actual, Tick(6));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn input_buffer_prepare_for_tick_resets_state() -> BevyBridgeResult<()> {
+    let buf = InputCommandBuffer::new();
+    buf.set_tick(Tick(1))?;
+
+    // Push commands in tick 1
+    buf.push(Command::Raw {
+        domain: "a".to_owned(),
+        payload: serde_json::Value::Null,
+    })?;
+
+    // Drain at tick 2
+    buf.prepare_for_tick(Tick(2))?;
+    let batch = buf.drain_commands(Tick(2))?;
+    assert_eq!(batch.commands.len(), 1);
+
+    // Push new commands
+    buf.push(Command::Raw {
+        domain: "b".to_owned(),
+        payload: serde_json::Value::Null,
+    })?;
+
+    // prepare_for_tick with new tick should reset position,
+    // old commands should still be pending
+    buf.prepare_for_tick(Tick(3))?;
+    let batch2 = buf.drain_commands(Tick(3))?;
+    assert_eq!(batch2.commands.len(), 1);
+
+    // After drain, buffer should be empty for the consumed tick
+    assert!(!buf.is_prepared()?);
+    Ok(())
+}
+
+#[test]
+fn view_of_with_invalid_row_id() -> BevyBridgeResult<()> {
+    // Set up a ViewModel with a real snapshot containing a table
+    let store = Arc::new(ArrowStore::default());
+    let init_store = InitStore::new(store.clone());
+
+    let spec = TableSpec::new("test_table")
+        .with_column(ColumnSpec::new("id", FieldSemantic::Id, "u64"))
+        .expect("column")
+        .with_column(ColumnSpec::new("name", FieldSemantic::Name, "utf8"))
+        .expect("column");
+
+    init_store
+        .create_table(&spec, scharnhorst_arrow_store::MutationMode::AppendOnly)
+        .expect("create table");
+
+    // Advance to simulation and generate a snapshot
+    let commit_store = init_store.into_simulation().expect("into simulation");
+    let snapshot = commit_store.generate_snapshot(Tick(1)).expect("snapshot");
+
+    let vm = ViewModel::new();
+    vm.refresh(snapshot, 1)?;
+
+    let registry = SchemaRegistry::new();
+    let qe = QueryEngine::new(registry);
+
+    // Querying a non-existent RowId using NullSyncField returns None
+    // (the real SyncField implementations would query ArrowStore and also return None)
+    let result: Option<bevy::prelude::Transform> =
+        NullSyncField.fetch(&vm, &qe, RowId::new(99999))?;
+    assert_eq!(result, None, "invalid RowId should return None");
+
+    Ok(())
 }

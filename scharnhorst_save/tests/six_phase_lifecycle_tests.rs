@@ -6,16 +6,18 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
+use scharnhorst_arrow_store::{ArrowStore, InitStore};
 use scharnhorst_content::{
-    migrated_target_version, FingerprintRegistry, ModFingerprint, SchemaManifest,
+    migrated_target_version, FingerprintRegistry, LoadPhase, ModFingerprint, SchemaManifest,
 };
 use scharnhorst_core::{RowId, Tick};
 use scharnhorst_journal::{CommitRecord, Diff};
 use scharnhorst_save::{
     LoadReconstruction, LoadReconstructionBuilder, MigrationPipeline, MigrationRegistry,
-    MigrationStep, ModToleranceChecker, ModTolerancePolicy, PersistedSnapshot,
-    SaveError, SaveResult, SnapshotHeader, SnapshotPersistence,
+    MigrationStep, ModToleranceChecker, ModTolerancePolicy, PersistedSnapshot, SaveError,
+    SaveResult, SnapshotHeader, SnapshotPersistence,
 };
 use scharnhorst_schema::{ColumnSpec, FieldSemantic, RelationEdge, RelationKind, TableSpec};
 
@@ -23,11 +25,7 @@ static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn temp_dir() -> PathBuf {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!(
-        "sch_six_phase_test_{}_{}",
-        std::process::id(),
-        id
-    ))
+    std::env::temp_dir().join(format!("sch_six_phase_test_{}_{}", std::process::id(), id))
 }
 
 fn cleanup(dir: &PathBuf) {
@@ -52,6 +50,10 @@ fn fp_with_tables(mod_id: &str, version: &str, hash: &str, tables: &[&str]) -> M
     fingerprint
 }
 
+fn make_init_store() -> InitStore {
+    InitStore::new(Arc::new(ArrowStore::new()))
+}
+
 // ===================================================================================
 // Phase 1: Snapshot Deserialize Tests
 // ===================================================================================
@@ -64,7 +66,7 @@ fn phase1_deserialize_extracts_schema_manifest() -> SaveResult<()> {
 
     let persistence = SnapshotPersistence::new(&dir);
 
- // Create a snapshot with a specific schema manifest
+    // Create a snapshot with a specific schema manifest
     let manifest = SchemaManifest::new("1.0.0")
         .with_table(dummy_table("actors"))
         .with_table(dummy_table("provinces"))
@@ -76,16 +78,16 @@ fn phase1_deserialize_extracts_schema_manifest() -> SaveResult<()> {
 
     persistence.write_snapshot(&snapshot)?;
 
- // Phase 1: Deserialize snapshot header
+    // Phase 1: Deserialize snapshot header
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
     let extracted_manifest = recon.phase1_snapshot_deserialize()?;
 
- // Verify extracted manifest matches original
+    // Verify extracted manifest matches original
     assert_eq!(extracted_manifest.schema_version, "1.0.0");
     assert_eq!(extracted_manifest.tables.len(), 2);
     assert_eq!(extracted_manifest.mod_fingerprints.len(), 1);
 
- // Verify lifecycle state
+    // Verify lifecycle state
     assert!(recon.lifecycle().manifest().is_some());
     assert_eq!(
         recon.lifecycle().manifest().unwrap().schema_version,
@@ -104,7 +106,7 @@ fn phase1_extracts_mod_fingerprints() -> SaveResult<()> {
 
     let persistence = SnapshotPersistence::new(&dir);
 
- // Create manifest with multiple mod fingerprints
+    // Create manifest with multiple mod fingerprints
     let manifest = SchemaManifest::new("1.0.0")
         .with_mod_fingerprint(fp("base", "1.0.0", "base_hash"))
         .with_mod_fingerprint(fp("dlc1", "1.2.0", "dlc1_hash"))
@@ -152,15 +154,15 @@ fn phase1_corrupted_snapshot_detected() -> SaveResult<()> {
     cleanup(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| SaveError::Io(e.to_string()))?;
 
- // Write a corrupted snapshot file with a valid header length but invalid JSON
- // Header format: [header_len: u64][header_json][table_count: u64][tables...]
+    // Write a corrupted snapshot file with a valid header length but invalid JSON
+    // Header format: [header_len: u64][header_json][table_count: u64][tables...]
     let path = dir.join("snapshot_gen_1.arrow");
 
- // Create a file with a small header length that points to invalid JSON
+    // Create a file with a small header length that points to invalid JSON
     let mut file_data = Vec::new();
- // Header length = 5 (small value)
+    // Header length = 5 (small value)
     file_data.extend_from_slice(&5u64.to_le_bytes());
- // Invalid JSON (5 bytes)
+    // Invalid JSON (5 bytes)
     file_data.extend_from_slice(b"{bad");
 
     std::fs::write(&path, file_data).unwrap();
@@ -168,7 +170,7 @@ fn phase1_corrupted_snapshot_detected() -> SaveResult<()> {
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
- // Should fail when trying to parse the corrupted header
+    // Should fail when trying to parse the corrupted header
     let result = recon.phase1_snapshot_deserialize();
     assert!(result.is_err());
 
@@ -190,14 +192,12 @@ fn phase2_exact_match_produces_final_mods() -> SaveResult<()> {
     stored.register(fp("base", "1.0.0", "hash1"));
     stored.register(fp("mod_a", "1.0.0", "hash2"));
 
-    let available = vec![
-        fp("base", "1.0.0", "hash1"),
-        fp("mod_a", "1.0.0", "hash2"),
-    ];
+    let available = vec![fp("base", "1.0.0", "hash1"), fp("mod_a", "1.0.0", "hash2")];
 
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
+    recon.skip_to_phase(LoadPhase::SnapshotDeserialize)?;
     let final_mods = recon.phase2_mod_coordination(&stored, &available)?;
 
     assert_eq!(final_mods.len(), 2);
@@ -221,16 +221,17 @@ fn phase2_missing_mod_degrades_tables() -> SaveResult<()> {
         &["bonus_table1", "bonus_table2"],
     ));
 
- // Available mods don't include bonus_mod
+    // Available mods don't include bonus_mod
     let available: Vec<ModFingerprint> = vec![];
 
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
- // Should succeed but mark tables as degraded
+    recon.skip_to_phase(LoadPhase::SnapshotDeserialize)?;
+    // Should succeed but mark tables as degraded
     let final_mods = recon.phase2_mod_coordination(&stored, &available)?;
 
- // Final mods should still include reference to the missing mod for record-keeping
+    // Final mods should still include reference to the missing mod for record-keeping
     assert_eq!(final_mods.len(), 1);
 
     cleanup(&dir);
@@ -243,11 +244,11 @@ fn phase2_extra_mod_included_in_compilation() -> SaveResult<()> {
     cleanup(&dir);
     let _ = std::fs::create_dir_all(&dir);
 
- // Save has only base mod
+    // Save has only base mod
     let mut stored = FingerprintRegistry::new();
     stored.register(fp("base", "1.0.0", "hash1"));
 
- // But disk has extra mod
+    // But disk has extra mod
     let available = vec![
         fp("base", "1.0.0", "hash1"),
         fp("extra_mod", "2.0.0", "hash2"),
@@ -256,9 +257,10 @@ fn phase2_extra_mod_included_in_compilation() -> SaveResult<()> {
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
+    recon.skip_to_phase(LoadPhase::SnapshotDeserialize)?;
     let final_mods = recon.phase2_mod_coordination(&stored, &available)?;
 
- // Extra mod should be included in final list
+    // Extra mod should be included in final list
     assert_eq!(final_mods.len(), 2);
     let ids: Vec<&str> = final_mods.iter().map(|f| f.mod_id.as_str()).collect();
     assert!(ids.contains(&"base"));
@@ -277,14 +279,15 @@ fn phase2_version_mismatch_warns_but_continues() -> SaveResult<()> {
     let mut stored = FingerprintRegistry::new();
     stored.register(fp("mod_a", "1.0.0", "hash1"));
 
- // Available has different version
+    // Available has different version
     let available = vec![fp("mod_a", "1.1.0", "hash2")];
 
     let checker = ModToleranceChecker::new(ModTolerancePolicy::Warn);
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, checker);
 
- // Should succeed with warning (policy is Warn)
+    recon.skip_to_phase(LoadPhase::SnapshotDeserialize)?;
+    // Should succeed with warning (policy is Warn)
     let final_mods = recon.phase2_mod_coordination(&stored, &available)?;
     assert_eq!(final_mods.len(), 1);
     assert_eq!(final_mods[0].version, "1.1.0");
@@ -302,17 +305,98 @@ fn phase2_critical_mod_missing_rejects_load() {
     let mut stored = FingerprintRegistry::new();
     stored.register(fp("base_game", "1.0.0", "hash1"));
 
- // No available mods
+    // No available mods
     let available: Vec<ModFingerprint> = vec![];
 
     let checker = ModToleranceChecker::default().with_critical_mod("base_game");
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, checker);
 
+    recon.skip_to_phase(LoadPhase::SnapshotDeserialize).ok();
     let result = recon.phase2_mod_coordination(&stored, &available);
     assert!(matches!(result, Err(SaveError::CriticalModMissing(_))));
 
     cleanup(&dir);
+}
+
+#[test]
+fn phase4_rejects_cyclic_relations() -> SaveResult<()> {
+    let dir = temp_dir();
+    cleanup(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let persistence = SnapshotPersistence::new(&dir);
+    let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
+
+    recon.skip_to_phase(LoadPhase::ModCoordination)?;
+    let manifest = SchemaManifest::new("1.0.0")
+        .with_table(dummy_table("actors"))
+        .with_table(dummy_table("directors"))
+        .with_relation(RelationEdge {
+            from: "actors".to_string(),
+            to: "directors".to_string(),
+            kind: RelationKind::OneToMany,
+            from_column: "id".to_string(),
+            to_column: Some("id".to_string()),
+        })
+        .with_relation(RelationEdge {
+            from: "directors".to_string(),
+            to: "actors".to_string(),
+            kind: RelationKind::OneToMany,
+            from_column: "id".to_string(),
+            to_column: Some("id".to_string()),
+        });
+    recon.phase3_schema_migration(&manifest)?;
+
+    let init_store = make_init_store();
+    let result = recon.phase4_content_compilation_entry(&init_store);
+    assert!(matches!(result, Err(SaveError::Schema(_))),
+        "cyclic relations should be rejected by detect_cycles or add_edge");
+
+    cleanup(&dir);
+    Ok(())
+}
+
+#[test]
+fn phase4_accepts_non_cyclic_dag() -> SaveResult<()> {
+    let dir = temp_dir();
+    cleanup(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let persistence = SnapshotPersistence::new(&dir);
+    let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
+
+    recon.skip_to_phase(LoadPhase::ModCoordination)?;
+    let manifest = SchemaManifest::new("1.0.0")
+        .with_table(dummy_table("countries"))
+        .with_table(dummy_table("provinces"))
+        .with_table(dummy_table("cities"))
+        .with_relation(RelationEdge {
+            from: "countries".to_string(),
+            to: "provinces".to_string(),
+            kind: RelationKind::OneToMany,
+            from_column: "id".to_string(),
+            to_column: Some("id".to_string()),
+        })
+        .with_relation(RelationEdge {
+            from: "provinces".to_string(),
+            to: "cities".to_string(),
+            kind: RelationKind::OneToMany,
+            from_column: "id".to_string(),
+            to_column: Some("id".to_string()),
+        });
+    recon.phase3_schema_migration(&manifest)?;
+
+    let init_store = make_init_store();
+    recon.phase4_content_compilation_entry(&init_store)?;
+
+    assert_eq!(recon.tier_registry().table_count(), 3);
+    assert!(recon.tier_registry().is_authority("countries"));
+    assert!(recon.tier_registry().is_authority("provinces"));
+    assert!(recon.tier_registry().is_authority("cities"));
+
+    cleanup(&dir);
+    Ok(())
 }
 
 // ===================================================================================
@@ -328,6 +412,7 @@ fn phase3_no_migration_needed() -> SaveResult<()> {
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
+    recon.skip_to_phase(LoadPhase::ModCoordination)?;
     let manifest = SchemaManifest::new("1.0.0").with_table(dummy_table("actors"));
 
     let migrated = recon.phase3_schema_migration(&manifest)?;
@@ -345,14 +430,15 @@ fn phase3_missing_migration_path_fails() {
     cleanup(&dir);
     let _ = std::fs::create_dir_all(&dir);
 
- // Pipeline only knows how to migrate to 2.0.0
+    // Pipeline only knows how to migrate to 2.0.0
     let pipeline = MigrationPipeline::new("2.0.0");
 
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default())
         .with_migration_pipeline(pipeline);
 
- // But manifest is at 1.0.0
+    recon.skip_to_phase(LoadPhase::ModCoordination).ok();
+    // But manifest is at 1.0.0
     let manifest = SchemaManifest::new("1.0.0").with_table(dummy_table("actors"));
 
     let result = recon.phase3_schema_migration(&manifest);
@@ -374,14 +460,16 @@ fn phase4_entry_returns_migrated_manifest() -> SaveResult<()> {
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
- // First run phase 3 to set the migrated manifest
+    recon.skip_to_phase(LoadPhase::ModCoordination)?;
+    // First run phase 3 to set the migrated manifest
     let manifest = SchemaManifest::new("1.0.0").with_table(dummy_table("actors"));
     let _ = recon.phase3_schema_migration(&manifest)?;
 
- // Phase 4 entry should return the migrated manifest
-    let migrated_ref = recon.phase4_content_compilation_entry()?;
-    assert_eq!(migrated_target_version(migrated_ref), "1.0.0");
-    assert_eq!(migrated_ref.tables().len(), 1);
+    // Phase 4: create Authority tables via InitStore
+    let init_store = make_init_store();
+    recon.phase4_content_compilation_entry(&init_store)?;
+    assert_eq!(recon.tier_registry().table_count(), 1);
+    assert!(recon.tier_registry().is_authority("actors"));
 
     cleanup(&dir);
     Ok(())
@@ -394,10 +482,12 @@ fn phase4_entry_fails_without_phase3() {
     let _ = std::fs::create_dir_all(&dir);
 
     let persistence = SnapshotPersistence::new(&dir);
-    let recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
+    let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
- // Phase 4 entry without running phase 3 should fail
-    let result = recon.phase4_content_compilation_entry();
+    recon.skip_to_phase(LoadPhase::SchemaMigration).ok();
+    // Phase 4 entry without running phase 3 should fail
+    let init_store = make_init_store();
+    let result = recon.phase4_content_compilation_entry(&init_store);
     assert!(matches!(result, Err(SaveError::Generic(_))));
 
     cleanup(&dir);
@@ -416,6 +506,7 @@ fn phase5_freezes_schema_registry() -> SaveResult<()> {
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
+    recon.skip_to_phase(LoadPhase::ContentCompilation)?;
     recon.phase5_schema_freeze()?;
 
     assert!(recon.lifecycle().is_frozen());
@@ -434,13 +525,14 @@ fn phase3_migration_preserves_relations() -> SaveResult<()> {
     pipeline.register(MigrationStep::new(
         "1.0.0",
         "1.1.0",
-        |_table: &mut TableSpec| { Ok(()) },
+        |_table: &mut TableSpec| Ok(()),
     ));
 
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default())
         .with_migration_pipeline(pipeline);
 
+    recon.skip_to_phase(LoadPhase::ModCoordination)?;
     let relation = RelationEdge {
         from: "actors".to_owned(),
         to: "provinces".to_owned(),
@@ -477,7 +569,8 @@ fn phase6_finishes_lifecycle() -> SaveResult<()> {
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
- // Must freeze before starting simulation
+    recon.skip_to_phase(LoadPhase::ContentCompilation)?;
+    // Must freeze before starting simulation
     recon.phase5_schema_freeze()?;
     recon.phase6_simulation_start()?;
 
@@ -498,7 +591,7 @@ fn full_six_phase_lifecycle_success() -> SaveResult<()> {
     cleanup(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| SaveError::Io(e.to_string()))?;
 
- // Setup: Create a snapshot file
+    // Setup: Create a snapshot file
     let persistence = SnapshotPersistence::new(&dir);
 
     let manifest = SchemaManifest::new("1.0.0")
@@ -512,12 +605,12 @@ fn full_six_phase_lifecycle_success() -> SaveResult<()> {
 
     persistence.write_snapshot(&snapshot)?;
 
- // Setup mod coordination
+    // Setup mod coordination
     let mut stored = FingerprintRegistry::new();
     stored.register(fp("base", "1.0.0", "base_hash"));
     let available = vec![fp("base", "1.0.0", "base_hash")];
 
- // Setup migration pipeline
+    // Setup migration pipeline
     let mut pipeline = MigrationPipeline::new("1.1.0");
     pipeline.register(MigrationStep::new(
         "1.0.0",
@@ -526,38 +619,47 @@ fn full_six_phase_lifecycle_success() -> SaveResult<()> {
             if table.name == "actors" {
                 let idx = table.columns.len();
                 table.column_index.insert("health".to_owned(), idx);
-                table.columns.push(ColumnSpec::new("health", FieldSemantic::Raw, "i64"));
+                table
+                    .columns
+                    .push(ColumnSpec::new("health", FieldSemantic::Raw, "i64"));
             }
             Ok(())
         },
     ));
 
- // Create load reconstruction
+    // Create load reconstruction
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default())
         .with_migration_pipeline(pipeline);
 
- // Phase 1: Snapshot Deserialize
+    // Phase 1: Snapshot Deserialize
     let manifest = recon.phase1_snapshot_deserialize()?;
     assert_eq!(manifest.schema_version, "1.0.0");
 
- // Phase 2: Mod Coordination
+    // Phase 2: Mod Coordination
     let final_mods = recon.phase2_mod_coordination(&stored, &available)?;
     assert_eq!(final_mods.len(), 1);
 
- // Phase 3: Schema Migration
+    // Phase 3: Schema Migration
     let migrated = recon.phase3_schema_migration(&manifest)?;
     assert_eq!(migrated_target_version(&migrated), "1.1.0");
-    assert!(migrated.manifest().get_table("actors").unwrap().column_by_name("health").is_some());
+    assert!(migrated
+        .manifest()
+        .get_table("actors")
+        .unwrap()
+        .column_by_name("health")
+        .is_some());
 
- // Phase 4: Content Compilation Entry
-    let migrated_ref = recon.phase4_content_compilation_entry()?;
-    assert_eq!(migrated_target_version(migrated_ref), "1.1.0");
+    // Phase 4: Content Compilation Entry
+    let init_store = make_init_store();
+    recon.phase4_content_compilation_entry(&init_store)?;
+    assert!(recon.tier_registry().is_authority("actors"));
+    assert!(recon.tier_registry().is_authority("provinces"));
 
- // Phase 5: Schema Freeze
+    // Phase 5: Schema Freeze
     recon.phase5_schema_freeze()?;
     assert!(recon.lifecycle().is_frozen());
 
- // Phase 6: Simulation Start
+    // Phase 6: Simulation Start
     recon.phase6_simulation_start()?;
     assert!(recon.lifecycle().current_phase().is_none());
 
@@ -573,7 +675,7 @@ fn full_lifecycle_with_journal_replay() -> SaveResult<()> {
 
     let persistence = SnapshotPersistence::new(&dir);
 
- // Create snapshot at generation 100
+    // Create snapshot at generation 100
     let manifest = SchemaManifest::new("1.0.0").with_table(dummy_table("actors"));
     let snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest, Tick(100), 0x1000));
     persistence.write_snapshot(&snapshot)?;
@@ -584,12 +686,12 @@ fn full_lifecycle_with_journal_replay() -> SaveResult<()> {
 
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
- // Run phases 1-3
+    // Run phases 1-3
     let manifest = recon.phase1_snapshot_deserialize()?;
     let _ = recon.phase2_mod_coordination(&stored, &available)?;
     let _ = recon.phase3_schema_migration(&manifest)?;
 
- // Simulate journal replay: diffs from tick 101 to 105
+    // Simulate journal replay: diffs from tick 101 to 105
     let records: Vec<CommitRecord> = (101u64..=105)
         .map(|tick| {
             CommitRecord::new(
@@ -605,7 +707,7 @@ fn full_lifecycle_with_journal_replay() -> SaveResult<()> {
 
     let final_hash = recon.replay_diffs(Tick(100), &records)?;
 
- // Hash should be deterministic
+    // Hash should be deterministic
     assert_ne!(final_hash, 0);
 
     cleanup(&dir);
@@ -621,7 +723,10 @@ fn state_hash_mismatch_detects_corruption() {
     let result = LoadReconstruction::verify_state_hash(0x1234, 0x5678);
     assert!(matches!(
         result,
-        Err(SaveError::StateHashMismatch { expected: 0x5678, got: 0x1234 })
+        Err(SaveError::StateHashMismatch {
+            expected: 0x5678,
+            got: 0x1234
+        })
     ));
 }
 
@@ -641,15 +746,15 @@ fn base_game_mod_missing_rejects_load() {
     stored.register(fp("base_game", "1.0.0", "hash1"));
     stored.register(fp("dlc", "1.0.0", "hash2"));
 
- // Available mods don't include base_game
+    // Available mods don't include base_game
     let available = vec![fp("dlc", "1.0.0", "hash2")];
 
-    let checker = ModToleranceChecker::default()
-        .with_critical_mod("base_game");
+    let checker = ModToleranceChecker::default().with_critical_mod("base_game");
 
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, checker);
 
+    recon.skip_to_phase(LoadPhase::SnapshotDeserialize).ok();
     let result = recon.phase2_mod_coordination(&stored, &available);
     assert!(matches!(result, Err(SaveError::CriticalModMissing(_))));
 
@@ -665,7 +770,7 @@ fn strict_policy_rejects_any_mismatch() {
     let mut stored = FingerprintRegistry::new();
     stored.register(fp("mod_a", "1.0.0", "hash1"));
 
- // Version mismatch
+    // Version mismatch
     let available = vec![fp("mod_a", "1.1.0", "hash2")];
 
     let checker = ModToleranceChecker::new(ModTolerancePolicy::Strict);
@@ -673,11 +778,10 @@ fn strict_policy_rejects_any_mismatch() {
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, checker);
 
- // Strict policy should reject version mismatch
- // Note: Current implementation doesn't reject in strict mode, just changes outcome type
+    recon.skip_to_phase(LoadPhase::SnapshotDeserialize).ok();
+    // Strict policy should reject version mismatch
     let result = recon.phase2_mod_coordination(&stored, &available);
- // The current implementation allows the load but reports VersionMismatch
-    assert!(result.is_ok());
+    assert!(result.is_err());
 
     cleanup(&dir);
 }
@@ -690,10 +794,10 @@ fn strict_policy_rejects_any_mismatch() {
 fn migration_registry_routes_to_correct_pipeline() -> SaveResult<()> {
     let mut registry = MigrationRegistry::new();
 
- // Register a pipeline that can migrate from 1.0.0 to 1.2.0 in two steps
+    // Register a pipeline that can migrate from 1.0.0 to 1.2.0 in two steps
     let mut pipeline_120 = MigrationPipeline::new("1.2.0");
 
- // Step 1: 1.0.0 -> 1.1.0
+    // Step 1: 1.0.0 -> 1.1.0
     pipeline_120.register(MigrationStep::new(
         "1.0.0",
         "1.1.0",
@@ -701,13 +805,15 @@ fn migration_registry_routes_to_correct_pipeline() -> SaveResult<()> {
             if table.name == "actors" {
                 let idx = table.columns.len();
                 table.column_index.insert("field_110".to_owned(), idx);
-                table.columns.push(ColumnSpec::new("field_110", FieldSemantic::Raw, "i64"));
+                table
+                    .columns
+                    .push(ColumnSpec::new("field_110", FieldSemantic::Raw, "i64"));
             }
             Ok(())
         },
     ));
 
- // Step 2: 1.1.0 -> 1.2.0
+    // Step 2: 1.1.0 -> 1.2.0
     pipeline_120.register(MigrationStep::new(
         "1.1.0",
         "1.2.0",
@@ -715,7 +821,9 @@ fn migration_registry_routes_to_correct_pipeline() -> SaveResult<()> {
             if table.name == "actors" {
                 let idx = table.columns.len();
                 table.column_index.insert("field_120".to_owned(), idx);
-                table.columns.push(ColumnSpec::new("field_120", FieldSemantic::Raw, "i64"));
+                table
+                    .columns
+                    .push(ColumnSpec::new("field_120", FieldSemantic::Raw, "i64"));
             }
             Ok(())
         },
@@ -723,14 +831,17 @@ fn migration_registry_routes_to_correct_pipeline() -> SaveResult<()> {
 
     registry.register(pipeline_120);
 
- // Migrate from 1.0.0 to 1.2.0
+    // Migrate from 1.0.0 to 1.2.0
     let manifest = SchemaManifest::new("1.0.0").with_table(dummy_table("actors"));
     let migrated = registry.migrate(&manifest, "1.2.0")?;
 
     assert_eq!(migrated_target_version(&migrated), "1.2.0");
 
- // Both migrations should have been applied
-    let actors = migrated.manifest().get_table("actors").ok_or_else(|| SaveError::Generic("missing actors".to_owned()))?;
+    // Both migrations should have been applied
+    let actors = migrated
+        .manifest()
+        .get_table("actors")
+        .ok_or_else(|| SaveError::Generic("missing actors".to_owned()))?;
     assert!(actors.column_by_name("field_110").is_some());
     assert!(actors.column_by_name("field_120").is_some());
 
@@ -802,6 +913,11 @@ fn replay_empty_diffs_returns_zero_hash() -> SaveResult<()> {
     let _ = std::fs::create_dir_all(&dir);
 
     let persistence = SnapshotPersistence::new(&dir);
+    let manifest = SchemaManifest::new("1.0.0");
+    let header = SnapshotHeader::new(manifest, Tick(0), 0);
+    let snapshot = PersistedSnapshot::new(header);
+    persistence.write_snapshot(&snapshot)?;
+
     let recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
     let hash = recon.replay_diffs(Tick(0), &[])?;
@@ -818,6 +934,11 @@ fn replay_diffs_computes_deterministic_hash() -> SaveResult<()> {
     let _ = std::fs::create_dir_all(&dir);
 
     let persistence = SnapshotPersistence::new(&dir);
+    let manifest = SchemaManifest::new("1.0.0");
+    let header = SnapshotHeader::new(manifest, Tick(0), 0);
+    let snapshot = PersistedSnapshot::new(header);
+    persistence.write_snapshot(&snapshot)?;
+
     let recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
     let records = vec![
@@ -842,7 +963,7 @@ fn replay_diffs_computes_deterministic_hash() -> SaveResult<()> {
     let hash1 = recon.replay_diffs(Tick(0), &records)?;
     let hash2 = recon.replay_diffs(Tick(0), &records)?;
 
- // Hash should be deterministic
+    // Hash should be deterministic
     assert_eq!(hash1, hash2);
     assert_ne!(hash1, 0);
 
@@ -857,6 +978,11 @@ fn replay_diffs_filters_by_base_tick() -> SaveResult<()> {
     let _ = std::fs::create_dir_all(&dir);
 
     let persistence = SnapshotPersistence::new(&dir);
+    let manifest = SchemaManifest::new("1.0.0");
+    let header0 = SnapshotHeader::new(manifest.clone(), Tick(0), 0);
+    let header10 = SnapshotHeader::new(manifest, Tick(10), 100);
+    persistence.write_snapshot(&PersistedSnapshot::new(header0))?;
+    persistence.write_snapshot(&PersistedSnapshot::new(header10))?;
     let recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
     let records = vec![
@@ -886,10 +1012,10 @@ fn replay_diffs_filters_by_base_tick() -> SaveResult<()> {
         ),
     ];
 
- // Only diffs with tick > 10 should be applied
+    // Only diffs with tick > 10 should be applied
     let hash = recon.replay_diffs(Tick(10), &records)?;
 
- // Hash should be different from replaying all diffs
+    // Hash should be different from replaying all diffs
     let hash_all = recon.replay_diffs(Tick(0), &records)?;
     assert_ne!(hash, hash_all);
 
@@ -909,7 +1035,7 @@ fn lifecycle_tracks_completed_phases() -> SaveResult<()> {
 
     let persistence = SnapshotPersistence::new(&dir);
 
- // Create a snapshot
+    // Create a snapshot
     let manifest = SchemaManifest::new("1.0.0").with_table(dummy_table("actors"));
     let snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest.clone(), Tick(1), 0x1));
     persistence.write_snapshot(&snapshot)?;
@@ -920,20 +1046,20 @@ fn lifecycle_tracks_completed_phases() -> SaveResult<()> {
 
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
- // Initially no phases completed
+    // Initially no phases completed
     assert!(recon.lifecycle().completed_phases().is_empty());
 
- // After phase 1
+    // After phase 1
     let _ = recon.phase1_snapshot_deserialize()?;
- // Note: phases are marked completed when advancing to next
+    // Note: phases are marked completed when advancing to next
 
- // After phase 2
+    // After phase 2
     let _ = recon.phase2_mod_coordination(&stored, &available)?;
 
- // After phase 3
+    // After phase 3
     let _ = recon.phase3_schema_migration(&manifest)?;
 
- // Verify lifecycle state
+    // Verify lifecycle state
     assert!(recon.lifecycle().manifest().is_some());
     assert!(recon.lifecycle().migrated_manifest().is_some());
     assert!(!recon.lifecycle().final_mods().is_empty());
@@ -951,11 +1077,12 @@ fn lifecycle_is_finished_after_phase6() -> SaveResult<()> {
     let persistence = SnapshotPersistence::new(&dir);
     let mut recon = LoadReconstruction::new(persistence, ModToleranceChecker::default());
 
- // Run through phases 5 and 6
+    recon.skip_to_phase(LoadPhase::ContentCompilation)?;
+    // Run through phases 5 and 6
     recon.phase5_schema_freeze()?;
     recon.phase6_simulation_start()?;
 
- // After phase 6, lifecycle should indicate completion
+    // After phase 6, lifecycle should indicate completion
     assert!(recon.lifecycle().current_phase().is_none());
 
     cleanup(&dir);
@@ -974,7 +1101,7 @@ fn load_with_multiple_mods_and_migrations() -> SaveResult<()> {
 
     let persistence = SnapshotPersistence::new(&dir);
 
- // Create snapshot with multiple mods
+    // Create snapshot with multiple mods
     let manifest = SchemaManifest::new("1.0.0")
         .with_table(dummy_table("actors"))
         .with_table(dummy_table("provinces"))
@@ -986,13 +1113,13 @@ fn load_with_multiple_mods_and_migrations() -> SaveResult<()> {
     let snapshot = PersistedSnapshot::new(SnapshotHeader::new(manifest, Tick(1000), 0xdeadbeef));
     persistence.write_snapshot(&snapshot)?;
 
- // Stored mods
+    // Stored mods
     let mut stored = FingerprintRegistry::new();
     stored.register(fp("base", "1.0.0", "base_hash"));
     stored.register(fp("dlc_units", "1.0.0", "dlc_hash"));
     stored.register(fp("mod_graphics", "2.0.0", "gfx_hash"));
 
- // Available mods (dlc_units has newer version, extra_mod is new)
+    // Available mods (dlc_units has newer version, extra_mod is new)
     let available = vec![
         fp("base", "1.0.0", "base_hash"),
         fp("dlc_units", "1.1.0", "dlc_new_hash"), // version mismatch
@@ -1000,10 +1127,10 @@ fn load_with_multiple_mods_and_migrations() -> SaveResult<()> {
         fp("extra_mod", "1.0.0", "extra_hash"), // extra mod
     ];
 
- // Complex migration pipeline
+    // Complex migration pipeline
     let mut pipeline = MigrationPipeline::new("1.2.0");
 
- // 1.0.0 -> 1.1.0: Add experience column to actors
+    // 1.0.0 -> 1.1.0: Add experience column to actors
     pipeline.register(MigrationStep::new(
         "1.0.0",
         "1.1.0",
@@ -1011,13 +1138,15 @@ fn load_with_multiple_mods_and_migrations() -> SaveResult<()> {
             if table.name == "actors" {
                 let idx = table.columns.len();
                 table.column_index.insert("experience".to_owned(), idx);
-                table.columns.push(ColumnSpec::new("experience", FieldSemantic::Raw, "i64"));
+                table
+                    .columns
+                    .push(ColumnSpec::new("experience", FieldSemantic::Raw, "i64"));
             }
             Ok(())
         },
     ));
 
- // 1.1.0 -> 1.2.0: Add reputation column to factions
+    // 1.1.0 -> 1.2.0: Add reputation column to factions
     pipeline.register(MigrationStep::new(
         "1.1.0",
         "1.2.0",
@@ -1025,7 +1154,9 @@ fn load_with_multiple_mods_and_migrations() -> SaveResult<()> {
             if table.name == "factions" {
                 let idx = table.columns.len();
                 table.column_index.insert("reputation".to_owned(), idx);
-                table.columns.push(ColumnSpec::new("reputation", FieldSemantic::Raw, "i64"));
+                table
+                    .columns
+                    .push(ColumnSpec::new("reputation", FieldSemantic::Raw, "i64"));
             }
             Ok(())
         },
@@ -1034,24 +1165,31 @@ fn load_with_multiple_mods_and_migrations() -> SaveResult<()> {
     let checker = ModToleranceChecker::default();
     let mut recon = LoadReconstruction::new(persistence, checker).with_migration_pipeline(pipeline);
 
- // Execute all phases
+    // Execute all phases
     let manifest = recon.phase1_snapshot_deserialize()?;
     let final_mods = recon.phase2_mod_coordination(&stored, &available)?;
     let migrated = recon.phase3_schema_migration(&manifest)?;
 
- // Verify results
+    // Verify results
     assert_eq!(final_mods.len(), 4); // All mods including extra
     assert_eq!(migrated_target_version(&migrated), "1.2.0");
 
- // Verify migrations were applied
-    let actors = migrated.manifest().get_table("actors").ok_or_else(|| SaveError::Generic("missing actors".to_owned()))?;
-    let factions = migrated.manifest().get_table("factions").ok_or_else(|| SaveError::Generic("missing factions".to_owned()))?;
+    // Verify migrations were applied
+    let actors = migrated
+        .manifest()
+        .get_table("actors")
+        .ok_or_else(|| SaveError::Generic("missing actors".to_owned()))?;
+    let factions = migrated
+        .manifest()
+        .get_table("factions")
+        .ok_or_else(|| SaveError::Generic("missing factions".to_owned()))?;
 
     assert!(actors.column_by_name("experience").is_some());
     assert!(factions.column_by_name("reputation").is_some());
 
- // Complete remaining phases
-    let _ = recon.phase4_content_compilation_entry()?;
+    // Complete remaining phases
+    let init_store = make_init_store();
+    recon.phase4_content_compilation_entry(&init_store)?;
     recon.phase5_schema_freeze()?;
     recon.phase6_simulation_start()?;
 
@@ -1067,7 +1205,7 @@ fn load_reconstruction_with_missing_non_critical_mod() -> SaveResult<()> {
 
     let persistence = SnapshotPersistence::new(&dir);
 
- // Save has optional cosmetic mod
+    // Save has optional cosmetic mod
     let manifest = SchemaManifest::new("1.0.0")
         .with_table(dummy_table("actors"))
         .with_mod_fingerprint(fp_with_tables(
@@ -1088,7 +1226,7 @@ fn load_reconstruction_with_missing_non_critical_mod() -> SaveResult<()> {
         &["skin_overrides"],
     ));
 
- // Cosmetic mod is missing but not critical
+    // Cosmetic mod is missing but not critical
     let available: Vec<ModFingerprint> = vec![];
 
     let checker = ModToleranceChecker::default(); // No critical mods
@@ -1096,7 +1234,7 @@ fn load_reconstruction_with_missing_non_critical_mod() -> SaveResult<()> {
 
     let _ = recon.phase1_snapshot_deserialize()?;
 
- // Should succeed with degraded tables
+    // Should succeed with degraded tables
     let final_mods = recon.phase2_mod_coordination(&stored, &available)?;
     assert_eq!(final_mods.len(), 1); // Still includes the missing mod reference
 

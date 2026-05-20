@@ -85,20 +85,19 @@ impl TableReadView {
             })
     }
 
- /// Returns an iterator over all record batches.
+    /// Returns an iterator over all record batches.
     pub fn batches(&self) -> impl Iterator<Item = &RecordBatch> + '_ {
         self.batches.iter()
     }
 
- /// Returns a `BatchColumnReader` for the first batch, if any.
+    /// Returns a `BatchColumnReader` for the first batch, if any.
     pub fn first_batch_reader(&self) -> QueryResult<BatchColumnReader> {
-        let batch = self
-            .batches
-            .first()
-            .ok_or_else(|| QueryError::InvalidQuery(format!(
+        let batch = self.batches.first().ok_or_else(|| {
+            QueryError::InvalidQuery(format!(
                 "table '{}' has no batches at tick {}",
                 self.table_name, self.tick
-            )))?;
+            ))
+        })?;
 
         let arrays = batch
             .schema()
@@ -111,15 +110,14 @@ impl TableReadView {
         BatchColumnReader::new(arrays)
     }
 
- /// Returns a `RowCursor` over the first batch, if any.
+    /// Returns a `RowCursor` over the first batch, if any.
     pub fn first_batch_cursor(&self) -> QueryResult<RowCursor> {
-        let batch = self
-            .batches
-            .first()
-            .ok_or_else(|| QueryError::InvalidQuery(format!(
+        let batch = self.batches.first().ok_or_else(|| {
+            QueryError::InvalidQuery(format!(
                 "table '{}' has no batches at tick {}",
                 self.table_name, self.tick
-            )))?;
+            ))
+        })?;
 
         let columns: Vec<(String, ColumnView)> = batch
             .schema()
@@ -135,15 +133,14 @@ impl TableReadView {
         RowCursor::new(columns)
     }
 
- /// Returns a map of column name -> `ColumnView` for the first batch.
+    /// Returns a map of column name -> `ColumnView` for the first batch.
     pub fn first_batch_columns(&self) -> QueryResult<HashMap<String, ColumnView>> {
-        let batch = self
-            .batches
-            .first()
-            .ok_or_else(|| QueryError::InvalidQuery(format!(
+        let batch = self.batches.first().ok_or_else(|| {
+            QueryError::InvalidQuery(format!(
                 "table '{}' has no batches at tick {}",
                 self.table_name, self.tick
-            )))?;
+            ))
+        })?;
 
         Ok(batch
             .schema()
@@ -157,14 +154,14 @@ impl TableReadView {
             .collect())
     }
 
- /// Returns a reference to the position map for looking up RowIds.
+    /// Returns a reference to the position map for looking up RowIds.
     pub fn position_map(&self) -> &RowPositionMap {
         &self.position_map
     }
 
- /// Build a `RowPositionMap` from a slice of record batches.
- ///
- /// Each row is assigned a sequential `RowId` starting from 0.
+    /// Build a `RowPositionMap` from a slice of record batches.
+    ///
+    /// Each row is assigned a sequential `RowId` starting from 0.
     fn build_position_map(batches: &[RecordBatch]) -> RowPositionMap {
         let mut map = RowPositionMap::new();
         let mut global_row: u64 = 0;

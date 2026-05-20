@@ -57,10 +57,7 @@ impl DebugWriteJournal {
     }
 
     pub fn enabled(&self) -> bool {
-        self.inner
-            .lock()
-            .map(|g| g.enabled)
-            .unwrap_or(false)
+        self.inner.lock().map(|g| g.enabled).unwrap_or(false)
     }
 
     pub fn set_enabled(&self, enabled: bool) {
@@ -95,10 +92,7 @@ impl DebugWriteJournal {
     }
 
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .map(|g| g.ops.len())
-            .unwrap_or(0)
+        self.inner.lock().map(|g| g.ops.len()).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -106,10 +100,7 @@ impl DebugWriteJournal {
     }
 
     pub fn latest(&self) -> Option<DebugWriteOp> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|g| g.ops.back().cloned())
+        self.inner.lock().ok().and_then(|g| g.ops.back().cloned())
     }
 
     pub fn ops_for_table(&self, table: &str) -> Vec<DebugWriteOp> {

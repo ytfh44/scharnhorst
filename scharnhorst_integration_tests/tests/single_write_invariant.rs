@@ -4,8 +4,10 @@
 //! `Journal::submit_diff`. No other crate may expose a direct write API
 //! to Arrow tables in production builds.
 
-use scharnhorst_arrow_store::{ArrowStore, MutationMode};
-use scharnhorst_core::Tick;
+use std::sync::Arc;
+
+use scharnhorst_arrow_store::{ArrowStore, InitStore, MutationMode};
+use scharnhorst_core::{JournalSubmitToken, Tick};
 use scharnhorst_integration_tests::harness::TestWorld;
 use scharnhorst_journal::{Command, CommandEnvelope, Diff, Journal};
 use scharnhorst_schema::{ColumnSpec, FieldSemantic, TableSpec};
@@ -23,7 +25,7 @@ fn journal_accepts_commands_and_diffs() {
         },
     );
 
-    journal.submit_command(envelope).expect("submit command");
+    journal.submit_command(envelope, &JournalSubmitToken::new()).expect("submit command");
     assert_eq!(journal.pending_command_count(), 1);
 
     let diff = Diff::Update {
@@ -33,24 +35,27 @@ fn journal_accepts_commands_and_diffs() {
         value: serde_json::Value::Number(42.into()),
     };
 
-    journal.submit_diff(diff).expect("submit diff");
+    journal.submit_diff(diff, &JournalSubmitToken::new()).expect("submit diff");
     assert_eq!(journal.pending_diff_count(), 1);
 }
 
 #[test]
 fn arrow_store_mutation_modes_exist_but_are_controlled() {
- // ArrowStore has append_batches / patch_rows / rebuild_table,
- // but in the full architecture these are called *only* by Journal::commit.
- // This test documents that the APIs exist and are stubbed.
-    let store = ArrowStore::new();
+    // ArrowStore has append_batches / patch_rows / rebuild_table,
+    // but in the full architecture these are called *only* by Journal::commit.
+    // This test documents that the APIs exist and are stubbed.
+    let store = Arc::new(ArrowStore::new());
+    let init_store = InitStore::new(Arc::clone(&store));
     let spec = TableSpec::new("actors")
         .with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64"))
         .unwrap_or_else(|_| TableSpec::new("actors"));
-    store.create_table(&spec, MutationMode::AppendOnly).expect("create table");
+    init_store
+        .create_table(&spec, MutationMode::AppendOnly)
+        .expect("create table");
 
- // Direct mutation methods return Ok in the stub, but the invariant
- // is that production code never calls them except from the journal.
-    let result = store.append_batches("actors", Tick::ZERO, Vec::new());
+    // Direct mutation methods return Ok in the stub, but the invariant
+    // is that production code never calls them except from the journal.
+    let result = init_store.append_batches("actors", Tick::ZERO, Vec::new());
     assert!(result.is_ok());
 }
 
@@ -59,26 +64,26 @@ fn scheduler_routes_all_writes_through_journal() {
     let mut world = TestWorld::build_mvp().expect("build world");
     world.seed_mvp_data().expect("seed");
 
- // The scheduler tick internally calls journal.commit.
- // If any system tried to write directly to ArrowStore, the test
- // would need to detect it; since all systems return Vec<Diff>,
- // the scheduler is the only writer.
+    // The scheduler tick internally calls journal.commit.
+    // If any system tried to write directly to ArrowStore, the test
+    // would need to detect it; since all systems return Vec<Diff>,
+    // the scheduler is the only writer.
     let result = world.tick().expect("tick");
-    assert_eq!(result.tick, scharnhorst_core::Tick(0));
+    assert_eq!(result.tick, scharnhorst_core::Tick(1));
 }
 
 #[test]
 #[cfg(not(debug_assertions))]
 fn debug_write_journal_is_absent_in_release() {
- // In release builds the DebugWriteJournal type is not compiled,
- // enforcing the single-write invariant at the type-system level.
- // This test only compiles in release mode as a static guarantee.
+    // In release builds the DebugWriteJournal type is not compiled,
+    // enforcing the single-write invariant at the type-system level.
+    // This test only compiles in release mode as a static guarantee.
 }
 
 #[test]
 #[cfg(debug_assertions)]
 fn debug_write_journal_is_present_in_debug() {
- // In debug builds the DebugWriteJournal exists but is gated behind
- // #[cfg(debug_assertions)]. This test verifies the gate works.
+    // In debug builds the DebugWriteJournal exists but is gated behind
+    // #[cfg(debug_assertions)]. This test verifies the gate works.
     let _dj = scharnhorst_journal::DebugWriteJournal::new();
 }

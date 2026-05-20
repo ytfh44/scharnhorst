@@ -9,6 +9,9 @@ pub enum JournalError {
     #[error("submit failed: {0}")]
     SubmitFailed(String),
 
+    #[error("invalid journal phase for operation: {0}")]
+    InvalidPhase(String),
+
     #[error("invalid tick: expected {expected}, got {got}")]
     InvalidTick { expected: u64, got: u64 },
 
@@ -42,19 +45,19 @@ pub enum JournalError {
     #[error("generic error: {0}")]
     Generic(String),
 
- /// SQL parsing errors (debug builds only).
+    /// SQL parsing errors (debug builds only).
     #[error("SQL parse error: {0}")]
     SqlParse(String),
 
- /// SQL execution errors (debug builds only).
+    /// SQL execution errors (debug builds only).
     #[error("SQL execution error: {0}")]
     SqlExecution(String),
 
- /// Unsupported SQL feature.
+    /// Unsupported SQL feature.
     #[error("unsupported SQL feature: {0}")]
     SqlUnsupported(String),
 
- /// SQL type conversion error.
+    /// SQL type conversion error.
     #[error("SQL type error: expected {expected}, got {actual}")]
     SqlTypeError { expected: String, actual: String },
 }

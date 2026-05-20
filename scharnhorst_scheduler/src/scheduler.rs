@@ -1,7 +1,10 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
-use scharnhorst_core::Tick;
+use scharnhorst_core::{JournalSubmitToken, Tick};
 use scharnhorst_journal::command::CommandEnvelope;
 use scharnhorst_journal::commit::CommitResult;
 use scharnhorst_journal::journal::Journal;
@@ -23,40 +26,32 @@ use crate::system::{BoxedSystem, SystemRegistration};
 /// - System dependency registration via query-engine.
 /// - Snapshot refresh signal protocol for consumers.
 pub struct Scheduler {
- /// Registered simulation systems keyed by ID.
+    /// Registered simulation systems keyed by ID.
     systems: Arc<Mutex<HashMap<String, BoxedSystem>>>,
- /// Cached system registrations for conflict detection.
+    /// Cached system registrations for conflict detection.
     registrations: Arc<Mutex<HashMap<String, SystemRegistration>>>,
- /// The command queue fed by the bevy-bridge input buffer.
+    /// The command queue fed by the bevy-bridge input buffer.
     pending_commands: Arc<Mutex<VecDeque<CommandEnvelope>>>,
- /// The deterministic journal for atomic commit.
+    /// The deterministic journal for atomic commit.
     journal: Arc<Mutex<Journal>>,
- /// Read-only query engine (unified read interface).
+    /// Read-only query engine (unified read interface).
     query_engine: Arc<QueryEngine>,
- /// Refresh signal bus for snapshot generation protocol.
+    /// Refresh signal bus for snapshot generation protocol.
     refresh_bus: RefreshSignalBus,
- /// Current simulation tick.
+    /// Current simulation tick.
     current_tick: Arc<AtomicU64>,
- /// Current snapshot generation (monotonically increasing).
+    /// Current snapshot generation (monotonically increasing).
     generation: Arc<AtomicU64>,
- /// Whether the scheduler has been initialized.
+    /// Whether the scheduler has been initialized.
     initialized: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Scheduler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let sys_count = self
-            .systems
-            .lock()
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let cmd_count = self
-            .pending_commands
-            .lock()
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let sys_count = self.systems.lock().map(|m| m.len()).unwrap_or(0);
+        let cmd_count = self.pending_commands.lock().map(|m| m.len()).unwrap_or(0);
         let tick = Tick(self.current_tick.load(Ordering::Relaxed));
-        let gen = self.generation.load(Ordering::Relaxed);
+        let gen = self.generation.load(Ordering::Acquire);
         f.debug_struct("Scheduler")
             .field("system_count", &sys_count)
             .field("pending_commands", &cmd_count)
@@ -68,7 +63,7 @@ impl std::fmt::Debug for Scheduler {
 }
 
 impl Scheduler {
- /// Create a new scheduler with the given journal and query engine.
+    /// Create a new scheduler with the given journal and query engine.
     pub fn new(journal: Journal, query_engine: QueryEngine) -> Self {
         Self {
             systems: Arc::new(Mutex::new(HashMap::new())),
@@ -83,26 +78,36 @@ impl Scheduler {
         }
     }
 
- // ------------------------------------------------------------------
- // System registration
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // System registration
+    // ------------------------------------------------------------------
 
- /// Register a simulation system.
- ///
- /// Returns an error if a system with the same ID is already registered
- /// or if the registration introduces a write conflict within a phase.
+    /// Register a simulation system.
+    ///
+    /// Returns an error if a system with the same ID is already registered
+    /// or if the registration introduces a write conflict within a phase.
     pub fn register_system(&self, system: BoxedSystem) -> SchedulerResult<()> {
+        if self.initialized.load(Ordering::Acquire) {
+            return Err(SchedulerError::Initialized);
+        }
+
         let id = system.id().to_owned();
         let reg = SystemRegistration::from_system(system.as_ref());
 
         let mut systems = self.lock_systems()?;
         let mut registrations = self.lock_registrations()?;
 
+        // Re-check initialized under lock to prevent TOCTOU race
+        // between the initial check at function entry and lock acquisition.
+        if self.initialized.load(Ordering::Acquire) {
+            return Err(SchedulerError::Initialized);
+        }
+
         if systems.contains_key(&id) {
             return Err(SchedulerError::SystemAlreadyRegistered(id));
         }
 
- // Detect write conflicts with existing systems in the same phase.
+        // Detect write conflicts with existing systems in the same phase.
         let conflicts: Vec<_> = registrations
             .values()
             .filter(|other| reg.has_write_conflict(other))
@@ -110,7 +115,10 @@ impl Scheduler {
 
         if let Some(conflict) = conflicts.first() {
             let tables = reg.conflicting_tables(conflict);
-            let table = tables.into_iter().next().unwrap_or_default();
+            let table = tables
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "<unknown>".to_string());
             return Err(SchedulerError::WriteConflict {
                 phase: format!("{:?}", reg.phase),
                 a: id.clone(),
@@ -119,10 +127,10 @@ impl Scheduler {
             });
         }
 
- // Register refresh callback if present.
+        // Register refresh callback if present.
         if let Some(cb) = &reg.refresh_callback {
- // Handle is discarded intentionally 鈥?RefreshSignalBus stores callbacks by name,
- // not through the handle. Dropping the handle does NOT unregister.
+            // Handle is discarded intentionally 鈥?RefreshSignalBus stores callbacks by name,
+            // not through the handle. Dropping the handle does NOT unregister.
             let _handle = self.refresh_bus.register(id.clone(), cb.clone())?;
         }
 
@@ -131,22 +139,23 @@ impl Scheduler {
         Ok(())
     }
 
- /// Unregister a system by ID.
+    /// Unregister a system by ID.
     pub fn unregister_system(&self, system_id: &str) -> SchedulerResult<()> {
         let mut systems = self.lock_systems()?;
         let mut registrations = self.lock_registrations()?;
         systems.remove(system_id);
         registrations.remove(system_id);
+        let _ = self.refresh_bus.unregister_by_name(system_id);
         Ok(())
     }
 
- /// Returns the IDs of all registered systems.
+    /// Returns the IDs of all registered systems.
     pub fn system_ids(&self) -> SchedulerResult<Vec<String>> {
         let systems = self.lock_systems()?;
         Ok(systems.keys().cloned().collect())
     }
 
- /// Returns the registration for a given system ID.
+    /// Returns the registration for a given system ID.
     pub fn registration(&self, system_id: &str) -> SchedulerResult<SystemRegistration> {
         let registrations = self.lock_registrations()?;
         registrations
@@ -155,7 +164,7 @@ impl Scheduler {
             .ok_or_else(|| SchedulerError::SystemNotFound(system_id.to_owned()))
     }
 
- /// Returns all system IDs grouped by phase, in phase order.
+    /// Returns all system IDs grouped by phase, in phase order.
     pub fn systems_by_phase(&self) -> SchedulerResult<Vec<(Phase, Vec<String>)>> {
         let registrations = self.lock_registrations()?;
         let mut map: HashMap<Phase, Vec<String>> = HashMap::new();
@@ -167,57 +176,87 @@ impl Scheduler {
         Ok(pairs)
     }
 
- // ------------------------------------------------------------------
- // Command buffer (tick-boundary consumption, )
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Command buffer (tick-boundary consumption, )
+    // ------------------------------------------------------------------
 
- /// Enqueue a command envelope (called by the bevy-bridge input buffer).
+    /// Enqueue a command envelope (called by the bevy-bridge input buffer).
     pub fn enqueue_command(&self, envelope: CommandEnvelope) -> SchedulerResult<()> {
         let mut queue = self.lock_commands()?;
         queue.push_back(envelope);
         Ok(())
     }
 
- /// Drain all pending commands and submit them to the journal.
- ///
- /// This is called at the tick boundary before any simulation phase runs.
+    /// Drain all pending commands and submit them to the journal.
+    ///
+    /// This is called at the tick boundary before any simulation phase runs.
     pub fn consume_pending_commands(&self) -> SchedulerResult<Vec<CommandEnvelope>> {
         let mut queue = self.lock_commands()?;
         let drained: Vec<_> = queue.drain(..).collect();
         let mut journal = self.lock_journal()?;
         for env in &drained {
-            journal.submit_command(env.clone())?;
+            journal.submit_command(env.clone(), &JournalSubmitToken::new())?;
         }
         Ok(drained)
     }
 
- /// Returns the number of pending commands.
+    /// Returns the number of pending commands.
     pub fn pending_command_count(&self) -> SchedulerResult<usize> {
         let queue = self.lock_commands()?;
         Ok(queue.len())
     }
 
- // ------------------------------------------------------------------
- // Tick lifecycle
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Tick lifecycle
+    // ------------------------------------------------------------------
 
- /// Advance the simulation by one tick.
- ///
- /// 1. Consume pending commands at tick boundary.
- /// 2. Execute all phases in order.
- /// 3. Trigger atomic commit.
- /// 4. Broadcast refresh signal.
+    /// Advance the simulation by one tick.
+    ///
+    /// 1. Consume pending commands at tick boundary.
+    /// 2. Execute all phases in order.
+    /// 3. Atomic commit: if `journal.commit()` fails, pending commands
+    ///    are restored to the queue and the journal's pending state is
+    ///    cleared so that a retry starts from a clean slate.
+    /// 4. On success, advance the tick counter and broadcast refresh signal.
     pub fn tick(&self) -> SchedulerResult<CommitResult> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(SchedulerError::NotInitialized);
+        }
+
         let tick = self.current_tick()?;
-        self.consume_pending_commands()?;
+
+        let consumed = self.consume_pending_commands()?;
+
         self.run_phases(tick)?;
-        let result = self.atomic_commit()?;
-        self.broadcast_refresh(tick, result.state_hash)?;
-        self.advance_tick()?;
-        Ok(result)
+
+        match self.atomic_commit() {
+            Ok(result) => {
+                self.advance_tick()?;
+                // Broadcast refresh AFTER commit is confirmed and tick advanced.
+                // Broadcast failure must NOT trigger rollback — the commit is
+                // already durable (generation was incremented in atomic_commit).
+                let gen = self.generation.load(Ordering::Acquire);
+                self.broadcast_refresh(result.tick, gen)?;
+                Ok(result)
+            }
+            Err(e) => {
+                // Rollback on actual commit failure:
+                // 1. Clear journal's internally restored pending state
+                //    to prevent diff/command duplication on retry.
+                // 2. Restore consumed commands to the external queue.
+                if let Ok(mut journal) = self.lock_journal() {
+                    journal.clear_pending().ok();
+                }
+                let mut queue = self.lock_commands()?;
+                for cmd in consumed.into_iter().rev() {
+                    queue.push_front(cmd);
+                }
+                Err(e)
+            }
+        }
     }
 
- /// Run all simulation phases for the current tick.
+    /// Run all simulation phases for the current tick.
     pub fn run_phases(&self, tick: Tick) -> SchedulerResult<()> {
         let by_phase = self.systems_by_phase()?;
         for (phase, ids) in by_phase {
@@ -226,11 +265,16 @@ impl Scheduler {
         Ok(())
     }
 
- /// Run a single phase.
- ///
- /// Systems within the same phase are executed sequentially in this stub.
- /// A full implementation may parallelize when write sets are disjoint.
-    pub fn run_phase(&self, phase: Phase, system_ids: &[String], tick: Tick) -> SchedulerResult<()> {
+    /// Run a single phase.
+    ///
+    /// Systems within the same phase are executed sequentially in this stub.
+    /// A full implementation may parallelize when write sets are disjoint.
+    pub fn run_phase(
+        &self,
+        phase: Phase,
+        system_ids: &[String],
+        tick: Tick,
+    ) -> SchedulerResult<()> {
         let systems = self.lock_systems()?;
         for id in system_ids {
             let system = systems
@@ -240,49 +284,54 @@ impl Scheduler {
             let diffs = system.execute(&mut rng, &self.query_engine, phase, tick.as_u64())?;
             let mut journal = self.lock_journal()?;
             for diff in diffs {
-                journal.submit_diff(diff)?;
+                journal.submit_diff(diff, &JournalSubmitToken::new())?;
             }
         }
         Ok(())
     }
 
- /// Perform the atomic commit at the end of the tick.
- ///
- /// Read-Snapshot -> Write-Journal -> Atomic Commit cycle.
+    /// Perform the atomic commit at the end of the tick.
+    ///
+    /// Read-Snapshot -> Write-Journal -> Atomic Commit cycle.
+    ///
+    /// Only performs the journal commit and increments the generation
+    /// counter. Refresh broadcast is handled by the caller (`tick()`)
+    /// after the commit is confirmed — broadcast failure must not
+    /// trigger rollback.
     pub fn atomic_commit(&self) -> SchedulerResult<CommitResult> {
         let mut journal = self.lock_journal()?;
         let result = journal.commit()?;
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        let _new_gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         Ok(result)
     }
 
- /// Broadcast the refresh signal to all registered consumers.
-    pub fn broadcast_refresh(&self, tick: Tick, state_hash: u64) -> SchedulerResult<()> {
-        self.refresh_bus.broadcast(tick.as_u64(), state_hash)
+    /// Broadcast the refresh signal to all registered consumers.
+    pub fn broadcast_refresh(&self, tick: Tick, generation: u64) -> SchedulerResult<()> {
+        self.refresh_bus.broadcast(tick.as_u64(), generation)
     }
 
- /// Advance the internal tick counter.
+    /// Advance the internal tick counter.
     pub fn advance_tick(&self) -> SchedulerResult<Tick> {
         let prev = self.current_tick.fetch_add(1, Ordering::Relaxed);
         Ok(Tick(prev).next())
     }
 
- /// Returns the current tick.
+    /// Returns the current tick.
     pub fn current_tick(&self) -> SchedulerResult<Tick> {
         let raw = self.current_tick.load(Ordering::Relaxed);
         Ok(Tick(raw))
     }
 
- /// Returns the current snapshot generation.
+    /// Returns the current snapshot generation.
     pub fn current_generation(&self) -> SchedulerResult<u64> {
-        Ok(self.generation.load(Ordering::Relaxed))
+        Ok(self.generation.load(Ordering::Acquire))
     }
 
- // ------------------------------------------------------------------
- // Refresh signal consumer registration
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Refresh signal consumer registration
+    // ------------------------------------------------------------------
 
- /// Register an external consumer for refresh signals.
+    /// Register an external consumer for refresh signals.
     pub fn register_consumer(
         &self,
         name: impl Into<String>,
@@ -291,32 +340,43 @@ impl Scheduler {
         self.refresh_bus.register(name, callback)
     }
 
- /// Unregister an external consumer.
+    /// Unregister an external consumer.
     pub fn unregister_consumer(&self, handle: &RefreshSignalHandle) -> SchedulerResult<()> {
         self.refresh_bus.unregister(handle)
     }
 
- /// Returns the names of all registered refresh-signal consumers.
+    /// Returns the names of all registered refresh-signal consumers.
     pub fn consumer_names(&self) -> SchedulerResult<Vec<String>> {
         self.refresh_bus.consumer_names()
     }
 
- // ------------------------------------------------------------------
- // Initialization
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Initialization
+    // ------------------------------------------------------------------
 
- /// Initialize the scheduler: validate registrations before first tick.
- ///
- /// Validates: (1) systems are registered, (2) each declares read/write tables,
- /// (3) registrations match system map, (4) no write conflicts within same phase.
- /// Safe to call multiple times 鈥?subsequent calls are no-ops.
+    /// Initialize the scheduler: validate registrations before first tick.
+    ///
+    /// Validates: (1) systems are registered, (2) each declares read/write tables,
+    /// (3) registrations match system map, (4) no write conflicts within same phase.
+    /// Safe to call multiple times 鈥?subsequent calls are no-ops.
     pub fn initialize(&self) -> SchedulerResult<()> {
         if self.initialized.load(Ordering::Acquire) {
             return Ok(());
         }
 
- // Lock in established order (systems first, then registrations)
- // to maintain consistent lock ordering and prevent deadlock.
+        // Schema freeze enforcement: the schema registry must be frozen
+        // before the scheduler can start. This ensures no new tables can
+        // be registered mid-simulation.
+        if !self
+            .query_engine
+            .is_schema_frozen()
+            .map_err(|e| SchedulerError::QueryEngine(e.to_string()))?
+        {
+            return Err(SchedulerError::SchemaNotFrozen);
+        }
+
+        // Lock in established order (systems first, then registrations)
+        // to maintain consistent lock ordering and prevent deadlock.
         let systems = self.lock_systems()?;
         let registrations = self.lock_registrations()?;
 
@@ -361,16 +421,18 @@ impl Scheduler {
         Ok(())
     }
 
- /// Returns true if the scheduler has been initialized.
+    /// Returns true if the scheduler has been initialized.
     pub fn is_initialized(&self) -> SchedulerResult<bool> {
         Ok(self.initialized.load(Ordering::Acquire))
     }
 
- // ------------------------------------------------------------------
- // Lock helpers (avoid unwrap/expect)
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Lock helpers (avoid unwrap/expect)
+    // ------------------------------------------------------------------
 
-    fn lock_systems(&self) -> SchedulerResult<std::sync::MutexGuard<'_, HashMap<String, BoxedSystem>>> {
+    fn lock_systems(
+        &self,
+    ) -> SchedulerResult<std::sync::MutexGuard<'_, HashMap<String, BoxedSystem>>> {
         self.systems
             .lock()
             .map_err(|e| SchedulerError::Generic(format!("systems lock poisoned: {e}")))
@@ -384,7 +446,9 @@ impl Scheduler {
             .map_err(|e| SchedulerError::Generic(format!("registrations lock poisoned: {e}")))
     }
 
-    fn lock_commands(&self) -> SchedulerResult<std::sync::MutexGuard<'_, VecDeque<CommandEnvelope>>> {
+    fn lock_commands(
+        &self,
+    ) -> SchedulerResult<std::sync::MutexGuard<'_, VecDeque<CommandEnvelope>>> {
         self.pending_commands
             .lock()
             .map_err(|e| SchedulerError::Generic(format!("commands lock poisoned: {e}")))
@@ -396,16 +460,16 @@ impl Scheduler {
             .map_err(|e| SchedulerError::Generic(format!("journal lock poisoned: {e}")))
     }
 
- // ------------------------------------------------------------------
- // Store and engine attachment (runtime replacement)
- // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Store and engine attachment (runtime replacement)
+    // ------------------------------------------------------------------
 
- /// Replace the query engine with a new instance.
+    /// Replace the query engine with a new instance.
     pub fn attach_query_engine(&mut self, engine: QueryEngine) {
         self.query_engine = Arc::new(engine);
     }
 
- /// Access the journal via a locked guard.
+    /// Access the journal via a locked guard.
     pub fn journal_mut(&self) -> SchedulerResult<std::sync::MutexGuard<'_, Journal>> {
         self.lock_journal()
     }
@@ -415,7 +479,8 @@ impl Scheduler {
 mod tests {
     use std::sync::Arc;
 
-    use scharnhorst_core::Tick;
+    use scharnhorst_arrow_store::{ArrowStore, InitStore};
+    use scharnhorst_core::{RowId, Tick};
     use scharnhorst_journal::command::{Command, CommandEnvelope};
     use scharnhorst_journal::diff::Diff;
     use scharnhorst_journal::journal::Journal;
@@ -425,11 +490,17 @@ mod tests {
     use super::*;
     use crate::error::SchedulerResult;
     use crate::phase::Phase;
+    use crate::refresh_signal::RefreshCallback;
     use crate::rng::DeterministicRng;
     use crate::system::SimSystem;
 
     fn make_scheduler() -> Scheduler {
-        Scheduler::new(Journal::default(), QueryEngine::new(SchemaRegistry::new()))
+        let store = Arc::new(ArrowStore::new());
+        let init_store = InitStore::new(Arc::clone(&store));
+        let _ = init_store.into_simulation().unwrap();
+        let mut registry = SchemaRegistry::new();
+        registry.freeze();
+        Scheduler::new(Journal::new(store), QueryEngine::new(registry))
     }
 
     #[test]
@@ -444,11 +515,25 @@ mod tests {
         let s = make_scheduler();
         struct S;
         impl SimSystem for S {
-            fn id(&self) -> &str { "s" }
-            fn phase(&self) -> Phase { Phase::Economy }
-            fn read_tables(&self) -> Vec<String> { vec![] }
-            fn write_tables(&self) -> Vec<String> { vec![] }
-            fn execute(&self, _: &mut DeterministicRng, _: &QueryEngine, _: Phase, _: u64) -> SchedulerResult<Vec<Diff>> {
+            fn id(&self) -> &str {
+                "s"
+            }
+            fn phase(&self) -> Phase {
+                Phase::Economy
+            }
+            fn read_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn write_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn execute(
+                &self,
+                _: &mut DeterministicRng,
+                _: &QueryEngine,
+                _: Phase,
+                _: u64,
+            ) -> SchedulerResult<Vec<Diff>> {
                 Ok(vec![])
             }
         }
@@ -463,11 +548,25 @@ mod tests {
         let s = make_scheduler();
         struct S;
         impl SimSystem for S {
-            fn id(&self) -> &str { "dup" }
-            fn phase(&self) -> Phase { Phase::Economy }
-            fn read_tables(&self) -> Vec<String> { vec![] }
-            fn write_tables(&self) -> Vec<String> { vec![] }
-            fn execute(&self, _: &mut DeterministicRng, _: &QueryEngine, _: Phase, _: u64) -> SchedulerResult<Vec<Diff>> {
+            fn id(&self) -> &str {
+                "dup"
+            }
+            fn phase(&self) -> Phase {
+                Phase::Economy
+            }
+            fn read_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn write_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn execute(
+                &self,
+                _: &mut DeterministicRng,
+                _: &QueryEngine,
+                _: Phase,
+                _: u64,
+            ) -> SchedulerResult<Vec<Diff>> {
                 Ok(vec![])
             }
         }
@@ -479,10 +578,14 @@ mod tests {
     #[test]
     fn enqueue_and_consume_commands() {
         let s = make_scheduler();
-        let env = CommandEnvelope::new(Tick::ZERO, "test", Command::Raw {
-            domain: "move".into(),
-            payload: serde_json::json!({}),
-        });
+        let env = CommandEnvelope::new(
+            Tick::ZERO,
+            "test",
+            Command::Raw {
+                domain: "move".into(),
+                payload: serde_json::json!({}),
+            },
+        );
         s.enqueue_command(env).unwrap();
         assert_eq!(s.pending_command_count().unwrap(), 1);
         let consumed = s.consume_pending_commands().unwrap();
@@ -493,6 +596,7 @@ mod tests {
     #[test]
     fn tick_advances_counter() {
         let s = make_scheduler();
+        s.initialize().unwrap();
         assert_eq!(s.current_tick().unwrap(), Tick::ZERO);
         s.tick().unwrap();
         assert_eq!(s.current_tick().unwrap(), Tick(1));
@@ -513,11 +617,25 @@ mod tests {
         let s = make_scheduler();
         struct S;
         impl SimSystem for S {
-            fn id(&self) -> &str { "s" }
-            fn phase(&self) -> Phase { Phase::Economy }
-            fn read_tables(&self) -> Vec<String> { vec!["a".into()] }
-            fn write_tables(&self) -> Vec<String> { vec![] }
-            fn execute(&self, _: &mut DeterministicRng, _: &QueryEngine, _: Phase, _: u64) -> SchedulerResult<Vec<Diff>> {
+            fn id(&self) -> &str {
+                "s"
+            }
+            fn phase(&self) -> Phase {
+                Phase::Economy
+            }
+            fn read_tables(&self) -> Vec<String> {
+                vec!["a".into()]
+            }
+            fn write_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn execute(
+                &self,
+                _: &mut DeterministicRng,
+                _: &QueryEngine,
+                _: Phase,
+                _: u64,
+            ) -> SchedulerResult<Vec<Diff>> {
                 Ok(vec![])
             }
         }
@@ -541,17 +659,33 @@ mod tests {
         let s = make_scheduler();
         struct S;
         impl SimSystem for S {
-            fn id(&self) -> &str { "bare" }
-            fn phase(&self) -> Phase { Phase::Economy }
-            fn read_tables(&self) -> Vec<String> { vec![] }
-            fn write_tables(&self) -> Vec<String> { vec![] }
-            fn execute(&self, _: &mut DeterministicRng, _: &QueryEngine, _: Phase, _: u64) -> SchedulerResult<Vec<Diff>> {
+            fn id(&self) -> &str {
+                "bare"
+            }
+            fn phase(&self) -> Phase {
+                Phase::Economy
+            }
+            fn read_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn write_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn execute(
+                &self,
+                _: &mut DeterministicRng,
+                _: &QueryEngine,
+                _: Phase,
+                _: u64,
+            ) -> SchedulerResult<Vec<Diff>> {
                 Ok(vec![])
             }
         }
         s.register_system(Arc::new(S)).unwrap();
         let err = s.initialize().unwrap_err();
-        assert!(matches!(err, SchedulerError::Generic(ref msg) if msg.contains("has no read or write tables")));
+        assert!(
+            matches!(err, SchedulerError::Generic(ref msg) if msg.contains("has no read or write tables"))
+        );
     }
 
     #[test]
@@ -559,21 +693,49 @@ mod tests {
         let s = make_scheduler();
         struct A;
         impl SimSystem for A {
-            fn id(&self) -> &str { "a" }
-            fn phase(&self) -> Phase { Phase::Economy }
-            fn read_tables(&self) -> Vec<String> { vec!["trade".into()] }
-            fn write_tables(&self) -> Vec<String> { vec!["prices".into()] }
-            fn execute(&self, _: &mut DeterministicRng, _: &QueryEngine, _: Phase, _: u64) -> SchedulerResult<Vec<Diff>> {
+            fn id(&self) -> &str {
+                "a"
+            }
+            fn phase(&self) -> Phase {
+                Phase::Economy
+            }
+            fn read_tables(&self) -> Vec<String> {
+                vec!["trade".into()]
+            }
+            fn write_tables(&self) -> Vec<String> {
+                vec!["prices".into()]
+            }
+            fn execute(
+                &self,
+                _: &mut DeterministicRng,
+                _: &QueryEngine,
+                _: Phase,
+                _: u64,
+            ) -> SchedulerResult<Vec<Diff>> {
                 Ok(vec![])
             }
         }
         struct B;
         impl SimSystem for B {
-            fn id(&self) -> &str { "b" }
-            fn phase(&self) -> Phase { Phase::Diplomacy }
-            fn read_tables(&self) -> Vec<String> { vec!["prices".into()] }
-            fn write_tables(&self) -> Vec<String> { vec!["treaties".into()] }
-            fn execute(&self, _: &mut DeterministicRng, _: &QueryEngine, _: Phase, _: u64) -> SchedulerResult<Vec<Diff>> {
+            fn id(&self) -> &str {
+                "b"
+            }
+            fn phase(&self) -> Phase {
+                Phase::Diplomacy
+            }
+            fn read_tables(&self) -> Vec<String> {
+                vec!["prices".into()]
+            }
+            fn write_tables(&self) -> Vec<String> {
+                vec!["treaties".into()]
+            }
+            fn execute(
+                &self,
+                _: &mut DeterministicRng,
+                _: &QueryEngine,
+                _: Phase,
+                _: u64,
+            ) -> SchedulerResult<Vec<Diff>> {
                 Ok(vec![])
             }
         }
@@ -601,18 +763,43 @@ mod tests {
     #[test]
     fn systems_by_phase_groups_correctly() {
         let s = make_scheduler();
-        struct Sys { id: &'static str, phase: Phase }
+        struct Sys {
+            id: &'static str,
+            phase: Phase,
+        }
         impl SimSystem for Sys {
-            fn id(&self) -> &str { self.id }
-            fn phase(&self) -> Phase { self.phase }
-            fn read_tables(&self) -> Vec<String> { vec![] }
-            fn write_tables(&self) -> Vec<String> { vec![] }
-            fn execute(&self, _: &mut DeterministicRng, _: &QueryEngine, _: Phase, _: u64) -> SchedulerResult<Vec<Diff>> {
+            fn id(&self) -> &str {
+                self.id
+            }
+            fn phase(&self) -> Phase {
+                self.phase
+            }
+            fn read_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn write_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn execute(
+                &self,
+                _: &mut DeterministicRng,
+                _: &QueryEngine,
+                _: Phase,
+                _: u64,
+            ) -> SchedulerResult<Vec<Diff>> {
                 Ok(vec![])
             }
         }
-        s.register_system(Arc::new(Sys { id: "pre", phase: Phase::PreTick })).unwrap();
-        s.register_system(Arc::new(Sys { id: "post", phase: Phase::PostTick })).unwrap();
+        s.register_system(Arc::new(Sys {
+            id: "pre",
+            phase: Phase::PreTick,
+        }))
+        .unwrap();
+        s.register_system(Arc::new(Sys {
+            id: "post",
+            phase: Phase::PostTick,
+        }))
+        .unwrap();
         let by_phase = s.systems_by_phase().unwrap();
         assert_eq!(by_phase.len(), 2);
         assert_eq!(by_phase[0].0, Phase::PreTick);
@@ -626,11 +813,25 @@ mod tests {
         let s = make_scheduler();
         struct Sys;
         impl SimSystem for Sys {
-            fn id(&self) -> &str { "meta" }
-            fn phase(&self) -> Phase { Phase::Military }
-            fn read_tables(&self) -> Vec<String> { vec!["units".into()] }
-            fn write_tables(&self) -> Vec<String> { vec!["battles".into()] }
-            fn execute(&self, _: &mut DeterministicRng, _: &QueryEngine, _: Phase, _: u64) -> SchedulerResult<Vec<Diff>> {
+            fn id(&self) -> &str {
+                "meta"
+            }
+            fn phase(&self) -> Phase {
+                Phase::Military
+            }
+            fn read_tables(&self) -> Vec<String> {
+                vec!["units".into()]
+            }
+            fn write_tables(&self) -> Vec<String> {
+                vec!["battles".into()]
+            }
+            fn execute(
+                &self,
+                _: &mut DeterministicRng,
+                _: &QueryEngine,
+                _: Phase,
+                _: u64,
+            ) -> SchedulerResult<Vec<Diff>> {
                 Ok(vec![])
             }
         }
@@ -645,5 +846,117 @@ mod tests {
         let s = make_scheduler();
         let err = s.registration("nope").unwrap_err();
         assert!(matches!(err, SchedulerError::SystemNotFound(ref id) if id == "nope"));
+    }
+
+    /// Refresh broadcast failure MUST NOT cause commit rollback.
+    ///
+    /// Invariant: When journal.commit() succeeds, the commit is durable.
+    /// Refresh signal is a notification to downstream consumers — its
+    /// failure must not undo the already-committed state. If broadcast
+    /// fails, tick() returns the error but the tick/generation have
+    /// advanced and consumed commands must NOT be restored.
+    #[test]
+    fn refresh_broadcast_failure_does_not_rollback_commit() {
+        let s = make_scheduler();
+
+        // Register a consumer whose callback unconditionally errors.
+        let fail_cb: RefreshCallback = Arc::new(|_, _| Err(SchedulerError::Generic("consumer down".into())));
+        s.register_consumer("broken_consumer", fail_cb).unwrap();
+
+        s.initialize().unwrap();
+
+        // Enqueue a command that we'll verify is NOT restored after broadcast failure.
+        let env = CommandEnvelope::new(
+            Tick::ZERO,
+            "test",
+            Command::Raw {
+                domain: "move".into(),
+                payload: serde_json::json!({}),
+            },
+        );
+        s.enqueue_command(env).unwrap();
+        assert_eq!(s.pending_command_count().unwrap(), 1);
+
+        let result = s.tick();
+        // Broadcast should fail due to the broken consumer.
+        assert!(result.is_err(), "tick should fail due to refresh broadcast failure");
+
+        // The commit itself succeeded — tick and generation must have advanced.
+        assert_eq!(s.current_tick().unwrap(), Tick(1), "tick must advance despite broadcast failure");
+        assert_eq!(s.current_generation().unwrap(), 1, "generation must advance despite broadcast failure");
+
+        // Consumed commands must NOT be restored — they were committed.
+        assert_eq!(
+            s.pending_command_count().unwrap(),
+            0,
+            "commands must NOT be restored after successful commit, even if broadcast failed"
+        );
+    }
+
+    /// Verify that commands consumed before a failed commit are restored
+    /// to the pending queue. Without the fix, consumed commands are lost
+    /// (scheduler queue empty, journal has them internally but run_phases
+    /// generates duplicate diffs on retry).
+    #[test]
+    fn commands_restored_on_commit_failure() {
+        let s = make_scheduler();
+
+        // Register a system that generates a diff to a non-existent table,
+        // which will cause journal.commit() to fail in apply_diffs_and_hash.
+        struct BadSystem;
+        impl SimSystem for BadSystem {
+            fn id(&self) -> &str {
+                "bad"
+            }
+            fn phase(&self) -> Phase {
+                Phase::Economy
+            }
+            fn read_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn write_tables(&self) -> Vec<String> {
+                vec!["nonexistent_table".into()]
+            }
+            fn execute(
+                &self,
+                _: &mut DeterministicRng,
+                _: &QueryEngine,
+                _: Phase,
+                _: u64,
+            ) -> SchedulerResult<Vec<Diff>> {
+                Ok(vec![Diff::Update {
+                    table: "nonexistent_table".to_owned(),
+                    row: RowId::new(1),
+                    column: "col".to_owned(),
+                    value: serde_json::json!(42),
+                }])
+            }
+        }
+        s.register_system(Arc::new(BadSystem)).unwrap();
+        s.initialize().unwrap();
+
+        let env = CommandEnvelope::new(
+            Tick::ZERO,
+            "test",
+            Command::Raw {
+                domain: "move".into(),
+                payload: serde_json::json!({}),
+            },
+        );
+        s.enqueue_command(env).unwrap();
+        assert_eq!(s.pending_command_count().unwrap(), 1, "command should be enqueued");
+
+        // tick() should fail because the bad system tries to write to
+        // a non-existent table.
+        let result = s.tick();
+        assert!(result.is_err(), "tick should fail on commit");
+
+        // Commands consumed before the failed commit MUST be restored
+        // to the pending queue so they are not lost.
+        assert_eq!(
+            s.pending_command_count().unwrap(),
+            1,
+            "consumed commands should be restored on commit failure"
+        );
     }
 }

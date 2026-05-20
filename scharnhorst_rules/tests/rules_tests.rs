@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use scharnhorst_core::{FixedPoint, RowId, Tick};
+use scharnhorst_core::{FixedPoint, JournalSubmitToken, RowId, Tick};
 use scharnhorst_journal::{Command, CommandEnvelope, Diff, Journal, JournalError};
 use scharnhorst_query::QueryEngine;
 use scharnhorst_query::QueryError;
-use scharnhorst_schema::{RelationEdge, RelationKind};
 use scharnhorst_rules::{
-    ArithmeticOp, CompareOp, Effect, EvalValue, Evaluator, Expr, JumpDirection, Modifier, ModifierOp,
-    ModifierRegistry, PrefetchCache, RuleError, RuleResult, Scope, ScopeJump,
+    ArithmeticOp, CompareOp, Effect, EvalValue, Evaluator, Expr, JumpDirection, Modifier,
+    ModifierOp, ModifierRegistry, PrefetchCache, RuleError, RuleResult, Scope, ScopeJump,
 };
+use scharnhorst_schema::{RelationEdge, RelationKind};
 
 // ------------------------------------------------------------------
 // Helper constructors
@@ -17,7 +17,9 @@ use scharnhorst_rules::{
 
 fn make_evaluator(root_table: &str, root_row: RowId) -> Evaluator {
     let query_engine = QueryEngine::new(scharnhorst_schema::SchemaRegistry::new());
-    let journal = Journal::new(scharnhorst_arrow_store::ArrowStore::new());
+    let journal = Journal::new(std::sync::Arc::new(
+        scharnhorst_arrow_store::ArrowStore::new(),
+    ));
     Evaluator::new(
         Arc::new(RwLock::new(query_engine)),
         Arc::new(RwLock::new(journal)),
@@ -51,7 +53,10 @@ fn expr_column_roundtrip() {
     let expr = Expr::column("actor_state", "treasury");
     assert_eq!(
         expr,
-        Expr::Column(scharnhorst_rules::ColumnPath::new("actor_state", "treasury"))
+        Expr::Column(scharnhorst_rules::ColumnPath::new(
+            "actor_state",
+            "treasury"
+        ))
     );
 }
 
@@ -83,7 +88,13 @@ fn expr_compare_roundtrip() {
     let lhs = Expr::constant(fp(1, 2));
     let rhs = Expr::constant(fp(2, 2));
     let expr = Expr::compare(CompareOp::Lt, lhs, rhs);
-    assert!(matches!(expr, Expr::Compare { op: CompareOp::Lt, .. }));
+    assert!(matches!(
+        expr,
+        Expr::Compare {
+            op: CompareOp::Lt,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -91,7 +102,13 @@ fn expr_arithmetic_roundtrip() {
     let lhs = Expr::constant(fp(3, 2));
     let rhs = Expr::constant(fp(4, 2));
     let expr = Expr::arithmetic(ArithmeticOp::Mul, lhs, rhs);
-    assert!(matches!(expr, Expr::Arithmetic { op: ArithmeticOp::Mul, .. }));
+    assert!(matches!(
+        expr,
+        Expr::Arithmetic {
+            op: ArithmeticOp::Mul,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -455,7 +472,11 @@ fn scope_new() {
 #[test]
 fn scope_push_pop() -> RuleResult<()> {
     let mut scope = Scope::new("actor_state", RowId::new(1));
-    scope.push("province", RowId::new(2), Some(ScopeJump::forward("actor_state -> province")));
+    scope.push(
+        "province",
+        RowId::new(2),
+        Some(ScopeJump::forward("actor_state -> province")),
+    );
     assert_eq!(scope.table(), "province");
     assert_eq!(scope.row(), RowId::new(2));
     assert_eq!(scope.stack_depth(), 1);
@@ -555,8 +576,8 @@ fn cache_set_tick_clears_entries() {
     cache.set_tick(Tick(1));
     assert_eq!(cache.tick(), Tick(1));
 
- // Insert a dummy entry via internal method is not public,
- // so we verify the clear behavior by checking tick transition.
+    // Insert a dummy entry via internal method is not public,
+    // so we verify the clear behavior by checking tick transition.
     cache.set_tick(Tick(2));
     assert_eq!(cache.tick(), Tick(2));
     assert!(cache.is_empty());
@@ -583,7 +604,12 @@ fn modifier_add() -> RuleResult<()> {
 
 #[test]
 fn modifier_mul() -> RuleResult<()> {
-    let m = Modifier::new("actor_state", "treasury", ModifierOp::Mul, FixedPoint::new(11, 1));
+    let m = Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Mul,
+        FixedPoint::new(11, 1),
+    );
     let base = fp(100, 2);
     let result = m.apply(base)?;
     assert_eq!(result, fp(110, 2));
@@ -616,7 +642,12 @@ fn registry_register_and_lookup() {
 #[test]
 fn registry_clear_field() {
     let mut reg = ModifierRegistry::new();
-    reg.register(Modifier::new("actor_state", "treasury", ModifierOp::Add, fp(5, 2)));
+    reg.register(Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Add,
+        fp(5, 2),
+    ));
     reg.clear_field("actor_state", "treasury");
     assert!(reg.is_empty());
 }
@@ -624,8 +655,18 @@ fn registry_clear_field() {
 #[test]
 fn registry_aggregate_add_only() -> RuleResult<()> {
     let mut reg = ModifierRegistry::new();
-    reg.register(Modifier::new("actor_state", "treasury", ModifierOp::Add, fp(10, 2)));
-    reg.register(Modifier::new("actor_state", "treasury", ModifierOp::Add, fp(5, 2)));
+    reg.register(Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Add,
+        fp(10, 2),
+    ));
+    reg.register(Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Add,
+        fp(5, 2),
+    ));
     let result = reg.aggregate("actor_state", "treasury", fp(100, 2))?;
     assert_eq!(result, fp(115, 2));
     Ok(())
@@ -634,7 +675,12 @@ fn registry_aggregate_add_only() -> RuleResult<()> {
 #[test]
 fn registry_aggregate_mul_only() -> RuleResult<()> {
     let mut reg = ModifierRegistry::new();
-    reg.register(Modifier::new("actor_state", "treasury", ModifierOp::Mul, FixedPoint::new(11, 1)));
+    reg.register(Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Mul,
+        FixedPoint::new(11, 1),
+    ));
     let result = reg.aggregate("actor_state", "treasury", fp(100, 2))?;
     assert_eq!(result, fp(110, 2));
     Ok(())
@@ -643,9 +689,19 @@ fn registry_aggregate_mul_only() -> RuleResult<()> {
 #[test]
 fn registry_aggregate_add_then_mul() -> RuleResult<()> {
     let mut reg = ModifierRegistry::new();
-    reg.register(Modifier::new("actor_state", "treasury", ModifierOp::Add, fp(20, 2)));
-    reg.register(Modifier::new("actor_state", "treasury", ModifierOp::Mul, FixedPoint::new(11, 1)));
- // (100 + 20) * 1.1 = 132
+    reg.register(Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Add,
+        fp(20, 2),
+    ));
+    reg.register(Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Mul,
+        FixedPoint::new(11, 1),
+    ));
+    // (100 + 20) * 1.1 = 132
     let result = reg.aggregate("actor_state", "treasury", fp(100, 2))?;
     assert_eq!(result, fp(132, 2));
     Ok(())
@@ -654,10 +710,25 @@ fn registry_aggregate_add_then_mul() -> RuleResult<()> {
 #[test]
 fn registry_aggregate_override_wins() -> RuleResult<()> {
     let mut reg = ModifierRegistry::new();
-    reg.register(Modifier::new("actor_state", "treasury", ModifierOp::Add, fp(10, 2)));
-    reg.register(Modifier::new("actor_state", "treasury", ModifierOp::Override, fp(7, 2)));
-    reg.register(Modifier::new("actor_state", "treasury", ModifierOp::Mul, fp(2, 0)));
- // Override is last, so it wins after add/mul
+    reg.register(Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Add,
+        fp(10, 2),
+    ));
+    reg.register(Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Override,
+        fp(7, 2),
+    ));
+    reg.register(Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Mul,
+        fp(2, 0),
+    ));
+    // Override is last, so it wins after add/mul
     let result = reg.aggregate("actor_state", "treasury", fp(100, 2))?;
     assert_eq!(result, fp(7, 2));
     Ok(())
@@ -666,8 +737,18 @@ fn registry_aggregate_override_wins() -> RuleResult<()> {
 #[test]
 fn registry_fields_iterator() {
     let mut reg = ModifierRegistry::new();
-    reg.register(Modifier::new("actor_state", "treasury", ModifierOp::Add, fp(1, 0)));
-    reg.register(Modifier::new("actor_state", "prestige", ModifierOp::Add, fp(1, 0)));
+    reg.register(Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Add,
+        fp(1, 0),
+    ));
+    reg.register(Modifier::new(
+        "actor_state",
+        "prestige",
+        ModifierOp::Add,
+        fp(1, 0),
+    ));
     let mut fields: Vec<_> = reg.fields().collect();
     fields.sort();
     assert_eq!(
@@ -694,7 +775,10 @@ fn evaluator_scope_push_pop() -> RuleResult<()> {
 fn evaluator_jump_to_unknown_relation_is_error() {
     let mut ev = make_evaluator("province", RowId::new(1));
     let result = ev.jump_to("province -> actor_state", JumpDirection::Forward);
-    assert!(matches!(result, Err(RuleError::Query(QueryError::RelationNotFound(_)))));
+    assert!(matches!(
+        result,
+        Err(RuleError::Query(QueryError::RelationNotFound(_)))
+    ));
 }
 
 // ------------------------------------------------------------------
@@ -710,7 +794,7 @@ fn evaluator_submit_diff_ok() -> RuleResult<()> {
         column: "treasury".to_owned(),
         value: serde_json::Value::Number(serde_json::Number::from(100)),
     };
-    ev.submit_diff(diff)?;
+    ev.submit_diff(diff, &JournalSubmitToken::new())?;
     let journal = ev
         .journal()
         .read()
@@ -732,7 +816,7 @@ fn evaluator_submit_command_ok() -> RuleResult<()> {
             value: serde_json::Value::Number(serde_json::Number::from(100)),
         },
     );
-    ev.submit_command(envelope)?;
+    ev.submit_command(envelope, &JournalSubmitToken::new())?;
     let journal = ev
         .journal()
         .read()
@@ -760,7 +844,12 @@ fn evaluator_advance_tick_clears_cache() {
 #[test]
 fn evaluator_with_modifiers() {
     let mut reg = ModifierRegistry::new();
-    reg.register(Modifier::new("actor_state", "treasury", ModifierOp::Add, fp(5, 2)));
+    reg.register(Modifier::new(
+        "actor_state",
+        "treasury",
+        ModifierOp::Add,
+        fp(5, 2),
+    ));
     let ev = make_evaluator("test", RowId::new(0)).with_modifiers(reg);
     assert_eq!(ev.modifiers().len(), 1);
 }
@@ -772,7 +861,7 @@ fn evaluator_with_modifiers() {
 #[test]
 fn eval_complex_trigger() -> RuleResult<()> {
     let mut ev = make_evaluator("province", RowId::new(1));
- // (unrest > 0.8) AND (stability < 0.3)
+    // (unrest > 0.8) AND (stability < 0.3)
     let unrest = Expr::compare(
         CompareOp::Gt,
         Expr::column("province", "unrest"),
@@ -785,7 +874,7 @@ fn eval_complex_trigger() -> RuleResult<()> {
     );
     let trigger = Expr::and(vec![unrest, stability]);
 
- // evaluate_column queries the engine; engine has no data so returns Query error.
+    // evaluate_column queries the engine; engine has no data so returns Query error.
     let result = ev.evaluate(&trigger);
     assert!(matches!(result, Err(RuleError::Query(_))));
     Ok(())
@@ -841,17 +930,17 @@ fn evaluator_advance_tick_u64_clears_cache() {
 
 #[test]
 fn evaluator_refresh_signal_integration() {
- // Simulate REFRESH_SIGNAL via RwLock-based external synchronization.
+    // Simulate REFRESH_SIGNAL via RwLock-based external synchronization.
     let ev = make_evaluator("test", RowId::new(0));
     let locked = std::sync::Arc::new(RwLock::new(ev));
 
- // External caller acquires write lock and advances tick.
+    // External caller acquires write lock and advances tick.
     {
         let mut guard = locked.write().unwrap();
         guard.advance_tick_u64(7);
     }
 
- // Verify tick updated and cache cleared.
+    // Verify tick updated and cache cleared.
     let guard = locked.read().unwrap();
     assert_eq!(guard.current_tick(), Tick(7));
     assert!(guard.cache().is_empty());
@@ -871,12 +960,11 @@ fn effect_update_column_submits_diff() -> RuleResult<()> {
     };
     ev.evaluate_effect(&effect)?;
 
-    let journal = ev
-        .journal()
-        .read()
-        .map_err(|_| RuleError::Journal(scharnhorst_journal::JournalError::SubmitFailed(
+    let journal = ev.journal().read().map_err(|_| {
+        RuleError::Journal(scharnhorst_journal::JournalError::SubmitFailed(
             "lock".to_owned(),
-        )))?;
+        ))
+    })?;
     assert_eq!(journal.pending_diff_count(), 1);
     Ok(())
 }
@@ -895,12 +983,11 @@ fn effect_insert_row_submits_diff() -> RuleResult<()> {
     };
     ev.evaluate_effect(&effect)?;
 
-    let journal = ev
-        .journal()
-        .read()
-        .map_err(|_| RuleError::Journal(scharnhorst_journal::JournalError::SubmitFailed(
+    let journal = ev.journal().read().map_err(|_| {
+        RuleError::Journal(scharnhorst_journal::JournalError::SubmitFailed(
             "lock".to_owned(),
-        )))?;
+        ))
+    })?;
     assert_eq!(journal.pending_diff_count(), 1);
     Ok(())
 }
@@ -944,7 +1031,7 @@ fn effect_sequence_runs_all() -> RuleResult<()> {
 #[test]
 fn effect_update_column_evaluates_expression() -> RuleResult<()> {
     let mut ev = make_evaluator("actor_state", RowId::new(0));
- // Arithmetic expression: 10.00 + 5.00 = 15.00
+    // Arithmetic expression: 10.00 + 5.00 = 15.00
     let effect = Effect::UpdateColumn {
         table: "actor_state".to_owned(),
         column: "treasury".to_owned(),
@@ -956,15 +1043,14 @@ fn effect_update_column_evaluates_expression() -> RuleResult<()> {
     };
     ev.evaluate_effect(&effect)?;
 
- // The expression should have been evaluated before diff submission.
- // If expression evaluation failed, this test would have returned
- // an error above. A successful evaluation produces one diff.
-    let journal = ev
-        .journal()
-        .read()
-        .map_err(|_| RuleError::Journal(scharnhorst_journal::JournalError::SubmitFailed(
+    // The expression should have been evaluated before diff submission.
+    // If expression evaluation failed, this test would have returned
+    // an error above. A successful evaluation produces one diff.
+    let journal = ev.journal().read().map_err(|_| {
+        RuleError::Journal(scharnhorst_journal::JournalError::SubmitFailed(
             "lock".to_owned(),
-        )))?;
+        ))
+    })?;
     assert_eq!(journal.pending_diff_count(), 1);
     Ok(())
 }

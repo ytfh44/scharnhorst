@@ -154,8 +154,12 @@ impl InspectorConsole {
             .ok_or_else(|| QueryError::TableNotFound(table_name.to_owned()))
     }
 
- /// Summarise a table from a set of record batches.
-    pub fn summarize_table(&self, table_name: &str, batches: &[RecordBatch]) -> QueryResult<TableSummary> {
+    /// Summarise a table from a set of record batches.
+    pub fn summarize_table(
+        &self,
+        table_name: &str,
+        batches: &[RecordBatch],
+    ) -> QueryResult<TableSummary> {
         let schema = self.schema(table_name)?;
         let row_count = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -180,7 +184,7 @@ impl InspectorConsole {
         Ok(TableSummary::new(table_name, row_count).with_columns(column_summaries))
     }
 
- /// Extract a paginated page of stringified rows from record batches.
+    /// Extract a paginated page of stringified rows from record batches.
     pub fn inspect_page(
         &self,
         table_name: &str,
@@ -197,11 +201,7 @@ impl InspectorConsole {
         }
         let end = (start + page_size).min(total_rows);
 
-        let column_names: Vec<String> = schema
-            .columns
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
+        let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
 
         let mut rows: Vec<InspectorRow> = Vec::with_capacity(end - start);
         let mut global_row = 0usize;
@@ -242,7 +242,7 @@ impl InspectorConsole {
         ))
     }
 
- /// Build a map of column views for the first batch of a table.
+    /// Build a map of column views for the first batch of a table.
     pub fn column_views(
         &self,
         table_name: &str,
@@ -277,8 +277,14 @@ fn format_cell(array: &Arc<dyn arrow_array::Array>, row: usize) -> String {
     }
 
     match array.data_type() {
-        DataType::Int64 => array.as_primitive::<arrow_array::types::Int64Type>().value(row).to_string(),
-        DataType::Float64 => array.as_primitive::<arrow_array::types::Float64Type>().value(row).to_string(),
+        DataType::Int64 => array
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(row)
+            .to_string(),
+        DataType::Float64 => array
+            .as_primitive::<arrow_array::types::Float64Type>()
+            .value(row)
+            .to_string(),
         DataType::Boolean => array.as_boolean().value(row).to_string(),
         DataType::Utf8 => array.as_string::<i32>().value(row).to_owned(),
         DataType::LargeUtf8 => array.as_string::<i64>().value(row).to_owned(),

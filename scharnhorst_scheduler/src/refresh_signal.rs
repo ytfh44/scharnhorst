@@ -24,11 +24,7 @@ pub struct RefreshSignalBus {
 
 impl std::fmt::Debug for RefreshSignalBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = self
-            .consumers
-            .lock()
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let count = self.consumers.lock().map(|m| m.len()).unwrap_or(0);
         f.debug_struct("RefreshSignalBus")
             .field("consumer_count", &count)
             .finish()
@@ -50,14 +46,14 @@ impl Default for RefreshSignalBus {
 }
 
 impl RefreshSignalBus {
- /// Create a new empty signal bus.
+    /// Create a new empty signal bus.
     pub fn new() -> Self {
         Self {
             consumers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
- /// Register a consumer with a unique name and callback.
+    /// Register a consumer with a unique name and callback.
     pub fn register(
         &self,
         name: impl Into<String>,
@@ -72,7 +68,7 @@ impl RefreshSignalBus {
         Ok(RefreshSignalHandle(name))
     }
 
- /// Unregister a consumer by handle.
+    /// Unregister a consumer by handle.
     pub fn unregister(&self, handle: &RefreshSignalHandle) -> SchedulerResult<()> {
         let mut consumers = self
             .consumers
@@ -82,31 +78,41 @@ impl RefreshSignalBus {
         Ok(())
     }
 
- /// Broadcast the refresh signal to all registered consumers.
- ///
- /// Returns `Ok()` only if every consumer acknowledges successfully.
+    /// Unregister a consumer by name.
+    ///
+    /// Returns an error if the consumer is not found.
+    pub fn unregister_by_name(&self, name: &str) -> SchedulerResult<()> {
+        let mut consumers = self
+            .consumers
+            .lock()
+            .map_err(|e| SchedulerError::Generic(format!("refresh signal lock poisoned: {e}")))?;
+        consumers.remove(name);
+        Ok(())
+    }
+
+    /// Broadcast the refresh signal to all registered consumers.
+    ///
+    /// Returns `Ok()` only if every consumer acknowledges successfully.
     pub fn broadcast(&self, tick: u64, generation: u64) -> SchedulerResult<()> {
         let snapshot: Vec<(String, RefreshCallback)> = {
-            let consumers = self
-                .consumers
-                .lock()
-                .map_err(|e| SchedulerError::Generic(format!("refresh signal lock poisoned: {e}")))?;
+            let consumers = self.consumers.lock().map_err(|e| {
+                SchedulerError::Generic(format!("refresh signal lock poisoned: {e}"))
+            })?;
             consumers
                 .iter()
                 .map(|(name, cb)| (name.clone(), Arc::clone(cb)))
                 .collect()
         };
         for (name, cb) in &snapshot {
-            cb(tick, generation)
-                .map_err(|e| SchedulerError::RefreshSignalFailed {
-                    consumer: name.clone(),
-                    source: Box::new(e),
-                })?;
+            cb(tick, generation).map_err(|e| SchedulerError::RefreshSignalFailed {
+                consumer: name.clone(),
+                source: Box::new(e),
+            })?;
         }
         Ok(())
     }
 
- /// Returns the names of all currently registered consumers.
+    /// Returns the names of all currently registered consumers.
     pub fn consumer_names(&self) -> SchedulerResult<Vec<String>> {
         let consumers = self
             .consumers
@@ -115,7 +121,7 @@ impl RefreshSignalBus {
         Ok(consumers.keys().cloned().collect())
     }
 
- /// Returns the number of registered consumers.
+    /// Returns the number of registered consumers.
     pub fn consumer_count(&self) -> SchedulerResult<usize> {
         let consumers = self
             .consumers
@@ -155,7 +161,9 @@ mod tests {
         let cb: RefreshCallback = {
             let r = received.clone();
             Arc::new(move |tick, gen| {
-                let mut guard = r.lock().map_err(|_| SchedulerError::Generic("poisoned".into()))?;
+                let mut guard = r
+                    .lock()
+                    .map_err(|_| SchedulerError::Generic("poisoned".into()))?;
                 *guard = (tick, gen);
                 Ok(())
             })

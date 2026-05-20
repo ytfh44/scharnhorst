@@ -16,22 +16,22 @@ use crate::store::{make_null_array, slice_array_to_single};
 /// documentation and can be used by higher-level logic to validate operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MutationMode {
- /// Rows are only appended; existing batches are never modified.
- ///
- /// This is the safest mode for concurrent access, as data is immutable
- /// once written.
+    /// Rows are only appended; existing batches are never modified.
+    ///
+    /// This is the safest mode for concurrent access, as data is immutable
+    /// once written.
     AppendOnly,
- /// Individual rows may be patched or updated in-place.
- ///
- /// **Warning**: This mode requires external synchronization when accessed
- /// from multiple threads. The `VersionedTable` itself does not provide
- /// internal locking.
+    /// Individual rows may be patched or updated in-place.
+    ///
+    /// **Warning**: This mode requires external synchronization when accessed
+    /// from multiple threads. The `VersionedTable` itself does not provide
+    /// internal locking.
     Patchable,
- /// The entire table is rebuilt from scratch every tick.
- ///
- /// This mode is useful for scenarios where the complete state is recomputed
- /// each tick. Like `Patchable`, it requires external synchronization for
- /// concurrent access.
+    /// The entire table is rebuilt from scratch every tick.
+    ///
+    /// This mode is useful for scenarios where the complete state is recomputed
+    /// each tick. Like `Patchable`, it requires external synchronization for
+    /// concurrent access.
     RebuildPerTick,
 }
 
@@ -108,33 +108,33 @@ pub enum MutationMode {
 /// additional synchronization.
 #[derive(Debug, Clone)]
 pub struct VersionedTable {
- /// The table's identifier.
+    /// The table's identifier.
     pub(crate) name: String,
- /// The mutation mode controlling how this table may be modified.
+    /// The mutation mode controlling how this table may be modified.
     pub(crate) mutation_mode: MutationMode,
- /// Optional schema specification for the table.
+    /// Optional schema specification for the table.
     pub(crate) spec: Option<TableSpec>,
- /// Historical batches organized by tick.
- ///
- /// Each tick may contain multiple `RecordBatch` instances. The map allows
- /// efficient lookup of all data valid at a particular tick.
+    /// Historical batches organized by tick.
+    ///
+    /// Each tick may contain multiple `RecordBatch` instances. The map allows
+    /// efficient lookup of all data valid at a particular tick.
     pub(crate) versions: HashMap<Tick, Vec<RecordBatch>>,
- /// Primary key index for fast lookups by primary key value.
- ///
- /// This index must be built explicitly after inserting data.
+    /// Primary key index for fast lookups by primary key value.
+    ///
+    /// This index must be built explicitly after inserting data.
     pub(crate) primary_key_index: PrimaryKeyIndex,
- /// Foreign key indices for referential integrity checks.
- ///
- /// Multiple foreign key indices may be defined, each referencing a
- /// different target table.
+    /// Foreign key indices for referential integrity checks.
+    ///
+    /// Multiple foreign key indices may be defined, each referencing a
+    /// different target table.
     pub(crate) foreign_key_indices: Vec<ForeignKeyIndex>,
- /// Partition map organizing the table into regions for distributed processing.
+    /// Partition map organizing the table into regions for distributed processing.
     pub(crate) partitions: PartitionMap,
- /// Maps RowId values to their physical storage positions within the table.
- ///
- /// Updated on insert, delete, replace, and rebuild operations. This is the
- /// authoritative source for translating logical RowId to physical
- /// (batch_index, row_offset) tuples.
+    /// Maps RowId values to their physical storage positions within the table.
+    ///
+    /// Updated on insert, delete, replace, and rebuild operations. This is the
+    /// authoritative source for translating logical RowId to physical
+    /// (batch_index, row_offset) tuples.
     pub(crate) position_map: RowPositionMap,
 }
 

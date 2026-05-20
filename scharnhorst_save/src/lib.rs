@@ -12,14 +12,10 @@ pub mod mod_tolerance;
 pub mod snapshot_manager;
 pub mod snapshot_persistence;
 
-pub use checkpoint::{
-    CheckpointManager, CheckpointingSaveJournal, RetentionPolicy,
-};
+pub use checkpoint::{CheckpointManager, CheckpointingSaveJournal, RetentionPolicy};
 pub use error::{SaveError, SaveResult};
 pub use load_reconstruction::{LoadReconstruction, LoadReconstructionBuilder};
 pub use migration::{MigrationPipeline, MigrationRegistry, MigrationStep};
 pub use mod_tolerance::{ModLoadOutcome, ModToleranceChecker, ModTolerancePolicy};
 pub use snapshot_manager::{SnapshotConfig, SnapshotInfo, SnapshotManager};
-pub use snapshot_persistence::{
-    PersistedSnapshot, SnapshotHeader, SnapshotPersistence,
-};
+pub use snapshot_persistence::{PersistedSnapshot, SnapshotHeader, SnapshotPersistence};

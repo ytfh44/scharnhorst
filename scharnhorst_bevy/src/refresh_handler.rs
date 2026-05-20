@@ -2,7 +2,7 @@ use scharnhorst_arrow_store::{ArrowStore, WorldSnapshot};
 use scharnhorst_query::engine::QueryEngine;
 use scharnhorst_scheduler::refresh_signal::{RefreshCallback, RefreshSignalHandle};
 use scharnhorst_scheduler::Scheduler;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::error::{BevyBridgeError, BevyBridgeResult};
@@ -15,7 +15,6 @@ pub struct SnapshotRefreshHandler {
     #[allow(dead_code)]
     arrow_store: Arc<ArrowStore>,
     signal_received: Arc<AtomicBool>,
-    last_snapshot_generation: Arc<AtomicU64>,
 }
 
 impl SnapshotRefreshHandler {
@@ -29,7 +28,6 @@ impl SnapshotRefreshHandler {
             query_engine,
             arrow_store,
             signal_received: Arc::new(AtomicBool::new(false)),
-            last_snapshot_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -42,11 +40,8 @@ impl SnapshotRefreshHandler {
         Ok(self.signal_received.load(Ordering::Acquire))
     }
 
-    pub fn refresh_snapshot(
-        &self,
-        new_snapshot: WorldSnapshot,
-    ) -> BevyBridgeResult<()> {
-        let generation = self.last_snapshot_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    pub fn refresh_snapshot(&self, new_snapshot: WorldSnapshot) -> BevyBridgeResult<()> {
+        let generation = self.view_model.generation()?.saturating_add(1);
 
         self.view_model
             .refresh(Arc::new(new_snapshot), generation)?;
@@ -57,28 +52,21 @@ impl SnapshotRefreshHandler {
     }
 
     pub fn current_generation(&self) -> BevyBridgeResult<u64> {
-        Ok(self.last_snapshot_generation.load(Ordering::Relaxed))
+        self.view_model.generation()
     }
 
     pub fn callback(&self) -> RefreshCallback {
         let vm = Arc::clone(&self.view_model);
         let qe = Arc::clone(&self.query_engine);
         let sig = Arc::clone(&self.signal_received);
-        let gen = Arc::clone(&self.last_snapshot_generation);
-        Arc::new(move |tick, _generation| {
-            let _ = tick;
-            let snapshot = qe
-                .snapshot()
-                .map_err(|e| {
-                    scharnhorst_scheduler::error::SchedulerError::Generic(e.to_string())
-                })?;
+        Arc::new(move |_tick, generation| {
+            let snapshot = qe.snapshot().map_err(|e| {
+                scharnhorst_scheduler::error::SchedulerError::Generic(e.to_string())
+            })?;
 
-            let new_gen = gen.fetch_add(1, Ordering::Relaxed) + 1;
-
-            vm.refresh(snapshot, new_gen)
-                .map_err(|e| {
-                    scharnhorst_scheduler::error::SchedulerError::Generic(e.to_string())
-                })?;
+            vm.refresh(snapshot, generation).map_err(|e| {
+                scharnhorst_scheduler::error::SchedulerError::Generic(e.to_string())
+            })?;
 
             sig.store(false, Ordering::Release);
             Ok(())
