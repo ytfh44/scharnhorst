@@ -427,6 +427,78 @@ fn foreign_key_index_remove_key() {
 }
 
 // ------------------------------------------------------------------
+// PrimaryKeyIndex: with_history mode
+// ------------------------------------------------------------------
+
+#[test]
+fn primary_key_index_with_history_true_lookup_returns_all() {
+    let mut idx = PrimaryKeyIndex::with_history(true);
+    idx.insert("k".to_owned(), Tick(1), 0, 0);
+    idx.insert("k".to_owned(), Tick(3), 0, 1);
+    idx.insert("k".to_owned(), Tick(2), 0, 2);
+
+    let all = idx.lookup("k");
+    // with_history(true) must return the full history
+    assert!(all.is_some(), "lookup must return Some when history is enabled");
+    assert_eq!(all.unwrap().len(), 3);
+}
+
+#[test]
+fn primary_key_index_with_history_false_lookup_returns_none() {
+    let mut idx = PrimaryKeyIndex::with_history(false);
+    idx.insert("k".to_owned(), Tick(1), 0, 0);
+    idx.insert("k".to_owned(), Tick(3), 0, 1);
+
+    // with_history(false): lookup must return None
+    assert!(
+        idx.lookup("k").is_none(),
+        "lookup must return None when history is disabled"
+    );
+}
+
+#[test]
+fn primary_key_index_with_history_false_lookup_latest_still_works() {
+    let mut idx = PrimaryKeyIndex::with_history(false);
+    idx.insert("k".to_owned(), Tick(1), 0, 0);
+    idx.insert("k".to_owned(), Tick(3), 0, 1);
+    idx.insert("k".to_owned(), Tick(2), 0, 2);
+
+    // lookup_latest must work regardless of history mode
+    let latest = idx.lookup_latest("k");
+    assert!(latest.is_some(), "lookup_latest must work even when history is disabled");
+    assert_eq!(latest.unwrap(), (Tick(3), 0, 1));
+}
+
+#[test]
+fn primary_key_index_lookup_latest_returns_max_tick() {
+    let mut idx = PrimaryKeyIndex::new();
+    // Insert many versions for the same key across scattered ticks
+    idx.insert("heavy".to_owned(), Tick(5), 1, 3);
+    idx.insert("heavy".to_owned(), Tick(100), 0, 0);
+    idx.insert("heavy".to_owned(), Tick(42), 2, 1);
+    idx.insert("heavy".to_owned(), Tick(7), 1, 0);
+
+    let latest = idx.lookup_latest("heavy").unwrap();
+    assert_eq!(latest, (Tick(100), 0, 0));
+}
+
+#[test]
+fn primary_key_index_remove_key_clears_both_layers() {
+    let mut idx = PrimaryKeyIndex::new();
+    idx.insert("k".to_owned(), Tick(1), 0, 0);
+    idx.insert("k".to_owned(), Tick(2), 0, 1);
+
+    assert!(idx.lookup_latest("k").is_some());
+    assert!(idx.lookup("k").is_some());
+
+    idx.remove_key("k");
+
+    assert!(idx.lookup_latest("k").is_none());
+    assert!(idx.lookup("k").is_none());
+    assert!(!idx.keys().any(|k| k == "k"));
+}
+
+// ------------------------------------------------------------------
 // RowLocation
 // ------------------------------------------------------------------
 
