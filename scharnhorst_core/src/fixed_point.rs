@@ -116,7 +116,7 @@ impl FixedPoint {
             return Some(a.cmp(&b));
         }
         if self.scale < other.scale {
-            let delta = (other.scale - self.scale) as u32;
+            let delta = other.scale - self.scale;
             match 10_i128.checked_pow(delta) {
                 Some(pow) => {
                     let a_scaled = a.checked_mul(pow)?;
@@ -131,7 +131,7 @@ impl FixedPoint {
                 }
             }
         } else {
-            let delta = (self.scale - other.scale) as u32;
+            let delta = self.scale - other.scale;
             match 10_i128.checked_pow(delta) {
                 Some(pow) => {
                     let b_scaled = b.checked_mul(pow)?;
@@ -161,13 +161,13 @@ impl FixedPoint {
 
 impl PartialEq for FixedPoint {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp_normalized(other).map_or(false, |o| o.is_eq())
+        self.cmp_normalized(other).is_some_and(|o| o.is_eq())
     }
 }
 
 impl PartialOrd for FixedPoint {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.cmp_normalized(other)
+        Some(self.cmp(other))
     }
 }
 
@@ -225,7 +225,7 @@ impl Mul for FixedPoint {
             .ok_or(CoreError::ArithmeticOverflow)?;
         let raw = product
             .checked_div(factor)
-            .map_or(Err(CoreError::ArithmeticOverflow), |v| Ok(v))?;
+            .ok_or(CoreError::ArithmeticOverflow)?;
         Ok(Self::new(raw, self.scale))
     }
 }

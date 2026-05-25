@@ -69,13 +69,17 @@ impl RefreshSignalBus {
     }
 
     /// Unregister a consumer by handle.
+    ///
+    /// Returns an error if the handle is not registered.
     pub fn unregister(&self, handle: &RefreshSignalHandle) -> SchedulerResult<()> {
         let mut consumers = self
             .consumers
             .lock()
             .map_err(|e| SchedulerError::Generic(format!("refresh signal lock poisoned: {e}")))?;
-        consumers.remove(&handle.0);
-        Ok(())
+        consumers
+            .remove(&handle.0)
+            .map(|_| ())
+            .ok_or_else(|| SchedulerError::RefreshBusLookupFailed(handle.0.clone()))
     }
 
     /// Unregister a consumer by name.
@@ -86,8 +90,10 @@ impl RefreshSignalBus {
             .consumers
             .lock()
             .map_err(|e| SchedulerError::Generic(format!("refresh signal lock poisoned: {e}")))?;
-        consumers.remove(name);
-        Ok(())
+        consumers
+            .remove(name)
+            .map(|_| ())
+            .ok_or_else(|| SchedulerError::RefreshBusLookupFailed(name.to_owned()))
     }
 
     /// Broadcast the refresh signal to all registered consumers.
@@ -133,10 +139,27 @@ impl RefreshSignalBus {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn broadcast_lock_poisoned_propagates_error() {
+        let bus = RefreshSignalBus::new();
+        let consumers = Arc::clone(&bus.consumers);
+        // Poison the mutex by panicking while holding the lock.
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = consumers.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        let err = bus.broadcast(0, 0).unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::Generic(ref msg) if msg.contains("poisoned")),
+            "expected Generic poison error, got {err:?}"
+        );
+    }
 
     #[test]
     fn register_and_broadcast() {
@@ -255,5 +278,21 @@ mod tests {
         let bus2 = bus.clone();
         bus2.broadcast(1, 1).unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// May-fail: unregister with unknown handle returns lookup error.
+    ///
+    /// Worst case: if unregister silently ignores unknown handles,
+    /// callers cannot distinguish between "unregister succeeded" and
+    /// "handle was already invalid", potentially causing stale
+    /// consumer references to linger.
+    #[test]
+    fn unregister_unknown_handle_returns_error() {
+        let bus = RefreshSignalBus::new();
+        let result = bus.unregister(&RefreshSignalHandle("unknown".to_string()));
+        assert!(
+            result.is_err(),
+            "unregister with unknown handle must return an error"
+        );
     }
 }

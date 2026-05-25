@@ -9,8 +9,12 @@ use scharnhorst_core::Tick;
 use scharnhorst_journal::{CommitRecord, SaveJournal};
 use scharnhorst_save::{CheckpointManager, CheckpointingSaveJournal, RetentionPolicy};
 
-fn temp_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("sch_auto_chk_test_{}", std::process::id()))
+fn temp_dir(suffix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "sch_auto_chk_test_{}_{}",
+        std::process::id(),
+        suffix
+    ))
 }
 
 #[test]
@@ -27,7 +31,7 @@ fn custom_threshold_respected() {
 
 #[test]
 fn checkpointing_journal_counts_appends() {
-    let dir = temp_dir();
+    let dir = temp_dir("counts");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
     let journal_path = dir.join("journal.bin");
@@ -62,7 +66,7 @@ fn checkpointing_journal_truncates() {
 
 #[test]
 fn retention_policy_enforces_max_snapshots() {
-    let dir = temp_dir();
+    let dir = temp_dir("retention");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
     let journal_path = dir.join("journal.bin");

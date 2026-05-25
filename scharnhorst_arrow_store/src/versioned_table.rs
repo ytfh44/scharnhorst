@@ -171,7 +171,9 @@ impl VersionedTable {
         self.spec = Some(spec);
     }
 
-    pub fn versions(&self) -> &HashMap<Tick, Vec<RecordBatch>> {
+    /// Used only in tests.
+    #[allow(dead_code)]
+    pub(crate) fn versions(&self) -> &HashMap<Tick, Vec<RecordBatch>> {
         &self.versions
     }
 
@@ -184,7 +186,7 @@ impl VersionedTable {
         Ok(())
     }
 
-    pub fn get_version(&self, tick: Tick) -> Option<&Vec<RecordBatch>> {
+    pub(crate) fn get_version(&self, tick: Tick) -> Option<&Vec<RecordBatch>> {
         self.versions.get(&tick)
     }
 
@@ -243,4 +245,53 @@ pub(crate) fn build_null_patch(
 
     RecordBatch::try_new(schema, new_columns)
         .map_err(|e| ArrowStoreError::Arrow(format!("build_null_patch: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Int64Array;
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
+
+    fn empty_batch() -> RecordBatch {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            ],
+        )
+        .unwrap_or_else(|_| {
+            let fallback_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+                "dummy",
+                DataType::Int64,
+                false,
+            )]));
+            RecordBatch::try_new(
+                fallback_schema,
+                vec![Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef],
+            )
+            .unwrap_or_else(|_| panic!("failed to create fallback batch"))
+        })
+    }
+
+    #[test]
+    fn versioned_table_stores_versions() {
+        let mut table = VersionedTable::new("test", MutationMode::AppendOnly);
+        let batch = empty_batch();
+
+        table.insert_version(Tick(10), vec![batch.clone()]).ok();
+        table.insert_version(Tick(20), vec![batch.clone()]).ok();
+
+        assert_eq!(table.versions().len(), 2);
+        assert!(table.get_version(Tick(10)).is_some());
+        assert!(table.get_version(Tick(99)).is_none());
+        assert_eq!(table.latest_tick(), Some(Tick(20)));
+    }
 }

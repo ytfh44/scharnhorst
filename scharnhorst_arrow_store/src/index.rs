@@ -17,6 +17,7 @@ use scharnhorst_core::{RowId, Tick};
 /// - For any key, the entry in `latest_entries` has the maximum tick among all
 ///   entries for that key.
 /// - `remove_key` clears both layers simultaneously.
+#[allow(clippy::type_complexity)]
 #[derive(Debug, Clone)]
 pub struct PrimaryKeyIndex {
     /// Hot layer: key -> single latest (tick, batch_index, row_index).
@@ -122,6 +123,7 @@ impl Default for PrimaryKeyIndex {
 /// Uses the same layered structure as [`PrimaryKeyIndex`] for O(1)
 /// [`lookup_latest`](Self::lookup_latest) performance and optional
 /// history tracking via [`with_history`](Self::with_history).
+#[allow(clippy::type_complexity)]
 #[derive(Debug, Clone)]
 pub struct ForeignKeyIndex {
     pub column_name: String,

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_array::Array;
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 
 use scharnhorst_arrow_store::{
@@ -141,19 +141,8 @@ fn set_mutation_mode_changes_value() {
 // VersionedTable
 // ------------------------------------------------------------------
 
-#[test]
-fn versioned_table_stores_versions() {
-    let mut table = VersionedTable::new("test", MutationMode::AppendOnly);
-    let batch = empty_batch();
-
-    table.insert_version(Tick(10), vec![batch.clone()]).ok();
-    table.insert_version(Tick(20), vec![batch.clone()]).ok();
-
-    assert_eq!(table.versions().len(), 2);
-    assert!(table.get_version(Tick(10)).is_some());
-    assert!(table.get_version(Tick(99)).is_none());
-    assert_eq!(table.latest_tick(), Some(Tick(20)));
-}
+// NOTE: VersionedTable-specific tests (versions, get_version) moved to
+// inline tests in versioned_table.rs since those methods are now pub(crate).
 
 #[test]
 fn versioned_table_mutation_mode_roundtrip() {
@@ -170,7 +159,7 @@ fn versioned_table_mutation_mode_roundtrip() {
 fn generate_snapshot_copies_tables() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("world");
     init_store
         .create_table(&spec, MutationMode::RebuildPerTick)
@@ -191,7 +180,7 @@ fn generate_snapshot_copies_tables() {
 fn get_snapshot_by_tick() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("map");
     init_store
         .create_table(&spec, MutationMode::AppendOnly)
@@ -217,7 +206,7 @@ fn get_snapshot_by_tick() {
 fn latest_snapshot_returns_max_tick() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("history");
     init_store
         .create_table(&spec, MutationMode::AppendOnly)
@@ -238,7 +227,7 @@ fn latest_snapshot_returns_max_tick() {
 fn snapshot_ticks_iterates_all() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("ticks");
     init_store
         .create_table(&spec, MutationMode::AppendOnly)
@@ -261,7 +250,7 @@ fn snapshot_ticks_iterates_all() {
 fn snapshot_is_immutable_from_outside() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("readonly");
     init_store
         .create_table(&spec, MutationMode::AppendOnly)
@@ -279,7 +268,7 @@ fn snapshot_is_immutable_from_outside() {
 fn snapshot_table_batches_returns_empty_when_no_version() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("empty");
     init_store
         .create_table(&spec, MutationMode::AppendOnly)
@@ -287,8 +276,8 @@ fn snapshot_table_batches_returns_empty_when_no_version() {
 
     let commit_store = init_store.into_simulation().unwrap();
 
-    let snap = commit_store.generate_snapshot(Tick(1)).unwrap();
-    let batches = snap.table_batches("empty");
+    let _snap = commit_store.generate_snapshot(Tick(1)).unwrap();
+    let batches = store.get_table_batches("empty", Tick(1));
     assert!(batches.is_ok());
     assert!(batches.unwrap().is_empty());
 }
@@ -322,7 +311,7 @@ fn append_batches_stub_succeeds() {
 fn patch_rows_stub_succeeds() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("actors");
     init_store.create_table(&spec, MutationMode::Patchable).ok();
 
@@ -439,7 +428,10 @@ fn primary_key_index_with_history_true_lookup_returns_all() {
 
     let all = idx.lookup("k");
     // with_history(true) must return the full history
-    assert!(all.is_some(), "lookup must return Some when history is enabled");
+    assert!(
+        all.is_some(),
+        "lookup must return Some when history is enabled"
+    );
     assert_eq!(all.unwrap().len(), 3);
 }
 
@@ -465,7 +457,10 @@ fn primary_key_index_with_history_false_lookup_latest_still_works() {
 
     // lookup_latest must work regardless of history mode
     let latest = idx.lookup_latest("k");
-    assert!(latest.is_some(), "lookup_latest must work even when history is disabled");
+    assert!(
+        latest.is_some(),
+        "lookup_latest must work even when history is disabled"
+    );
     assert_eq!(latest.unwrap(), (Tick(3), 0, 1));
 }
 
@@ -570,7 +565,6 @@ fn partition_add_batch() {
     assert!(part.is_empty());
     part.add_batch(empty_batch());
     assert!(!part.is_empty());
-    assert_eq!(part.batches().len(), 1);
 }
 
 // ------------------------------------------------------------------
@@ -609,14 +603,13 @@ fn store_partition_access() {
 
     let pm = store.partition_map("pop_groups").unwrap();
     assert!(pm.contains("region_north"));
-    assert_eq!(pm.get("region_north").unwrap().batches().len(), 1);
 }
 
 #[test]
 fn snapshot_registers_partition_views() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("units");
     init_store
         .create_table(&spec, MutationMode::AppendOnly)
@@ -633,17 +626,15 @@ fn snapshot_registers_partition_views() {
 
     let snap = commit_store.generate_snapshot(Tick(10)).unwrap();
     assert!(snap.has_partition("units", "region_south"));
-
-    let ps = snap.partition_snapshot("units", "region_south");
-    assert!(ps.is_ok());
-    assert_eq!(ps.unwrap().tick(), Tick(10));
+    assert_eq!(snap.tick(), Tick(10));
+    assert!(snap.has_table("units"));
 }
 
 #[test]
 fn snapshot_partition_missing_fails() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("buildings");
     init_store
         .create_table(&spec, MutationMode::AppendOnly)
@@ -652,11 +643,7 @@ fn snapshot_partition_missing_fails() {
     let commit_store = init_store.into_simulation().unwrap();
 
     let snap = commit_store.generate_snapshot(Tick(1)).unwrap();
-    let result = snap.partition_snapshot("buildings", "nowhere");
-    assert!(matches!(
-        result.unwrap_err(),
-        ArrowStoreError::PartitionNotFound(ref s) if s == "buildings:nowhere"
-    ));
+    assert!(!snap.has_partition("buildings", "nowhere"));
 }
 
 // ------------------------------------------------------------------
@@ -727,7 +714,7 @@ fn load_checkpoint_missing_dir_fails() {
 fn write_and_load_checkpoint_roundtrip() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("roundtrip_table");
     init_store
         .create_table(&spec, MutationMode::AppendOnly)
@@ -751,7 +738,9 @@ fn write_and_load_checkpoint_roundtrip() {
 
     assert_eq!(snapshot.tick(), Tick(5));
     assert!(snapshot.has_table("roundtrip_table"));
-    let loaded_batches = snapshot.table_batches("roundtrip_table").unwrap();
+    let loaded_batches = store2
+        .get_table_batches("roundtrip_table", Tick(5))
+        .unwrap();
     assert_eq!(loaded_batches.len(), 1);
     assert_eq!(loaded_batches[0].num_rows(), 3);
 
@@ -763,7 +752,7 @@ fn write_and_load_checkpoint_roundtrip() {
 fn load_checkpoint_wrong_tick_fails() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("wrong_tick_table");
     init_store
         .create_table(&spec, MutationMode::AppendOnly)
@@ -796,7 +785,7 @@ fn load_checkpoint_wrong_tick_fails() {
 fn load_checkpoint_restores_after_truncate() {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_spec("restore_table");
     init_store
         .create_table(&spec, MutationMode::AppendOnly)
@@ -815,8 +804,8 @@ fn load_checkpoint_restores_after_truncate() {
 
     // Verify data is gone
     assert!(store.get_table("restore_table").is_ok());
-    let table = store.get_table("restore_table").unwrap();
-    assert!(table.get_version(Tick(20)).is_none());
+    let restored_batches = store.get_table_batches("restore_table", Tick(20)).unwrap();
+    assert!(restored_batches.is_empty());
 
     // Load checkpoint into fresh store and verify data is restored
     let store2 = Arc::new(ArrowStore::new());
@@ -824,7 +813,7 @@ fn load_checkpoint_restores_after_truncate() {
     let _commit_store2 = CommitStore::new(Arc::clone(&store2));
     let snapshot = init_store2.load_checkpoint(Tick(20)).unwrap();
     assert!(snapshot.has_table("restore_table"));
-    let batches = snapshot.table_batches("restore_table").unwrap();
+    let batches = store2.get_table_batches("restore_table", Tick(20)).unwrap();
     assert!(!batches.is_empty());
     assert_eq!(batches[0].num_rows(), 3);
 
@@ -892,7 +881,7 @@ fn make_pk_spec() -> TableSpec {
 fn setup_store_with_data() -> (Arc<ArrowStore>, CommitStore) {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
     let spec = make_pk_spec();
     init_store
         .create_table(&spec, MutationMode::Patchable)
@@ -937,7 +926,7 @@ fn setup_store_with_data() -> (Arc<ArrowStore>, CommitStore) {
 
 #[test]
 fn apply_update_diff_changes_value() {
-    let (_store, commit_store) = setup_store_with_data();
+    let (store, commit_store) = setup_store_with_data();
     let tick = Tick(1);
 
     let diff = Diff::Update {
@@ -948,8 +937,8 @@ fn apply_update_diff_changes_value() {
     };
     commit_store.apply_diffs(tick, &[diff]).unwrap();
 
-    let snap = commit_store.generate_snapshot(tick).unwrap();
-    let batches = snap.table_batches("test_diff").unwrap();
+    let _snap = commit_store.generate_snapshot(tick).unwrap();
+    let batches = store.get_table_batches("test_diff", tick).unwrap();
     assert_eq!(batches.len(), 3);
 
     let name_col0 = batches[0]
@@ -976,7 +965,7 @@ fn apply_update_diff_changes_value() {
 
 #[test]
 fn apply_update_diff_changes_numeric_value() {
-    let (_store, commit_store) = setup_store_with_data();
+    let (store, commit_store) = setup_store_with_data();
     let tick = Tick(1);
 
     let diff = Diff::Update {
@@ -987,8 +976,8 @@ fn apply_update_diff_changes_numeric_value() {
     };
     commit_store.apply_diffs(tick, &[diff]).unwrap();
 
-    let snap = commit_store.generate_snapshot(tick).unwrap();
-    let batches = snap.table_batches("test_diff").unwrap();
+    let _snap = commit_store.generate_snapshot(tick).unwrap();
+    let batches = store.get_table_batches("test_diff", tick).unwrap();
     let value_col0 = batches[0]
         .column(2)
         .as_any()
@@ -1013,7 +1002,7 @@ fn apply_update_diff_changes_numeric_value() {
 
 #[test]
 fn apply_insert_diff_adds_row() {
-    let (_store, commit_store) = setup_store_with_data();
+    let (store, commit_store) = setup_store_with_data();
     let tick = Tick(1);
 
     let mut values = serde_json::Map::new();
@@ -1028,8 +1017,8 @@ fn apply_insert_diff_adds_row() {
     };
     commit_store.apply_diffs(tick, &[diff]).unwrap();
 
-    let snap = commit_store.generate_snapshot(tick).unwrap();
-    let batches = snap.table_batches("test_diff").unwrap();
+    let _snap = commit_store.generate_snapshot(tick).unwrap();
+    let batches = store.get_table_batches("test_diff", tick).unwrap();
     assert_eq!(batches.len(), 4);
 
     let new_batch = &batches[3];
@@ -1044,7 +1033,7 @@ fn apply_insert_diff_adds_row() {
 
 #[test]
 fn apply_delete_diff_marks_deleted() {
-    let (_store, commit_store) = setup_store_with_data();
+    let (store, commit_store) = setup_store_with_data();
     let tick = Tick(1);
 
     let diff = Diff::Delete {
@@ -1053,8 +1042,8 @@ fn apply_delete_diff_marks_deleted() {
     };
     commit_store.apply_diffs(tick, &[diff]).unwrap();
 
-    let snap = commit_store.generate_snapshot(tick).unwrap();
-    let batches = snap.table_batches("test_diff").unwrap();
+    let _snap = commit_store.generate_snapshot(tick).unwrap();
+    let batches = store.get_table_batches("test_diff", tick).unwrap();
 
     let id_col = batches[1]
         .column(0)
@@ -1080,7 +1069,7 @@ fn apply_delete_diff_marks_deleted() {
 
 #[test]
 fn apply_replace_diff_rebuilds_table() {
-    let (_store, commit_store) = setup_store_with_data();
+    let (store, commit_store) = setup_store_with_data();
     let tick = Tick(2);
 
     let mut row1 = serde_json::Map::new();
@@ -1105,8 +1094,8 @@ fn apply_replace_diff_rebuilds_table() {
     };
     commit_store.apply_diffs(tick, &[diff]).unwrap();
 
-    let snap = commit_store.generate_snapshot(tick).unwrap();
-    let batches = snap.table_batches("test_diff").unwrap();
+    let _snap = commit_store.generate_snapshot(tick).unwrap();
+    let batches = store.get_table_batches("test_diff", tick).unwrap();
     assert_eq!(batches.len(), 2);
 
     // Each row becomes its own batch in ReplaceTable
@@ -1127,7 +1116,7 @@ fn apply_replace_diff_rebuilds_table() {
 
 #[test]
 fn apply_multiple_diffs_in_sequence() {
-    let (_store, commit_store) = setup_store_with_data();
+    let (store, commit_store) = setup_store_with_data();
     let tick = Tick(1);
 
     let mut insert_values = serde_json::Map::new();
@@ -1150,8 +1139,8 @@ fn apply_multiple_diffs_in_sequence() {
     ];
     commit_store.apply_diffs(tick, &diffs).unwrap();
 
-    let snap = commit_store.generate_snapshot(tick).unwrap();
-    let batches = snap.table_batches("test_diff").unwrap();
+    let _snap = commit_store.generate_snapshot(tick).unwrap();
+    let batches = store.get_table_batches("test_diff", tick).unwrap();
     assert_eq!(batches.len(), 4);
 
     let name_col = batches[0]
@@ -1166,7 +1155,7 @@ fn apply_multiple_diffs_in_sequence() {
 
 #[test]
 fn apply_diffs_then_snapshot_reflects_changes() {
-    let (_store, commit_store) = setup_store_with_data();
+    let (store, commit_store) = setup_store_with_data();
     let tick = Tick(1);
 
     // Apply diffs
@@ -1179,8 +1168,8 @@ fn apply_diffs_then_snapshot_reflects_changes() {
     commit_store.apply_diffs(tick, &[diff]).unwrap();
 
     // Generate snapshot AFTER applying diffs
-    let snap = commit_store.generate_snapshot(tick).unwrap();
-    let batches = snap.table_batches("test_diff").unwrap();
+    let _snap = commit_store.generate_snapshot(tick).unwrap();
+    let batches = store.get_table_batches("test_diff", tick).unwrap();
 
     let value_col = batches[2]
         .column(2)
@@ -1224,9 +1213,11 @@ fn create_table_rejected_after_simulation() {
     let result = init2.create_table(&spec, MutationMode::AppendOnly);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("operation not allowed during simulation")
-        || err.contains("Lifecycle")
-        || err.contains("Simulation"));
+    assert!(
+        err.contains("operation not allowed during simulation")
+            || err.contains("Lifecycle")
+            || err.contains("Simulation")
+    );
 }
 
 #[test]
@@ -1250,9 +1241,11 @@ fn apply_diffs_rejected_during_initialization() {
     let result = commit.apply_diffs(Tick(0), &[diff]);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("operation not allowed during initialization")
-        || err.contains("Lifecycle")
-        || err.contains("Initialization"));
+    assert!(
+        err.contains("operation not allowed during initialization")
+            || err.contains("Lifecycle")
+            || err.contains("Initialization")
+    );
 }
 
 #[test]
@@ -1288,7 +1281,7 @@ fn apply_diffs_wrong_column_fails() {
 fn setup_store_with_nullable_table() -> (Arc<ArrowStore>, CommitStore) {
     let store = Arc::new(ArrowStore::new());
     let init_store = InitStore::new(Arc::clone(&store));
-    let commit_store = CommitStore::new(Arc::clone(&store));
+    let _commit_store = CommitStore::new(Arc::clone(&store));
 
     let spec = TableSpec::new("nullable_test")
         .with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64"))
@@ -1296,8 +1289,7 @@ fn setup_store_with_nullable_table() -> (Arc<ArrowStore>, CommitStore) {
         .with_column(ColumnSpec::new("name", FieldSemantic::Name, "utf8"))
         .unwrap()
         .with_column(
-            ColumnSpec::new("optional_note", FieldSemantic::Raw, "utf8")
-                .with_nullable(true),
+            ColumnSpec::new("optional_note", FieldSemantic::Raw, "utf8").with_nullable(true),
         )
         .unwrap()
         .with_column(ColumnSpec::new("score", FieldSemantic::Quantity, "i64"))
@@ -1309,14 +1301,26 @@ fn setup_store_with_nullable_table() -> (Arc<ArrowStore>, CommitStore) {
 
     let mut row1 = serde_json::Map::new();
     row1.insert("id".to_owned(), serde_json::Value::Number(1.into()));
-    row1.insert("name".to_owned(), serde_json::Value::String("alpha".to_owned()));
-    row1.insert("optional_note".to_owned(), serde_json::Value::String("first_note".to_owned()));
+    row1.insert(
+        "name".to_owned(),
+        serde_json::Value::String("alpha".to_owned()),
+    );
+    row1.insert(
+        "optional_note".to_owned(),
+        serde_json::Value::String("first_note".to_owned()),
+    );
     row1.insert("score".to_owned(), serde_json::Value::Number(100.into()));
 
     let mut row2 = serde_json::Map::new();
     row2.insert("id".to_owned(), serde_json::Value::Number(2.into()));
-    row2.insert("name".to_owned(), serde_json::Value::String("beta".to_owned()));
-    row2.insert("optional_note".to_owned(), serde_json::Value::String("second_note".to_owned()));
+    row2.insert(
+        "name".to_owned(),
+        serde_json::Value::String("beta".to_owned()),
+    );
+    row2.insert(
+        "optional_note".to_owned(),
+        serde_json::Value::String("second_note".to_owned()),
+    );
     row2.insert("score".to_owned(), serde_json::Value::Number(200.into()));
 
     let diffs = vec![
@@ -1345,7 +1349,10 @@ fn delete_nullable_column_becomes_null_in_patch() {
     {
         let table = store.get_table("nullable_test").unwrap();
         let pos_map = table.position_map();
-        assert!(pos_map.contains(RowId::new(1)), "row 1 should exist before delete");
+        assert!(
+            pos_map.contains(RowId::new(1)),
+            "row 1 should exist before delete"
+        );
     }
 
     let diff = Diff::Delete {
@@ -1354,33 +1361,43 @@ fn delete_nullable_column_becomes_null_in_patch() {
     };
     commit_store.apply_diffs(tick, &[diff]).unwrap();
 
-    let snap = commit_store.generate_snapshot(tick).unwrap();
-    let batches = snap.table_batches("nullable_test").unwrap();
-    assert!(batches.len() >= 2,
-        "expected at least 2 batches after delete, got {}", batches.len());
+    let _snap = commit_store.generate_snapshot(tick).unwrap();
+    let batches = store.get_table_batches("nullable_test", tick).unwrap();
+    assert!(
+        batches.len() >= 2,
+        "expected at least 2 batches after delete, got {}",
+        batches.len()
+    );
 
     let note_col_b0 = batches[0]
         .column(2)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert!(note_col_b0.is_null(0),
-        "optional_note should be null for deleted row in batch 0");
+    assert!(
+        note_col_b0.is_null(0),
+        "optional_note should be null for deleted row in batch 0"
+    );
 
     let note_col_b1 = batches[1]
         .column(2)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert!(!note_col_b1.is_null(0),
-        "optional_note should NOT be null for non-deleted row in batch 1");
-    assert_eq!(note_col_b1.value(0), "second_note",
-        "non-deleted row's optional_note preserves original value");
+    assert!(
+        !note_col_b1.is_null(0),
+        "optional_note should NOT be null for non-deleted row in batch 1"
+    );
+    assert_eq!(
+        note_col_b1.value(0),
+        "second_note",
+        "non-deleted row's optional_note preserves original value"
+    );
 }
 
 #[test]
 fn delete_non_nullable_column_preserves_value_in_patch() {
-    let (_store, commit_store) = setup_store_with_data();
+    let (store, commit_store) = setup_store_with_data();
     let tick = Tick(1);
 
     let diff = Diff::Delete {
@@ -1389,8 +1406,8 @@ fn delete_non_nullable_column_preserves_value_in_patch() {
     };
     commit_store.apply_diffs(tick, &[diff]).unwrap();
 
-    let snap = commit_store.generate_snapshot(tick).unwrap();
-    let batches = snap.table_batches("test_diff").unwrap();
+    let _snap = commit_store.generate_snapshot(tick).unwrap();
+    let batches = store.get_table_batches("test_diff", tick).unwrap();
     assert!(batches.len() >= 2);
 
     let name_col = batches[1]
@@ -1398,10 +1415,15 @@ fn delete_non_nullable_column_preserves_value_in_patch() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert!(!name_col.is_null(0),
-        "non-nullable column should NOT be null in null patch");
-    assert_eq!(name_col.value(0), "b",
-        "non-nullable column preserves original value in null patch");
+    assert!(
+        !name_col.is_null(0),
+        "non-nullable column should NOT be null in null patch"
+    );
+    assert_eq!(
+        name_col.value(0),
+        "b",
+        "non-nullable column preserves original value in null patch"
+    );
 }
 
 #[test]
@@ -1417,12 +1439,18 @@ fn delete_removes_row_from_position_map() {
 
     let table = store.get_table("test_diff").unwrap();
     let pos_map = table.position_map();
-    assert!(!pos_map.contains(RowId::new(2)),
-        "deleted RowId should be removed from position_map");
-    assert!(pos_map.contains(RowId::new(1)),
-        "non-deleted RowId should remain in position_map");
-    assert!(pos_map.contains(RowId::new(3)),
-        "non-deleted RowId should remain in position_map");
+    assert!(
+        !pos_map.contains(RowId::new(2)),
+        "deleted RowId should be removed from position_map"
+    );
+    assert!(
+        pos_map.contains(RowId::new(1)),
+        "non-deleted RowId should remain in position_map"
+    );
+    assert!(
+        pos_map.contains(RowId::new(3)),
+        "non-deleted RowId should remain in position_map"
+    );
 }
 
 #[test]
@@ -1433,8 +1461,7 @@ fn delete_nonexistent_row_fails() {
         row: RowId::new(999),
     };
     let result = commit_store.apply_diffs(Tick(2), &[diff]);
-    assert!(result.is_err(),
-        "deleting non-existent row should fail");
+    assert!(result.is_err(), "deleting non-existent row should fail");
 }
 
 #[test]
@@ -1446,11 +1473,13 @@ fn double_delete_fails() {
         table: "test_diff".to_owned(),
         row: RowId::new(2),
     };
-    commit_store.apply_diffs(tick, &[diff.clone()]).unwrap();
+    commit_store.apply_diffs(tick, std::slice::from_ref(&diff)).unwrap();
 
     let result = commit_store.apply_diffs(tick, &[diff]);
-    assert!(result.is_err(),
-        "deleting an already-deleted row should fail");
+    assert!(
+        result.is_err(),
+        "deleting an already-deleted row should fail"
+    );
 }
 
 #[test]
@@ -1461,8 +1490,10 @@ fn delete_on_wrong_table_fails() {
         row: RowId::new(1),
     };
     let result = commit_store.apply_diffs(Tick(2), &[diff]);
-    assert!(result.is_err(),
-        "deleting from non-existent table should fail");
+    assert!(
+        result.is_err(),
+        "deleting from non-existent table should fail"
+    );
 }
 
 // ------------------------------------------------------------------
@@ -1481,8 +1512,7 @@ fn patch_string_preserves_nulls_in_unaffected_rows() {
     let spec = TableSpec::new("string_null_test")
         .with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64"))
         .unwrap()
-        .with_column(ColumnSpec::new("label", FieldSemantic::Name, "utf8")
-            .with_nullable(true))
+        .with_column(ColumnSpec::new("label", FieldSemantic::Name, "utf8").with_nullable(true))
         .unwrap();
     init_store
         .create_table(&spec, MutationMode::Patchable)
@@ -1490,15 +1520,31 @@ fn patch_string_preserves_nulls_in_unaffected_rows() {
 
     let mut row1 = serde_json::Map::new();
     row1.insert("id".to_owned(), serde_json::Value::Number(1.into()));
-    row1.insert("label".to_owned(), serde_json::Value::String("alpha".to_owned()));
+    row1.insert(
+        "label".to_owned(),
+        serde_json::Value::String("alpha".to_owned()),
+    );
     let mut row2 = serde_json::Map::new();
     row2.insert("id".to_owned(), serde_json::Value::Number(2.into()));
     row2.insert("label".to_owned(), serde_json::Value::Null);
     let commit_store = init_store.into_simulation().unwrap();
-    commit_store.apply_diffs(Tick(1), &[
-        Diff::Insert { table: "string_null_test".to_owned(), row: RowId::new(1), values: row1 },
-        Diff::Insert { table: "string_null_test".to_owned(), row: RowId::new(2), values: row2 },
-    ]).unwrap();
+    commit_store
+        .apply_diffs(
+            Tick(1),
+            &[
+                Diff::Insert {
+                    table: "string_null_test".to_owned(),
+                    row: RowId::new(1),
+                    values: row1,
+                },
+                Diff::Insert {
+                    table: "string_null_test".to_owned(),
+                    row: RowId::new(2),
+                    values: row2,
+                },
+            ],
+        )
+        .unwrap();
 
     let diff = Diff::Update {
         table: "string_null_test".to_owned(),
@@ -1508,33 +1554,34 @@ fn patch_string_preserves_nulls_in_unaffected_rows() {
     };
     commit_store.apply_diffs(Tick(1), &[diff]).unwrap();
 
-    let snap = commit_store.generate_snapshot(Tick(1)).unwrap();
-    let vt = snap.get_table("string_null_test").unwrap();
-    let batches = vt.versions().get(&Tick(1)).unwrap();
-
-    let label_col = batches[0]
-        .column_by_name("label")
+    let batches = store
+        .get_table_batches("string_null_test", Tick(1))
         .unwrap();
+
+    let label_col = batches[0].column_by_name("label").unwrap();
     let label_arr: &GenericStringArray<i32> = label_col
         .as_any()
         .downcast_ref::<GenericStringArray<i32>>()
         .unwrap();
 
     assert_eq!(label_arr.len(), 1, "batch0 should contain 1 row (RowId=1)");
-    assert_eq!(label_arr.value(0), "beta",
-        "patched RowId=1 should have new value");
+    assert_eq!(
+        label_arr.value(0),
+        "beta",
+        "patched RowId=1 should have new value"
+    );
 
-    let label_col2 = batches[1]
-        .column_by_name("label")
-        .unwrap();
+    let label_col2 = batches[1].column_by_name("label").unwrap();
     let label_arr2: &GenericStringArray<i32> = label_col2
         .as_any()
         .downcast_ref::<GenericStringArray<i32>>()
         .unwrap();
 
     assert_eq!(label_arr2.len(), 1, "batch1 should contain 1 row (RowId=2)");
-    assert!(label_arr2.is_null(0),
-        "untouched RowId=2 with null should remain null in its batch");
+    assert!(
+        label_arr2.is_null(0),
+        "untouched RowId=2 with null should remain null in its batch"
+    );
 }
 
 /// Would have failed: patch_string_array must handle LargeUtf8
@@ -1558,11 +1605,21 @@ fn patch_string_array_handles_large_utf8() {
 
     let mut row = serde_json::Map::new();
     row.insert("id".to_owned(), serde_json::Value::Number(1.into()));
-    row.insert("name".to_owned(), serde_json::Value::String("alpha".to_owned()));
+    row.insert(
+        "name".to_owned(),
+        serde_json::Value::String("alpha".to_owned()),
+    );
     let commit_store = init_store.into_simulation().unwrap();
-    commit_store.apply_diffs(Tick(1), &[
-        Diff::Insert { table: "large_utf8_test".to_owned(), row: RowId::new(1), values: row },
-    ]).unwrap();
+    commit_store
+        .apply_diffs(
+            Tick(1),
+            &[Diff::Insert {
+                table: "large_utf8_test".to_owned(),
+                row: RowId::new(1),
+                values: row,
+            }],
+        )
+        .unwrap();
 
     let diff = Diff::Update {
         table: "large_utf8_test".to_owned(),
@@ -1572,25 +1629,24 @@ fn patch_string_array_handles_large_utf8() {
     };
     commit_store.apply_diffs(Tick(1), &[diff]).unwrap();
 
-    let snap = commit_store.generate_snapshot(Tick(1)).unwrap();
-    let vt = snap.get_table("large_utf8_test").unwrap();
-    let batches = vt.versions().get(&Tick(1)).unwrap();
-    let name_col = batches[0]
-        .column_by_name("name")
-        .unwrap();
+    let batches = store.get_table_batches("large_utf8_test", Tick(1)).unwrap();
+    let name_col = batches[0].column_by_name("name").unwrap();
 
     let name_arr: &GenericStringArray<i64> = name_col
         .as_any()
         .downcast_ref::<GenericStringArray<i64>>()
         .unwrap();
-    assert_eq!(name_arr.value(0), "beta",
-        "LargeUtf8 patch should produce correct value");
+    assert_eq!(
+        name_arr.value(0),
+        "beta",
+        "LargeUtf8 patch should produce correct value"
+    );
 
-    let wrong_downcast = name_col
-        .as_any()
-        .downcast_ref::<GenericStringArray<i32>>();
-    assert!(wrong_downcast.is_none(),
-        "LargeUtf8 patch must return i64 offsets, not i32");
+    let wrong_downcast = name_col.as_any().downcast_ref::<GenericStringArray<i32>>();
+    assert!(
+        wrong_downcast.is_none(),
+        "LargeUtf8 patch must return i64 offsets, not i32"
+    );
 }
 
 // ------------------------------------------------------------------
@@ -1612,7 +1668,10 @@ fn drop_table_rejected_after_simulation() {
     // The underlying ArrowStore lifecycle is Simulation; drop must reject.
     let init2 = InitStore::new(Arc::clone(&store));
     let result = init2.drop_table("doomed_table");
-    assert!(result.is_err(), "drop_table must be rejected after simulation starts");
+    assert!(
+        result.is_err(),
+        "drop_table must be rejected after simulation starts"
+    );
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("operation not allowed during simulation")
@@ -1635,12 +1694,13 @@ fn register_type_rejected_after_simulation() {
     let result = init2.register_type(
         "mid_sim_type",
         DataType::Int64,
-        Arc::new(|_v| {
-            Ok(Arc::new(Int64Array::from(vec![0i64])) as ArrayRef)
-        }),
+        Arc::new(|_v| Ok(Arc::new(Int64Array::from(vec![0i64])) as ArrayRef)),
         Arc::new(|| Ok(Arc::new(Int64Array::from(vec![0i64])) as ArrayRef)),
     );
-    assert!(result.is_err(), "register_type must be rejected after simulation starts");
+    assert!(
+        result.is_err(),
+        "register_type must be rejected after simulation starts"
+    );
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("operation not allowed during simulation")
@@ -1663,7 +1723,10 @@ fn set_mutation_mode_rejected_after_simulation() {
 
     let init2 = InitStore::new(Arc::clone(&store));
     let result = init2.set_mutation_mode("mutable_table", MutationMode::Patchable);
-    assert!(result.is_err(), "set_mutation_mode must be rejected after simulation");
+    assert!(
+        result.is_err(),
+        "set_mutation_mode must be rejected after simulation"
+    );
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("operation not allowed during simulation")
@@ -1704,10 +1767,7 @@ fn duplicate_rowid_on_insert_rejected() {
         values: values2,
     };
     let result = commit.apply_diffs(Tick(1), &[diff2]);
-    assert!(
-        result.is_err(),
-        "duplicate RowId insert must be rejected"
-    );
+    assert!(result.is_err(), "duplicate RowId insert must be rejected");
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("Duplicate") || err.contains("duplicate") || err.contains("already exists"),

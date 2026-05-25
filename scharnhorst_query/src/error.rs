@@ -1,5 +1,21 @@
 use thiserror::Error;
 
+/// Describes the kind of validation failure for a schema path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationErrorKind {
+    MissingTable,
+    MissingColumn,
+    MissingRelation,
+}
+
+/// Describes a validation failure for a schema path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationError {
+    pub path: String,
+    pub kind: ValidationErrorKind,
+    pub message: String,
+}
+
 /// Errors raised by the query engine and related interfaces.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum QueryError {
@@ -30,6 +46,9 @@ pub enum QueryError {
 
     #[error("SQL error: {0}")]
     Sql(String),
+
+    #[error("SQL not allowed: {0}")]
+    SqlNotAllowed(String),
 
     #[error("unified read error: {0}")]
     UnifiedRead(String),

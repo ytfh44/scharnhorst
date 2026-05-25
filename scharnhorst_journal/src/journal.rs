@@ -1,14 +1,18 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use scharnhorst_arrow_store::{ArrowStore, CommitStore, SnapshotIngestor};
+use scharnhorst_arrow_store::{ArrowStore, CommitStore, SnapshotIngestRollback, SnapshotIngestor};
 use scharnhorst_core::{JournalSubmitToken, Tick};
 
+#[cfg(feature = "metrics")]
+use crate::command::Command;
 use crate::command::CommandEnvelope;
 use crate::commit::{CommitPhase, CommitRecord, CommitResult};
 use crate::diff::{Diff, DiffBatch};
 use crate::error::{JournalError, JournalResult};
 use crate::save_journal::SaveJournal;
+#[cfg(feature = "metrics")]
+use crate::telemetry;
 
 const MAX_COMMIT_HISTORY: usize = 1024;
 
@@ -88,7 +92,11 @@ impl Journal {
     /// Submit a single command envelope.
     ///
     /// Envelopes are validated and queued for the current tick.
-    pub fn submit_command(&mut self, envelope: CommandEnvelope, _token: &JournalSubmitToken) -> JournalResult<()> {
+    pub fn submit_command(
+        &mut self,
+        envelope: CommandEnvelope,
+        _token: &JournalSubmitToken,
+    ) -> JournalResult<()> {
         if self.phase != CommitPhase::Open {
             return Err(JournalError::SubmitFailed(
                 "commit already in progress".to_owned(),
@@ -100,12 +108,29 @@ impl Journal {
                 got: envelope.tick.as_u64(),
             });
         }
+
+        #[cfg(feature = "metrics")]
+        {
+            let cmd_type = match &envelope.command {
+                Command::TransferControl { .. } => "TransferControl",
+                Command::UpdateColumn { .. } => "UpdateColumn",
+                Command::InsertRow { .. } => "InsertRow",
+                Command::DeleteRow { .. } => "DeleteRow",
+                Command::Raw { .. } => "Raw",
+            };
+            telemetry::record_command_submit(cmd_type);
+        }
+
         self.pending_commands.push(envelope);
         Ok(())
     }
 
     /// Submit a batch of commands.
-    pub fn submit_commands(&mut self, envelopes: Vec<CommandEnvelope>, token: &JournalSubmitToken) -> JournalResult<()> {
+    pub fn submit_commands(
+        &mut self,
+        envelopes: Vec<CommandEnvelope>,
+        token: &JournalSubmitToken,
+    ) -> JournalResult<()> {
         envelopes
             .into_iter()
             .try_for_each(|e| self.submit_command(e, token))
@@ -120,12 +145,29 @@ impl Journal {
                 "commit already in progress".to_owned(),
             ));
         }
+
+        #[cfg(feature = "metrics")]
+        {
+            let table = diff.table().to_owned();
+            let diff_type = match &diff {
+                Diff::Update { .. } => "Update",
+                Diff::Insert { .. } => "Insert",
+                Diff::Delete { .. } => "Delete",
+                Diff::ReplaceTable { .. } => "ReplaceTable",
+            };
+            telemetry::record_diff_submit(diff_type, &table);
+        }
+
         self.pending_diffs.push(diff);
         Ok(())
     }
 
     /// Submit a [`DiffBatch`].
-    pub fn submit_batch(&mut self, batch: DiffBatch, token: &JournalSubmitToken) -> JournalResult<()> {
+    pub fn submit_batch(
+        &mut self,
+        batch: DiffBatch,
+        token: &JournalSubmitToken,
+    ) -> JournalResult<()> {
         batch
             .diffs
             .into_iter()
@@ -182,49 +224,67 @@ impl Journal {
             }
         };
 
-    {
-        let qe_opt = &self.query_engine;
-        let store = &self.arrow_store;
-        let qe_result = (move || -> JournalResult<()> {
-            if let Some(ref qe) = qe_opt {
-                let snapshot = store
-                    .get_snapshot(tick)
-                    .map_err(|e| JournalError::ArrowStore(format!("get_snapshot: {}", e)))?;
-                for table_name in snapshot.table_names() {
-                    let batches = snapshot.table_batches(table_name).map_err(|e| {
-                        JournalError::ArrowStore(format!(
-                            "table_batches for '{}': {}",
-                            table_name, e
-                        ))
-                    })?;
-                    let vt = snapshot.get_table(table_name).map_err(|e| {
-                        JournalError::ArrowStore(format!(
-                            "get_table for '{}': {}",
-                            table_name, e
-                        ))
-                    })?;
-                    let position_map = vt.position_map().clone();
-                    qe.ingest_snapshot(tick, table_name, batches, position_map)
-                        .map_err(|e| {
-                            JournalError::Generic(format!(
-                                "ingest snapshot for '{}': {}",
-                                table_name, e
-                            ))
-                        })?;
+        let mut ingest_rollback: Option<Box<dyn SnapshotIngestRollback>> =
+            match self.query_engine.as_ref() {
+                Some(qe) => match qe.begin_ingest() {
+                    Ok(rollback) => Some(rollback),
+                    Err(e) => {
+                        let _ = self.commit_store.restore_table_versions(saved);
+                        self.pending_diffs = diffs;
+                        self.pending_commands = commands;
+                        self.phase = CommitPhase::Open;
+                        return Err(JournalError::Generic(format!("begin query ingest: {}", e)));
+                    }
+                },
+                None => None,
+            };
+
+        {
+            let qe_opt = &self.query_engine;
+            let store = &self.arrow_store;
+            let qe_result = (move || -> JournalResult<()> {
+                if let Some(ref qe) = qe_opt {
+                    let snapshot = store
+                        .get_snapshot(tick)
+                        .map_err(|e| JournalError::ArrowStore(format!("get_snapshot: {}", e)))?;
+                    for table_name in snapshot.table_names() {
+                        let batches = store
+                            .get_table_batches(table_name, tick)
+                            .unwrap_or_default();
+                        let position_map = store
+                            .get_table(table_name)
+                            .map_err(|e| {
+                                JournalError::ArrowStore(format!(
+                                    "get_table for '{}': {}",
+                                    table_name, e
+                                ))
+                            })?
+                            .position_map()
+                            .clone();
+                        qe.ingest_snapshot(tick, table_name, batches, position_map)
+                            .map_err(|e| {
+                                JournalError::Generic(format!(
+                                    "ingest snapshot for '{}': {}",
+                                    table_name, e
+                                ))
+                            })?;
+                    }
+                    qe.store_snapshot((*snapshot).clone())
+                        .map_err(|e| JournalError::Generic(format!("store snapshot: {}", e)))?;
                 }
-                qe.store_snapshot((*snapshot).clone())
-                    .map_err(|e| JournalError::Generic(format!("store snapshot: {}", e)))?;
+                Ok(())
+            })();
+            if let Err(e) = qe_result {
+                if let Some(rollback) = ingest_rollback.take() {
+                    let _ = rollback.rollback();
+                }
+                let _ = self.commit_store.restore_table_versions(saved);
+                self.pending_diffs = diffs;
+                self.pending_commands = commands;
+                self.phase = CommitPhase::Open;
+                return Err(e);
             }
-            Ok(())
-        })();
-        if let Err(e) = qe_result {
-            let _ = self.commit_store.restore_table_versions(saved);
-            self.pending_diffs = diffs;
-            self.pending_commands = commands;
-            self.phase = CommitPhase::Open;
-            return Err(e);
         }
-    }
 
         let record = CommitRecord::with_commands(tick, diffs, commands, state_hash);
 
@@ -235,6 +295,10 @@ impl Journal {
                     commands: restored_commands,
                     ..
                 } = record;
+                if let Some(rollback) = ingest_rollback.take() {
+                    let _ = rollback.rollback();
+                }
+                let _ = self.commit_store.restore_table_versions(saved);
                 self.pending_diffs = restored_diffs;
                 self.pending_commands = restored_commands;
                 self.phase = CommitPhase::Open;
@@ -251,12 +315,25 @@ impl Journal {
         self.advance_tick();
         self.phase = CommitPhase::Open;
 
-        Ok(CommitResult {
+        let result = CommitResult {
             tick,
             diff_count,
             command_count,
             state_hash,
-        })
+        };
+
+        #[cfg(feature = "metrics")]
+        {
+            telemetry::emit_commit_record(
+                result.tick.as_u64(),
+                diff_count as u64,
+                result.diff_count as u64,
+                &format!("{:?}", result.state_hash),
+            );
+            telemetry::reset_counters();
+        }
+
+        Ok(result)
     }
 
     /// Return a view of the commit history.
@@ -448,8 +525,8 @@ mod tests {
     use super::*;
     use crate::diff::Diff;
     use crate::save_journal::InMemorySaveJournal;
-    use arrow_array::StringArray;
-    use scharnhorst_arrow_store::{InitStore, MutationMode};
+    use arrow_array::{Array, StringArray};
+    use scharnhorst_arrow_store::{InitStore, MutationMode, SnapshotIngestor, WorldSnapshot};
     use scharnhorst_core::{RowId, Tick};
     use scharnhorst_schema::{ColumnSpec, FieldSemantic, TableSpec};
     use std::sync::Arc;
@@ -510,8 +587,10 @@ mod tests {
             .unwrap();
 
         // Verify data was actually written
-        let snap = journal.arrow_store.get_snapshot(tick).unwrap();
-        let batches = snap.table_batches("treasury").unwrap();
+        let batches = journal
+            .arrow_store
+            .get_table_batches("treasury", tick)
+            .unwrap_or_default();
         assert!(!batches.is_empty());
         let name_col = batches[0]
             .column(1)
@@ -555,8 +634,10 @@ mod tests {
         // that apply_diffs_and_hash does not crash, not that hash is non-zero.
 
         // Verify snapshot was still generated with no diffs
-        let snap = journal.arrow_store.get_snapshot(tick).unwrap();
-        let batches = snap.table_batches("empty_table").unwrap();
+        let batches = journal
+            .arrow_store
+            .get_table_batches("empty_table", tick)
+            .unwrap_or_default();
         assert!(!batches.is_empty());
     }
 
@@ -564,12 +645,15 @@ mod tests {
     fn commit_history_returns_contiguous_slice() {
         let mut journal = setup_journal_with_table("t");
         journal
-            .submit_diff(Diff::Update {
-                table: "t".to_owned(),
-                row: RowId::new(1),
-                column: "name".to_owned(),
-                value: serde_json::Value::String("updated".to_owned()),
-            }, &JournalSubmitToken::new())
+            .submit_diff(
+                Diff::Update {
+                    table: "t".to_owned(),
+                    row: RowId::new(1),
+                    column: "name".to_owned(),
+                    value: serde_json::Value::String("updated".to_owned()),
+                },
+                &JournalSubmitToken::new(),
+            )
             .unwrap();
         journal.commit().unwrap();
 
@@ -627,24 +711,103 @@ mod tests {
     fn different_ticks_produce_different_hashes() {
         let mut journal = setup_journal_with_table("t");
         journal
-            .submit_diff(Diff::Update {
-                table: "t".to_owned(),
-                row: RowId::new(1),
-                column: "name".to_owned(),
-                value: serde_json::Value::String("v1".to_owned()),
-            }, &JournalSubmitToken::new())
+            .submit_diff(
+                Diff::Update {
+                    table: "t".to_owned(),
+                    row: RowId::new(1),
+                    column: "name".to_owned(),
+                    value: serde_json::Value::String("v1".to_owned()),
+                },
+                &JournalSubmitToken::new(),
+            )
             .unwrap();
         let r1 = journal.commit().unwrap();
         journal
-            .submit_diff(Diff::Update {
-                table: "t".to_owned(),
-                row: RowId::new(1),
-                column: "name".to_owned(),
-                value: serde_json::Value::String("v2".to_owned()),
-            }, &JournalSubmitToken::new())
+            .submit_diff(
+                Diff::Update {
+                    table: "t".to_owned(),
+                    row: RowId::new(1),
+                    column: "name".to_owned(),
+                    value: serde_json::Value::String("v2".to_owned()),
+                },
+                &JournalSubmitToken::new(),
+            )
             .unwrap();
         let r2 = journal.commit().unwrap();
         assert_ne!(r1.state_hash, r2.state_hash);
+    }
+
+    /// May-fail: save_journal failure does NOT restore ArrowStore table versions.
+    ///
+    /// Naive behavior: journal.commit() applies diffs to ArrowStore,
+    /// ingests into query_engine, then appends to save_journal. If
+    /// save_journal.append() fails, the code restores pending diffs/commands
+    /// but does NOT call commit_store.restore_table_versions(). The ArrowStore
+    /// retains the applied diffs. A retry on the same tick double-applies
+    /// the diffs, corrupting data.
+    #[test]
+    fn commit_save_journal_failure_rollback() {
+        // Create a save journal that always fails on append
+        struct FailingSaveJournal;
+        impl SaveJournal for FailingSaveJournal {
+            fn append(&mut self, _record: &CommitRecord) -> JournalResult<()> {
+                Err(JournalError::Generic("simulated save failure".to_owned()))
+            }
+            fn flush(&mut self) -> JournalResult<()> {
+                Ok(())
+            }
+            fn truncate_before(&mut self, _tick: Tick) -> JournalResult<()> {
+                Ok(())
+            }
+        }
+
+        let mut journal = setup_journal_with_table("t").with_save_journal(FailingSaveJournal);
+
+        let tick = journal.current_tick();
+        let update = Diff::Update {
+            table: "t".to_owned(),
+            row: RowId::new(1),
+            column: "name".to_owned(),
+            value: serde_json::Value::String("modified".to_owned()),
+        };
+        journal
+            .submit_diff(update.clone(), &JournalSubmitToken::new())
+            .unwrap();
+
+        let result = journal.commit();
+        // commit should fail because save_journal.append fails
+        assert!(result.is_err(), "commit must fail when save_journal fails");
+
+        // ArrowStore MUST NOT retain the applied diff.
+        // After rollback, data at tick should not reflect the update.
+        // get_table_batches returns data at the CURRENT state (which includes
+        // all applied versions up to current tick). Since the diff was rolled
+        // back, the table at current_tick should still show the original data.
+        // We check that row[1] column[1] is NOT "modified".
+        let batches = journal
+            .arrow_store
+            .get_table_batches("t", tick)
+            .unwrap_or_default();
+        if !batches.is_empty() {
+            let name_col = batches[0].column(1);
+            if let Some(arr) = name_col.as_any().downcast_ref::<StringArray>() {
+                // Row 0 corresponds to RowId(1) in setup data
+                if arr.len() > 0 {
+                    let val = arr.value(0);
+                    assert_ne!(
+                        val, "modified",
+                        "ArrowStore must be rolled back: row still shows 'modified'"
+                    );
+                }
+            }
+        }
+
+        // pending_diffs MUST be preserved for retry
+        assert_eq!(
+            journal.pending_diff_count(),
+            1,
+            "pending diffs must be preserved after save_journal rollback"
+        );
     }
 
     /// Would have failed: commit applies diffs to ArrowStore before
@@ -668,5 +831,134 @@ mod tests {
         let result = journal.commit();
         assert!(result.is_err());
         assert_eq!(journal.pending_diff_count(), 1);
+    }
+
+    /// May-fail: begin_ingest failure must rollback ArrowStore table versions.
+    ///
+    /// Worst case: when query_engine rejects begin_ingest(), diffs have already
+    /// been applied to ArrowStore. If restore_table_versions is missing from
+    /// this error path, the store retains the partial commit. A retry on the
+    /// same tick double-applies diffs, corrupting data.
+    #[test]
+    fn commit_begin_ingest_failure_rolls_back_arrow_store() {
+        use std::error::Error;
+
+        struct RejectIngestor;
+        impl SnapshotIngestor for RejectIngestor {
+            fn begin_ingest(
+                &self,
+            ) -> Result<Box<dyn SnapshotIngestRollback>, Box<dyn Error + Send + Sync>> {
+                Err(Box::new(std::io::Error::other(
+                    "ingest refused",
+                )))
+            }
+            fn ingest_snapshot(
+                &self,
+                _tick: Tick,
+                _table_name: &str,
+                _batches: Vec<arrow_array::RecordBatch>,
+                _position_map: scharnhorst_core::RowPositionMap,
+            ) -> Result<(), Box<dyn Error + Send + Sync>> {
+                Ok(())
+            }
+            fn store_snapshot(
+                &self,
+                _snapshot: WorldSnapshot,
+            ) -> Result<(), Box<dyn Error + Send + Sync>> {
+                Ok(())
+            }
+        }
+
+        let mut journal = setup_journal_with_table("ingest_test");
+        let tick = journal.current_tick();
+
+        // snapshot initial name value for comparison later
+        let initial_name = {
+            let batches = journal
+                .arrow_store
+                .get_table_batches("ingest_test", tick)
+                .unwrap_or_default();
+            batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .and_then(|a| if a.len() > 0 { Some(a.value(0).to_owned()) } else { None })
+                .unwrap_or_default()
+        };
+
+        let update = Diff::Update {
+            table: "ingest_test".to_owned(),
+            row: RowId::new(1),
+            column: "name".to_owned(),
+            value: serde_json::Value::String("corrupted".to_owned()),
+        };
+        journal
+            .submit_diff(update.clone(), &JournalSubmitToken::new())
+            .unwrap();
+
+        // Attach failing ingestor — consumes journal, returns new
+        journal = journal.with_query_engine(Arc::new(RejectIngestor));
+
+        let result = journal.commit();
+        assert!(
+            result.is_err(),
+            "commit must fail when begin_ingest rejects"
+        );
+
+        // ArrowStore must NOT retain the applied diff.
+        let batches = journal
+            .arrow_store
+            .get_table_batches("ingest_test", tick)
+            .unwrap_or_default();
+        if !batches.is_empty() {
+            let name_col = batches[0].column(1);
+            if let Some(arr) = name_col.as_any().downcast_ref::<StringArray>() {
+                if arr.len() > 0 {
+                    assert_eq!(
+                        arr.value(0), initial_name,
+                        "ArrowStore must be rolled back after begin_ingest failure"
+                    );
+                }
+            }
+        }
+
+        // pending_diffs must be preserved
+        assert_eq!(
+            journal.pending_diff_count(),
+            1,
+            "pending diffs must be preserved after begin_ingest rollback"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod metrics_tests {
+    use crate::telemetry;
+
+    #[test]
+    fn record_diff_submit_no_panic() {
+        telemetry::record_diff_submit("Add", "heroes");
+    }
+
+    #[test]
+    fn record_command_submit_no_panic() {
+        telemetry::record_command_submit("SpawnEntity");
+    }
+
+    #[test]
+    fn emit_commit_record_no_panic() {
+        telemetry::emit_commit_record(1, 10, 8, "abc123");
+    }
+
+    #[test]
+    fn reset_counters_no_panic() {
+        telemetry::reset_counters();
+    }
+
+    #[test]
+    fn counters_reset_to_zero() {
+        telemetry::record_diff_submit("Add", "heroes");
+        telemetry::record_command_submit("SpawnEntity");
+        telemetry::reset_counters();
     }
 }

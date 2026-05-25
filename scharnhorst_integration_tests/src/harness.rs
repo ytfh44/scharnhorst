@@ -113,7 +113,8 @@ impl TestWorld {
         // The scheduler enforces this at initialize() time.
         query_engine.freeze_schema_registry()?;
 
-        let journal = Journal::new(Arc::clone(&arrow_store));
+        let journal = Journal::new(Arc::clone(&arrow_store))
+            .with_query_engine(Arc::new(query_engine.clone()));
         let scheduler = Scheduler::new(journal, query_engine.clone());
         scheduler.initialize()?;
 

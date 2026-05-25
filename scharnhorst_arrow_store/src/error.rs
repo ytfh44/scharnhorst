@@ -51,6 +51,13 @@ pub enum ArrowStoreError {
     #[error("unimplemented: {0}")]
     Unimplemented(String),
 
+    #[error("type mismatch for column {column}: expected {expected}, got {got}")]
+    TypeMismatch {
+        column: String,
+        expected: String,
+        got: String,
+    },
+
     #[error("generic error: {0}")]
     Generic(String),
 }

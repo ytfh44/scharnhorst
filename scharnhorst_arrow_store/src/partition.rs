@@ -24,7 +24,7 @@ impl Partition {
         &self.region_id
     }
 
-    pub fn batches(&self) -> &[RecordBatch] {
+    pub(crate) fn batches(&self) -> &[RecordBatch] {
         &self.batches
     }
 
@@ -118,10 +118,6 @@ impl PartitionSnapshot {
 
     pub fn tick(&self) -> Tick {
         self.tick
-    }
-
-    pub fn batches(&self) -> &[RecordBatch] {
-        &self.batches
     }
 
     pub fn is_empty(&self) -> bool {

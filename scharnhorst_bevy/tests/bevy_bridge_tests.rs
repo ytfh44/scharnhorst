@@ -1,4 +1,4 @@
-use scharnhorst_arrow_store::{ArrowStore, InitStore};
+use scharnhorst_arrow_store::{ArrowStore, InitStore, WorldView};
 use scharnhorst_bevy::{
     BevyBridgeError, BevyBridgeResult, CommandSource, EntityMaterializationRegistry,
     InputCommandBuffer, MaterializationConfig, MaterializationFilter, MaterializeRequest,
@@ -184,7 +184,10 @@ fn buffer_push_ai_rejects() {
         payload: serde_json::Value::Null,
     };
     let result = buf.push_ai(cmd);
-    assert!(matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)));
+    assert!(matches!(
+        result,
+        Err(BevyBridgeError::NonPlayerCommandRejected)
+    ));
 }
 
 #[test]
@@ -330,8 +333,9 @@ fn view_model_initially_empty() -> BevyBridgeResult<()> {
 fn view_model_refresh_updates_state() -> BevyBridgeResult<()> {
     let vm = ViewModel::new();
     let snapshot = Arc::new(scharnhorst_arrow_store::WorldSnapshot::new(Tick(7)));
+    let view = WorldView::new(snapshot);
 
-    vm.refresh(snapshot.clone(), 3)?;
+    vm.refresh(view, 3)?;
 
     assert_eq!(vm.generation()?, 3);
     assert_eq!(vm.latest_tick()?, Some(Tick(7)));
@@ -378,6 +382,30 @@ fn sync_state_mark_dirty_and_clear() -> BevyBridgeResult<()> {
     state.clear_dirty()?;
     assert!(!state.is_dirty(entity)?);
     assert_eq!(state.dirty_count()?, 0);
+
+    // Verify sync_all continues past individual failures and always clears dirty.
+    let e1 = bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid");
+    let e2 = bevy::prelude::Entity::from_raw_u32(2).expect("Entity index must be valid");
+    state.register_entity(e1, "t1", 0, Tick(0))?;
+    state.register_entity(e2, "t2", 0, Tick(0))?;
+    state.mark_dirty(e1)?;
+    state.mark_dirty(e2)?;
+
+    let vm = ViewModel::new();
+    let qe = QueryEngine::new(SchemaRegistry::new());
+    let result = state.sync_all(&vm, &qe);
+    assert!(
+        matches!(result, Err(BevyBridgeError::SyncFailed(_))),
+        "sync_all should aggregate errors as SyncFailed, got {:?}",
+        result
+    );
+    // Both entities were attempted; dirty must still be cleared.
+    assert_eq!(
+        state.dirty_count()?,
+        0,
+        "dirty should be cleared even when sync_all fails"
+    );
+
     Ok(())
 }
 
@@ -402,6 +430,63 @@ fn sync_state_unregister_cleans_dirty() -> BevyBridgeResult<()> {
     state.unregister_entity(entity)?;
     assert_eq!(state.entity_count()?, 0);
     assert_eq!(state.dirty_count()?, 0);
+    Ok(())
+}
+
+/// May-fail: unregister_entity for an entity not in models must not panic.
+///
+/// Worst case: if unregister_entity panics or corrupts state when the
+/// entity is absent, any cleanup path that double-unregisters triggers
+/// undefined behaviour (e.g. stale dirty entries).
+#[test]
+fn unregister_entity_not_in_models_does_not_panic() -> BevyBridgeResult<()> {
+    let state = SyncState::new();
+    let entity = bevy::prelude::Entity::from_raw_u32(99).expect("Entity index must be valid");
+    let result = state.unregister_entity(entity);
+    assert!(
+        result.is_ok(),
+        "unregister_entity with unknown entity should not panic, got {:?}",
+        result
+    );
+    assert_eq!(state.entity_count()?, 0);
+    Ok(())
+}
+
+/// May-fail: sync_all with dirty entity not in models skips gracefully.
+///
+/// Worst case: a dangling dirty entry (from a race or stale handle)
+/// causes sync_all to panic or produce incorrect sync counts, masking
+/// real sync failures.
+#[test]
+fn sync_all_dirty_not_in_models_skips_gracefully() -> BevyBridgeResult<()> {
+    let state = SyncState::new();
+    let registered =
+        bevy::prelude::Entity::from_raw_u32(1).expect("Entity index must be valid");
+    let orphan =
+        bevy::prelude::Entity::from_raw_u32(2).expect("Entity index must be valid");
+
+    state.register_entity(registered, "provinces", 0, Tick(0))?;
+    state.mark_dirty(registered)?;
+    state.mark_dirty(orphan)?; // entity NOT in models
+
+    let vm = ViewModel::new();
+    let qe = QueryEngine::new(SchemaRegistry::new());
+
+    // sync_all must not panic; the orphan is silently skipped via if-let.
+    // The registered entity will fail (no snapshot), so SyncFailed is expected.
+    let result = state.sync_all(&vm, &qe);
+    assert!(
+        matches!(result, Err(BevyBridgeError::SyncFailed(_))),
+        "sync_all with dirty-not-in-models should aggregate errors, got {:?}",
+        result
+    );
+
+    // Dirty must be cleared even for the orphaned entity.
+    assert_eq!(
+        state.dirty_count()?,
+        0,
+        "dirty must be cleared after sync_all"
+    );
     Ok(())
 }
 
@@ -433,8 +518,10 @@ fn refresh_handler_signal_cycle() -> BevyBridgeResult<()> {
     let _ = handler.on_refresh_signal();
     assert!(handler.should_refresh()?);
 
-    let snapshot = scharnhorst_arrow_store::WorldSnapshot::new(Tick(7));
-    handler.refresh_snapshot(snapshot)?;
+    let view = WorldView::new(Arc::new(scharnhorst_arrow_store::WorldSnapshot::new(Tick(
+        7,
+    ))));
+    handler.refresh_snapshot(view)?;
 
     assert!(!handler.should_refresh()?);
     assert_eq!(handler.current_generation()?, 1);
@@ -527,7 +614,10 @@ fn input_buffer_drain_with_wrong_tick_rejected() -> BevyBridgeResult<()> {
     );
 
     // Verify the expected/actual values in the error
-    if let Err(BevyBridgeError::TickAlignmentError { expected, actual, .. }) = result {
+    if let Err(BevyBridgeError::TickAlignmentError {
+        expected, actual, ..
+    }) = result
+    {
         assert_eq!(expected, Tick(5));
         assert_eq!(actual, Tick(6));
     }
@@ -589,7 +679,7 @@ fn view_of_with_invalid_row_id() -> BevyBridgeResult<()> {
     let snapshot = commit_store.generate_snapshot(Tick(1)).expect("snapshot");
 
     let vm = ViewModel::new();
-    vm.refresh(snapshot, 1)?;
+    vm.refresh(WorldView::new(snapshot), 1)?;
 
     let registry = SchemaRegistry::new();
     let qe = QueryEngine::new(registry);

@@ -7,6 +7,7 @@ pub mod refresh_signal;
 pub mod rng;
 pub mod scheduler;
 pub mod system;
+pub mod telemetry;
 
 pub use error::{SchedulerError, SchedulerResult};
 pub use phase::Phase;

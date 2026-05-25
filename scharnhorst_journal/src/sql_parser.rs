@@ -176,11 +176,7 @@ impl SqlParser {
     /// Syntax: UPDATE table SET col = val WHERE condition
     fn parse_update(sql: &str) -> JournalResult<SqlStatement> {
         // Remove the UPDATE keyword
-        let after_update = sql
-            .trim()
-            .strip_prefix("UPDATE")
-            .or_else(|| sql.trim().strip_prefix("update"))
-            .ok_or_else(|| JournalError::SqlParse("expected UPDATE".to_owned()))?;
+        let after_update = Self::strip_statement_keyword(sql, "UPDATE")?;
 
         let mut tokens = Tokenizer::new(after_update);
 
@@ -217,6 +213,7 @@ impl SqlParser {
         }
 
         let condition = Self::parse_where_clause(&mut tokens)?;
+        tokens.ensure_finished("UPDATE")?;
 
         Ok(SqlStatement::Update {
             table,
@@ -230,11 +227,7 @@ impl SqlParser {
     ///
     /// Syntax: INSERT INTO table (col1, col2) VALUES (val1, val2)
     fn parse_insert(sql: &str) -> JournalResult<SqlStatement> {
-        let after_insert = sql
-            .trim()
-            .strip_prefix("INSERT")
-            .or_else(|| sql.trim().strip_prefix("insert"))
-            .ok_or_else(|| JournalError::SqlParse("expected INSERT".to_owned()))?;
+        let after_insert = Self::strip_statement_keyword(sql, "INSERT")?;
 
         let mut tokens = Tokenizer::new(after_insert);
 
@@ -274,6 +267,7 @@ impl SqlParser {
                 values.len()
             )));
         }
+        tokens.ensure_finished("INSERT")?;
 
         Ok(SqlStatement::Insert {
             table,
@@ -286,11 +280,7 @@ impl SqlParser {
     ///
     /// Syntax: DELETE FROM table WHERE condition
     fn parse_delete(sql: &str) -> JournalResult<SqlStatement> {
-        let after_delete = sql
-            .trim()
-            .strip_prefix("DELETE")
-            .or_else(|| sql.trim().strip_prefix("delete"))
-            .ok_or_else(|| JournalError::SqlParse("expected DELETE".to_owned()))?;
+        let after_delete = Self::strip_statement_keyword(sql, "DELETE")?;
 
         let mut tokens = Tokenizer::new(after_delete);
 
@@ -312,8 +302,32 @@ impl SqlParser {
         }
 
         let condition = Self::parse_where_clause(&mut tokens)?;
+        tokens.ensure_finished("DELETE")?;
 
         Ok(SqlStatement::Delete { table, condition })
+    }
+
+    fn strip_statement_keyword<'a>(sql: &'a str, keyword: &str) -> JournalResult<&'a str> {
+        let trimmed = sql.trim_start();
+        let keyword_len = keyword.len();
+        let prefix = trimmed
+            .get(..keyword_len)
+            .ok_or_else(|| JournalError::SqlParse(format!("expected {keyword}")))?;
+
+        if !prefix.eq_ignore_ascii_case(keyword) {
+            return Err(JournalError::SqlParse(format!("expected {keyword}")));
+        }
+
+        let boundary_ok = trimmed
+            .get(keyword_len..)
+            .and_then(|rest| rest.chars().next())
+            .map(|c| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(true);
+        if !boundary_ok {
+            return Err(JournalError::SqlParse(format!("expected {keyword}")));
+        }
+
+        Ok(&trimmed[keyword_len..])
     }
 
     /// Parse a WHERE clause: column op value
@@ -388,10 +402,21 @@ impl<'a> Tokenizer<'a> {
         while self.pos < self.input.len() {
             let c = self.input[self.pos..].chars().next().unwrap_or('\0');
             if c.is_whitespace() {
-                self.pos += 1;
+                self.pos += c.len_utf8();
             } else {
                 break;
             }
+        }
+    }
+
+    fn ensure_finished(&mut self, statement: &str) -> JournalResult<()> {
+        self.skip_whitespace();
+        if self.pos == self.input.len() {
+            Ok(())
+        } else {
+            Err(JournalError::SqlParse(format!(
+                "unexpected trailing tokens after {statement}"
+            )))
         }
     }
 
@@ -532,14 +557,19 @@ impl<'a> Tokenizer<'a> {
             let c = self.input[self.pos..].chars().next().unwrap_or('\0');
             if c == quote_char {
                 // Check for escaped quote (double quote)
-                if self.pos + 1 < self.input.len()
-                    && self.input[self.pos + 1..].chars().next().unwrap_or('\0') == quote_char
+                let quote_len = quote_char.len_utf8();
+                if self.pos + quote_len < self.input.len()
+                    && self.input[self.pos + quote_len..]
+                        .chars()
+                        .next()
+                        .unwrap_or('\0')
+                        == quote_char
                 {
-                    self.pos += 2;
+                    self.pos += quote_len * 2;
                 } else {
                     let value = &self.input[start..self.pos];
-                    self.pos += 1; // Skip closing quote
-                                   // Handle escaped quotes by replacing doubled quotes with single
+                    self.pos += quote_len; // Skip closing quote
+                                           // Handle escaped quotes by replacing doubled quotes with single
                     let unescaped = value.replace(
                         &format!("{}{}", quote_char, quote_char),
                         &quote_char.to_string(),
@@ -547,7 +577,7 @@ impl<'a> Tokenizer<'a> {
                     return Some(SqlValue::String(unescaped));
                 }
             } else {
-                self.pos += 1;
+                self.pos += c.len_utf8();
             }
         }
 
@@ -911,5 +941,406 @@ mod tests {
             }
             _ => panic!("expected UPDATE statement"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // INSERT value type variants (uncovered branches in parse_keyword_value, parse_number)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_insert_with_boolean_true() {
+        let sql = "INSERT INTO t (id, done) VALUES (1, true)";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Insert { values, .. } => {
+                assert_eq!(values[0], SqlValue::Integer(1));
+                assert_eq!(values[1], SqlValue::Boolean(true));
+            }
+            _ => panic!("expected INSERT"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_with_boolean_false() {
+        let sql = "INSERT INTO t (id, flag) VALUES (1, false)";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Insert { values, .. } => {
+                assert_eq!(values[1], SqlValue::Boolean(false));
+            }
+            _ => panic!("expected INSERT"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_with_null() {
+        let sql = "INSERT INTO t (id, name) VALUES (1, NULL)";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Insert { values, .. } => {
+                assert_eq!(values[1], SqlValue::Null);
+            }
+            _ => panic!("expected INSERT"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn parse_insert_with_float() {
+        let sql = "INSERT INTO t (id, score) VALUES (1, 3.14)";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Insert { values, .. } => {
+                assert_eq!(values[1], SqlValue::Float(3.14));
+            }
+            _ => panic!("expected INSERT"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_with_negative_number() {
+        let sql = "INSERT INTO t (id, delta) VALUES (1, -5)";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Insert { values, .. } => {
+                assert_eq!(values[1], SqlValue::Integer(-5));
+            }
+            _ => panic!("expected INSERT"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // UPDATE SET value type edge cases
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_update_set_boolean_false() {
+        let sql = "UPDATE t SET flag = false WHERE id = 1";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Update { value, .. } => {
+                assert_eq!(value, SqlValue::Boolean(false));
+            }
+            _ => panic!("expected UPDATE"),
+        }
+    }
+
+    #[test]
+    fn parse_update_set_negative_number() {
+        let sql = "UPDATE t SET delta = -42 WHERE id = 1";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Update { value, .. } => {
+                assert_eq!(value, SqlValue::Integer(-42));
+            }
+            _ => panic!("expected UPDATE"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // DELETE parser validation (uncovered error branches)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_delete_no_where() {
+        let result = SqlParser::parse("DELETE FROM t");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_delete_where_non_id_column() {
+        // parse succeeds (it's valid SQL syntax), but statement_to_diff will reject
+        let sql = "DELETE FROM t WHERE name = 'x'";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Delete { condition, .. } => {
+                assert_eq!(condition.column, "name");
+                assert_eq!(condition.operator, ComparisonOp::Eq);
+                assert_eq!(condition.value, SqlValue::String("x".to_owned()));
+            }
+            _ => panic!("expected DELETE"),
+        }
+    }
+
+    #[test]
+    fn parse_delete_where_non_equality_op() {
+        // parse succeeds, statement_to_diff will reject
+        let sql = "DELETE FROM t WHERE id > 5";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Delete { condition, .. } => {
+                assert_eq!(condition.column, "id");
+                assert_eq!(condition.operator, ComparisonOp::Gt);
+                assert_eq!(condition.value, SqlValue::Integer(5));
+            }
+            _ => panic!("expected DELETE"),
+        }
+    }
+
+    #[test]
+    fn parse_delete_where_boolean_value() {
+        // WHERE col = true/false — parse succeeds, statement_to_diff fails
+        let sql = "DELETE FROM t WHERE done = true";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Delete { condition, .. } => {
+                assert_eq!(condition.value, SqlValue::Boolean(true));
+            }
+            _ => panic!("expected DELETE"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn parse_delete_where_float_value() {
+        let sql = "DELETE FROM t WHERE score = 3.14";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Delete { condition, .. } => {
+                assert_eq!(condition.value, SqlValue::Float(3.14));
+            }
+            _ => panic!("expected DELETE"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Unsupported SQL statement types
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_unsupported_alter_table() {
+        let result = SqlParser::parse("ALTER TABLE t ADD COLUMN c INTEGER");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_unsupported_drop_table() {
+        let result = SqlParser::parse("DROP TABLE t");
+        assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Case-insensitive keyword handling
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_case_insensitive_delete() {
+        let sql = "delete from t where id = 1";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Delete { table, .. } => assert_eq!(table, "t"),
+            _ => panic!("expected DELETE"),
+        }
+    }
+
+    #[test]
+    fn parse_case_insensitive_insert() {
+        let sql = "insert into t (id) values (1)";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Insert { table, .. } => assert_eq!(table, "t"),
+            _ => panic!("expected INSERT"),
+        }
+    }
+
+    /// May-fail: parser dispatch is case-insensitive, so the concrete
+    /// statement parser must strip the leading keyword case-insensitively too.
+    #[test]
+    fn parse_mixed_case_statement_keywords() {
+        let update = SqlParser::parse("UpDaTe t SeT val = 1 WhErE id = 2");
+        assert!(matches!(update, Ok(SqlStatement::Update { .. })));
+
+        let insert = SqlParser::parse("InSeRt InTo t (id, name) VaLuEs (1, 'x')");
+        assert!(matches!(insert, Ok(SqlStatement::Insert { .. })));
+
+        let delete = SqlParser::parse("DeLeTe FrOm t WhErE id = 1");
+        assert!(matches!(delete, Ok(SqlStatement::Delete { .. })));
+    }
+
+    /// May-fail: valid debug write SQL must consume the whole statement.
+    #[test]
+    fn parse_rejects_trailing_tokens() {
+        assert!(SqlParser::parse("UPDATE t SET val = 1 WHERE id = 2 trailing").is_err());
+        assert!(SqlParser::parse("INSERT INTO t (id) VALUES (1) trailing").is_err());
+        assert!(SqlParser::parse("DELETE FROM t WHERE id = 1 trailing").is_err());
+    }
+
+    /// May-fail: string literal scanning must advance by UTF-8 character width.
+    #[test]
+    fn parse_unicode_string_literal() {
+        let stmt = SqlParser::parse("UPDATE t SET name = '\u{00CE}le' WHERE id = 1").unwrap();
+        match stmt {
+            SqlStatement::Update { value, .. } => {
+                assert_eq!(value, SqlValue::String("\u{00CE}le".to_owned()));
+            }
+            _ => panic!("expected UPDATE"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Whitespace resilience
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_extra_whitespace_update() {
+        let sql = "  UPDATE   t \t SET \n val \t =  42  WHERE  id  =  1  ";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Update {
+                table,
+                column,
+                value,
+                ..
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(column, "val");
+                assert_eq!(value, SqlValue::Integer(42));
+            }
+            _ => panic!("expected UPDATE"),
+        }
+    }
+
+    #[test]
+    fn parse_extra_whitespace_delete() {
+        let sql = "  DELETE   FROM   t   WHERE   id   =   7  ";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Delete {
+                table, condition, ..
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(condition.value, SqlValue::Integer(7));
+            }
+            _ => panic!("expected DELETE"),
+        }
+    }
+
+    #[test]
+    fn parse_extra_whitespace_insert() {
+        let sql = "  INSERT   INTO   t   (id)   VALUES   (42)  ";
+        let stmt = SqlParser::parse(sql).unwrap();
+        match stmt {
+            SqlStatement::Insert { table, values, .. } => {
+                assert_eq!(table, "t");
+                assert_eq!(values[0], SqlValue::Integer(42));
+            }
+            _ => panic!("expected INSERT"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Malformed / garbage SQL
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_garbage_sql() {
+        assert!(SqlParser::parse("garbage input").is_err());
+        assert!(SqlParser::parse("12345").is_err());
+        assert!(SqlParser::parse("   ").is_err());
+        assert!(SqlParser::parse("UPDATE").is_err());
+        assert!(SqlParser::parse("UPDATE t").is_err());
+        assert!(SqlParser::parse("INSERT INTO t").is_err());
+        assert!(SqlParser::parse("DELETE FROM").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // statement_to_diff branches
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn statement_to_diff_column_count_mismatch() {
+        let stmt = SqlStatement::Insert {
+            table: "t".to_owned(),
+            columns: vec!["id".to_owned(), "name".to_owned()],
+            values: vec![SqlValue::Integer(1)],
+        };
+        let result = SqlParser::statement_to_diff(stmt);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn statement_to_diff_insert_no_id_column() {
+        let stmt = SqlStatement::Insert {
+            table: "t".to_owned(),
+            columns: vec!["name".to_owned(), "score".to_owned()],
+            values: vec![SqlValue::String("x".to_owned()), SqlValue::Integer(42)],
+        };
+        let result = SqlParser::statement_to_diff(stmt);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn statement_to_diff_non_equality_where() {
+        let stmt = SqlStatement::Update {
+            table: "t".to_owned(),
+            column: "val".to_owned(),
+            value: SqlValue::Integer(42),
+            condition: WhereCondition {
+                column: "id".to_owned(),
+                operator: ComparisonOp::Gt,
+                value: SqlValue::Integer(5),
+            },
+        };
+        let result = SqlParser::statement_to_diff(stmt);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn statement_to_diff_non_id_where_column() {
+        let stmt = SqlStatement::Update {
+            table: "t".to_owned(),
+            column: "val".to_owned(),
+            value: SqlValue::Integer(42),
+            condition: WhereCondition {
+                column: "name".to_owned(),
+                operator: ComparisonOp::Eq,
+                value: SqlValue::String("x".to_owned()),
+            },
+        };
+        let result = SqlParser::statement_to_diff(stmt);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn statement_to_diff_non_integer_row_id() {
+        let stmt = SqlStatement::Delete {
+            table: "t".to_owned(),
+            condition: WhereCondition {
+                column: "id".to_owned(),
+                operator: ComparisonOp::Eq,
+                value: SqlValue::Null,
+            },
+        };
+        let result = SqlParser::statement_to_diff(stmt);
+        assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // SqlValue::to_json branches
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sql_value_to_json_boolean() {
+        assert_eq!(
+            SqlValue::Boolean(true).to_json(),
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            SqlValue::Boolean(false).to_json(),
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn sql_value_to_json_null() {
+        assert_eq!(SqlValue::Null.to_json(), serde_json::Value::Null);
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn sql_value_to_json_float() {
+        let v = SqlValue::Float(3.14).to_json();
+        assert!(v.is_f64());
+        assert_eq!(v.as_f64().unwrap(), 3.14);
     }
 }

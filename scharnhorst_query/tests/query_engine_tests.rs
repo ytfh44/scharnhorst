@@ -2,11 +2,13 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use scharnhorst_core::{RowId, RowPositionMap, Tick};
+use scharnhorst_arrow_store::SnapshotIngestor;
+use scharnhorst_core::{RowId, RowLookup, RowPositionMap, Tick};
 use scharnhorst_query::{
     BatchColumnReader, ColumnView, DebugWriteJournal, DebugWriteOp, InMemoryReadSource,
     InspectorConsole, QueryEngine, QueryError, QueryResult, ReadRequest, ReadResponse, RowCursor,
-    TableReadView, TypedColumnAccess, UnifiedReadSource,
+    RowLookupView, TableReadView, TypedColumnAccess, UnifiedReadSource, ValidatablePath,
+    ValidationErrorKind,
 };
 use scharnhorst_schema::{
     ColumnSpec, FieldSemantic, RelationEdge, RelationKind, SchemaRegistry, TableSpec,
@@ -1125,16 +1127,20 @@ fn dc4_sql_register_empty_table_name_returns_err() {
     );
 }
 
-/// Registering with empty batch vec must not crash the context.
+/// Registering with empty batch vec must succeed and make
+/// the table appear in registered_tables.
 #[test]
 fn dc4_sql_register_empty_batches_does_not_crash() {
-    // empty Vec<RecordBatch> should not panic; internally
+    // empty Vec<RecordBatch> should succeed; internally
     // the context registers an empty schema batch as a placeholder
     let ctx = scharnhorst_query::SqlExecutionContext::new();
-    let result = ctx.register_table("units", vec![]);
-    // must not panic; result may be Ok or Err depending on
-    // DataFusion's tolerance for empty-schema registration
-    let _ = result;
+    ctx.register_table("units", vec![]).unwrap();
+    // the table must be tracked in registered_tables
+    let tables = ctx.registered_tables().unwrap();
+    assert!(
+        tables.contains(&"units".to_string()),
+        "DC-4: empty-batch registration must succeed and table must appear in registered_tables"
+    );
 }
 
 /// Unregistering a table removes it from registered_tables.
@@ -1155,23 +1161,74 @@ fn dc4_sql_unregister_table_removes_from_registered() {
     );
 }
 
-/// Unregistering a table that was never registered does not crash.
-/// DataFusion's SessionContext silently ignores deregistration of unknown
-/// tables (returns Ok), so we verify the call completes without panic and
-/// the table remains absent from registered_tables.
+/// Unregistering a table that was never registered must not panic.
+/// DataFusion's SessionContext.deregister_table returns Ok for
+/// unknown table names (silently ignores deregistration).
 #[test]
 fn dc4_sql_unregister_nonexistent_table_returns_err() {
     // unregistering a never-registered table must not panic
     let ctx = scharnhorst_query::SqlExecutionContext::new();
     let result = ctx.unregister_table("nonexistent");
-    // call completes without panic; DataFusion may return Ok or Err
-    // depending on version -- both are acceptable
-    let _ = result;
+    // DataFusion returns Ok for unknown tables — verify no panic
+    assert!(
+        result.is_ok(),
+        "DC-4: unregister nonexistent table must not panic (DataFusion returns Ok)"
+    );
     // table was never registered, so it must not appear in the list
     let tables = ctx.registered_tables().unwrap();
     assert!(
         !tables.contains(&"nonexistent".to_string()),
         "DC-4: nonexistent table must not appear in registered_tables"
+    );
+}
+
+// ------------------------------------------------------------------
+// SQL Execution
+// ------------------------------------------------------------------
+
+/// Executing invalid/garbage SQL must return a DataFusion error.
+#[tokio::test]
+async fn dc4_sql_execute_invalid_sql_returns_err() {
+    let ctx = scharnhorst_query::SqlExecutionContext::new();
+    let result = ctx.execute_sql("GARBAGE NOT SQL").await;
+    assert!(
+        matches!(result, Err(QueryError::DataFusion(_))),
+        "DC-4: executing invalid SQL must return DataFusion error"
+    );
+}
+
+/// Executing SQL referencing a nonexistent table must return an error.
+#[tokio::test]
+async fn dc4_sql_execute_on_nonexistent_table_returns_err() {
+    let ctx = scharnhorst_query::SqlExecutionContext::new();
+    let result = ctx.execute_sql("SELECT * FROM nonexistent_table").await;
+    assert!(
+        matches!(result, Err(QueryError::DataFusion(_))),
+        "DC-4: querying nonexistent table must return DataFusion error"
+    );
+}
+
+/// execute_sql_limited wraps a SQL query with LIMIT and returns at most
+/// the specified number of rows.
+#[tokio::test]
+async fn dc4_sql_execute_sql_limited_returns_limited_rows() {
+    let ctx = scharnhorst_query::SqlExecutionContext::new();
+    ctx.register_table("units", vec![sample_batch()]).unwrap();
+
+    // execute_sql_limited with limit 1 must return at most 1 row
+    let batches = ctx
+        .execute_sql_limited("SELECT * FROM units", 1)
+        .await
+        .unwrap();
+    assert!(
+        !batches.is_empty(),
+        "DC-4: limited query must produce batches"
+    );
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(
+        total_rows <= 1,
+        "DC-4: limited query with limit=1 must return at most 1 row, got {}",
+        total_rows
     );
 }
 
@@ -1982,6 +2039,63 @@ fn dc4_ingest_snapshot_makes_data_readable() {
     );
 }
 
+/// May-fail: transactional ingestion must not publish partial tick data.
+#[test]
+fn dc4_begin_ingest_stages_tables_until_snapshot_store() {
+    let engine = QueryEngine::new(SchemaRegistry::new());
+    engine.register_table_schema(test_table_spec()).unwrap();
+    let item_spec = TableSpec::new("items")
+        .with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64"))
+        .unwrap()
+        .with_column(ColumnSpec::new("name", FieldSemantic::Name, "utf8"))
+        .unwrap()
+        .with_column(ColumnSpec::new("health", FieldSemantic::Quantity, "f64"))
+        .unwrap()
+        .with_column(ColumnSpec::new("active", FieldSemantic::Tag, "bool"))
+        .unwrap();
+    engine.register_table_schema(item_spec).unwrap();
+
+    engine
+        .ingest_snapshot(
+            Tick(1),
+            "units",
+            vec![sample_batch()],
+            RowPositionMap::new(),
+        )
+        .unwrap();
+    engine
+        .ingest_snapshot(
+            Tick(1),
+            "items",
+            vec![sample_batch()],
+            RowPositionMap::new(),
+        )
+        .unwrap();
+
+    let rollback = engine.begin_ingest().unwrap();
+    engine
+        .ingest_snapshot(
+            Tick(2),
+            "units",
+            vec![sample_batch()],
+            RowPositionMap::new(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        engine.latest_tick().unwrap(),
+        Some(Tick(1)),
+        "partial transactional ingest must not publish Tick(2)"
+    );
+    let read = engine.read(ReadRequest::new(Tick(2)).with_tables(["units", "items"]));
+    assert!(
+        matches!(read, Err(QueryError::TicksMismatch { .. })),
+        "Tick(2) reads must remain unavailable until store_snapshot"
+    );
+
+    rollback.rollback().unwrap();
+}
+
 /// Would have failed: ingest_snapshot with u64::MAX tick (sentinel)
 /// should be rejected. Without this guard, downstream code could
 /// observe a frame that's not a real commit.
@@ -2001,7 +2115,8 @@ fn dc4_ingest_snapshot_rejects_sentinel_tick() {
     assert!(
         err.to_string().to_lowercase().contains("sentinel")
             || err.to_string().to_lowercase().contains("unsupported"),
-        "sentinel tick must be rejected, got: {}", err
+        "sentinel tick must be rejected, got: {}",
+        err
     );
 }
 
@@ -2401,4 +2516,601 @@ fn dc6_relation_edge_metadata_preserved() {
         resolved.to_column, original.to_column,
         "DC-6: 'to_column'='id' must be preserved"
     );
+}
+
+// ==========================================================================
+// Typed Access Error Path Coverage Tests
+// ==========================================================================
+// These tests cover the uncovered branches in typed_access.rs:
+// RowCursor::advance() false return, RowCursor::get_column() missing,
+// RowCursor::get_row_id() negative i64 -> None, RowLookupView::column_view()
+// batch_index OOB and column-not-found, Slice iter_valid() with nulls,
+// and Slice get() out-of-bounds.
+
+// ------------------------------------------------------------------
+// Helpers for typed access error path tests
+// ------------------------------------------------------------------
+
+/// Build a RecordBatch with nullable columns for testing null filtering.
+fn sample_batch_with_nulls() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("health", DataType::Float64, true),
+        Field::new("active", DataType::Boolean, true),
+    ]));
+    let id: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
+    let name: ArrayRef = Arc::new(StringArray::from(vec![Some("alpha"), None, Some("gamma")]));
+    let health: ArrayRef = Arc::new(Float64Array::from(vec![Some(100.0), None, Some(60.0)]));
+    let active: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)]));
+    RecordBatch::try_new(schema, vec![id, name, health, active]).unwrap()
+}
+
+/// Build a batch with a negative id value.
+fn sample_batch_negative_id() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let id: ArrayRef = Arc::new(Int64Array::from(vec![-1]));
+    let name: ArrayRef = Arc::new(StringArray::from(vec!["neg"]));
+    RecordBatch::try_new(schema, vec![id, name]).unwrap()
+}
+
+/// Build columns vector from a RecordBatch.
+fn batch_to_columns(batch: &RecordBatch) -> Vec<(String, ColumnView)> {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let view = ColumnView::new(batch.column(idx).clone(), field.name());
+            (field.name().clone(), view)
+        })
+        .collect()
+}
+
+/// Build arrays vector from a RecordBatch.
+fn batch_to_arrays(batch: &RecordBatch) -> Vec<(String, ArrayRef)> {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| (field.name().clone(), batch.column(idx).clone()))
+        .collect()
+}
+
+// ------------------------------------------------------------------
+// RowCursor error path tests
+// ------------------------------------------------------------------
+
+/// RowCursor::advance() returns false when already at the last row.
+#[test]
+fn dc10_row_cursor_advance_at_end_returns_false() {
+    let batch = sample_batch();
+    let mut cursor = RowCursor::new(batch_to_columns(&batch)).unwrap();
+    // advance through all 3 rows
+    assert!(cursor.advance(), "DC-10: first advance must return true");
+    assert!(cursor.advance(), "DC-10: second advance must return true");
+    // now at last row (index 2); next advance must return false
+    assert!(
+        !cursor.advance(),
+        "DC-10: advance past last row must return false"
+    );
+    // position must not change after failed advance
+    assert_eq!(
+        cursor.current_row(),
+        2,
+        "DC-10: current_row must stay at last row after failed advance"
+    );
+}
+
+/// RowCursor::get_column() with a non-existent column name returns ColumnNotFound.
+#[test]
+fn dc10_row_cursor_get_column_missing_returns_err() {
+    let batch = sample_batch();
+    let cursor = RowCursor::new(batch_to_columns(&batch)).unwrap();
+    let result = cursor.get_column("nonexistent");
+    assert!(
+        matches!(result, Err(QueryError::ColumnNotFound { .. })),
+        "DC-10: get_column('nonexistent') must return ColumnNotFound"
+    );
+}
+
+/// RowCursor::get_row_id() with a negative i64 silently returns None.
+#[test]
+fn dc10_row_cursor_get_row_id_negative_returns_none() {
+    let batch = sample_batch_negative_id();
+    let cursor = RowCursor::new(batch_to_columns(&batch)).unwrap();
+    // negative i64 cannot convert to u64 RowId, so get_row_id returns Ok(None)
+    let result = cursor.get_row_id("id");
+    assert!(
+        result.is_ok(),
+        "DC-10: get_row_id with negative i64 must not error"
+    );
+    assert_eq!(
+        result.unwrap(),
+        None,
+        "DC-10: get_row_id with negative i64 must return None"
+    );
+}
+
+// ------------------------------------------------------------------
+// RowLookupView error path tests
+// ------------------------------------------------------------------
+
+/// RowLookupView with an out-of-range batch_index returns InvalidQuery.
+#[test]
+fn dc10_row_lookup_view_column_view_batch_index_oob() {
+    let spec = Arc::new(test_table_spec());
+    let view = TableReadView::new("units", Tick(1), vec![sample_batch()], spec, None);
+    // batch_index 99 is out of range (only 1 batch at index 0)
+    let lookup = RowLookup::new(RowId::new(0), 99, 0);
+    let row_view = RowLookupView::new(lookup, view);
+
+    let result = row_view.get_i64("id");
+    assert!(
+        matches!(result, Err(QueryError::InvalidQuery(_))),
+        "DC-10: RowLookupView with batch_index OOB must return InvalidQuery"
+    );
+}
+
+/// RowLookupView with missing column name returns ColumnNotFound.
+#[test]
+fn dc10_row_lookup_view_column_view_missing_column() {
+    let spec = Arc::new(test_table_spec());
+    let view = TableReadView::new("units", Tick(1), vec![sample_batch()], spec, None);
+    let lookup = RowLookup::new(RowId::new(0), 0, 0);
+    let row_view = RowLookupView::new(lookup, view);
+
+    let result = row_view.get_i64("nonexistent");
+    assert!(
+        matches!(result, Err(QueryError::ColumnNotFound { .. })),
+        "DC-10: RowLookupView with missing column must return ColumnNotFound"
+    );
+}
+
+// ------------------------------------------------------------------
+// Slice iter_valid() null-filtering tests
+// ------------------------------------------------------------------
+
+/// BooleanSlice::iter_valid() skips nulls and yields only valid booleans.
+#[test]
+fn dc10_bool_slice_iter_valid_filters_nulls() {
+    let batch = sample_batch_with_nulls();
+    let reader = BatchColumnReader::new(batch_to_arrays(&batch)).unwrap();
+    let slice = reader.bool_slice("active").unwrap();
+    let values: Vec<bool> = slice.iter_valid().collect();
+    assert_eq!(
+        values,
+        vec![true, false],
+        "DC-10: BooleanSlice iter_valid must skip null and yield [true, false]"
+    );
+}
+
+/// I64Slice::iter_valid() skips nulls and yields only valid i64s.
+#[test]
+fn dc10_i64_slice_iter_valid_filters_nulls() {
+    let batch = sample_batch_with_nulls();
+    let reader = BatchColumnReader::new(batch_to_arrays(&batch)).unwrap();
+    let slice = reader.i64_slice("id").unwrap();
+    let values: Vec<i64> = slice.iter_valid().collect();
+    assert_eq!(
+        values,
+        vec![1, 3],
+        "DC-10: I64Slice iter_valid must skip null and yield [1, 3]"
+    );
+}
+
+/// F64Slice::iter_valid() skips nulls and yields only valid f64s.
+#[test]
+fn dc10_f64_slice_iter_valid_filters_nulls() {
+    let batch = sample_batch_with_nulls();
+    let reader = BatchColumnReader::new(batch_to_arrays(&batch)).unwrap();
+    let slice = reader.f64_slice("health").unwrap();
+    let values: Vec<f64> = slice.iter_valid().collect();
+    assert_eq!(
+        values,
+        vec![100.0, 60.0],
+        "DC-10: F64Slice iter_valid must skip null and yield [100.0, 60.0]"
+    );
+}
+
+/// StringSlice::iter_valid() skips nulls and yields only valid strings.
+#[test]
+fn dc10_string_slice_iter_valid_filters_nulls() {
+    let batch = sample_batch_with_nulls();
+    let reader = BatchColumnReader::new(batch_to_arrays(&batch)).unwrap();
+    let slice = reader.string_slice("name").unwrap();
+    let values: Vec<String> = slice.iter_valid().collect();
+    assert_eq!(
+        values,
+        vec!["alpha".to_owned(), "gamma".to_owned()],
+        "DC-10: StringSlice iter_valid must skip null and yield ['alpha', 'gamma']"
+    );
+}
+
+// ------------------------------------------------------------------
+// Slice get() out-of-bounds tests
+// ------------------------------------------------------------------
+
+/// BooleanSlice::get() with row >= len returns IndexOutOfBounds.
+#[test]
+fn dc10_bool_slice_get_out_of_bounds() {
+    let batch = sample_batch();
+    let reader = BatchColumnReader::new(batch_to_arrays(&batch)).unwrap();
+    let slice = reader.bool_slice("active").unwrap();
+    // len is 3, row 3 is out of bounds
+    let result = slice.get(3);
+    assert!(
+        matches!(result, Err(QueryError::IndexOutOfBounds(3))),
+        "DC-10: BooleanSlice::get(3) on len-3 slice must return IndexOutOfBounds"
+    );
+}
+
+/// I64Slice::get() with row >= len returns IndexOutOfBounds.
+#[test]
+fn dc10_i64_slice_get_out_of_bounds() {
+    let batch = sample_batch();
+    let reader = BatchColumnReader::new(batch_to_arrays(&batch)).unwrap();
+    let slice = reader.i64_slice("id").unwrap();
+    // len is 3, row 5 is out of bounds
+    let result = slice.get(5);
+    assert!(
+        matches!(result, Err(QueryError::IndexOutOfBounds(5))),
+        "DC-10: I64Slice::get(5) on len-3 slice must return IndexOutOfBounds"
+    );
+}
+
+// ==========================================================================
+// Uncovered Branch Coverage Tests
+// ==========================================================================
+// These tests exercise branches identified as uncovered in the latest
+// coverage report for scharnhorst_query.
+//
+// engine.rs: 14 missed branches (69.57%)
+//   - latest_tick() None path (u64::MAX sentinel, already tested but
+//     add explicit edge-case coverage)
+//   - sql() semicolon-not-at-end rejection
+//   - sql() WITH-CTE acceptance
+//
+// inspector.rs: 3 missed branches (62.50%)
+//   - inspect_page no-overlap path
+//   - summarise_table with empty batches
+//
+// unified_read.rs: 1 missed branch (50.00%)
+//   - TableReadView::new multi-batch concat path
+
+// ------------------------------------------------------------------
+// engine.rs: latest_tick None sentinel (u64::MAX default)
+// ------------------------------------------------------------------
+
+/// Fresh engine (no ingestion) returns None from latest_tick.
+/// The internal AtomicU64 starts at u64::MAX sentinel.
+#[test]
+fn dc10_engine_latest_tick_none_on_fresh_engine() {
+    let engine = QueryEngine::new(SchemaRegistry::new());
+    let tick = engine.latest_tick().unwrap();
+    assert_eq!(tick, None, "DC-10: fresh engine latest_tick must be None");
+}
+
+/// After clear_cache, latest_tick remains set (clear_cache empties
+/// view_cache but does not reset the atomic).
+#[test]
+fn dc10_engine_latest_tick_persists_after_clear_cache() {
+    let engine = make_engine_with_data();
+    assert_eq!(engine.latest_tick().unwrap(), Some(Tick(1)));
+    engine.clear_cache().unwrap();
+    // latest_tick is NOT reset by clear_cache
+    assert_eq!(
+        engine.latest_tick().unwrap(),
+        Some(Tick(1)),
+        "DC-10: latest_tick must persist after clear_cache"
+    );
+}
+
+// ------------------------------------------------------------------
+// engine.rs: sql() semicolon handling edge cases
+// ------------------------------------------------------------------
+
+/// A single semicolon NOT at the end of the SQL string is treated
+/// as multi-statement (e.g. "SELECT 1; -- comment").
+/// This covers the branch: semicolon_count == 1 && !ends_with(';')
+#[test]
+fn dc4_sql_rejects_semicolon_not_at_end() {
+    let qe = QueryEngine::new(SchemaRegistry::new());
+    let err = qe.sql("SELECT 1; -- trailing comment").unwrap_err();
+    assert!(
+        matches!(err, QueryError::SqlNotAllowed(_)),
+        "DC-4: single semicolon not at end must be rejected as multi-statement, got {:?}",
+        err
+    );
+}
+
+/// Semicon at end with trailing whitespace should still be accepted.
+#[test]
+fn dc4_sql_allows_semicolon_with_trailing_whitespace() {
+    let qe = QueryEngine::new(SchemaRegistry::new());
+    // trailing semicolon with whitespace after trim is still just "SELECT 1;"
+    let result = qe.sql("  SELECT 1;  ");
+    assert!(
+        result.is_ok(),
+        "DC-4: trailing sem with whitespace should succeed, got {:?}",
+        result.err()
+    );
+}
+
+/// WITH CTE queries should be accepted (not rejected as non-SELECT).
+#[test]
+fn dc4_sql_allows_with_cte() {
+    let qe = QueryEngine::new(SchemaRegistry::new());
+    let result = qe.sql("WITH cte AS (SELECT 1 AS n) SELECT n FROM cte");
+    assert!(
+        result.is_ok(),
+        "DC-4: WITH CTE must be accepted, got {:?}",
+        result.err()
+    );
+}
+
+/// Non-SELECT/non-WITH statement like DROP must be rejected.
+#[test]
+fn dc4_sql_rejects_ddl() {
+    let qe = QueryEngine::new(SchemaRegistry::new());
+    let err = qe.sql("DROP TABLE x").unwrap_err();
+    assert!(
+        matches!(err, QueryError::SqlNotAllowed(_)),
+        "DC-4: DDL must be rejected"
+    );
+}
+
+/// Whitespace-only SQL must be rejected as empty.
+#[test]
+fn dc4_sql_rejects_whitespace_only() {
+    let qe = QueryEngine::new(SchemaRegistry::new());
+    let err = qe.sql("   \t\n  ").unwrap_err();
+    assert!(
+        matches!(err, QueryError::SqlNotAllowed(_)),
+        "DC-4: whitespace-only SQL must be rejected as empty"
+    );
+}
+
+// ------------------------------------------------------------------
+// engine.rs: validate() edge cases
+// ------------------------------------------------------------------
+
+/// validate with a path that has both missing table AND missing
+/// column must report only the missing table error (table check
+/// short-circuits column validation).
+#[test]
+fn dc4_validate_missing_table_short_circuits_columns() {
+    let reg = SchemaRegistry::new();
+    let qe = QueryEngine::new(reg);
+    let paths = vec![ValidatablePath {
+        path: "test.missing".into(),
+        table: "nonexistent".into(),
+        columns: vec!["some_col".into()],
+        relations: vec![],
+    }];
+    let errors = qe.validate(&paths).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].kind, ValidationErrorKind::MissingTable);
+}
+
+/// validate a path where the table exists and the relation exists.
+#[test]
+fn dc4_validate_existing_relation_passes() {
+    let mut reg = SchemaRegistry::new();
+    let spec_a = TableSpec::new("A")
+        .with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64"))
+        .unwrap();
+    let spec_b = TableSpec::new("B")
+        .with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64"))
+        .unwrap();
+    reg.register(spec_a).unwrap();
+    reg.register(spec_b).unwrap();
+    reg.add_relation(RelationEdge {
+        from: "A".into(),
+        to: "B".into(),
+        kind: RelationKind::OneToMany,
+        from_column: "id".into(),
+        to_column: None,
+    })
+    .unwrap();
+    let qe = QueryEngine::new(reg);
+    let paths = vec![ValidatablePath {
+        path: "test.existing_rel".into(),
+        table: "A".into(),
+        columns: vec![],
+        relations: vec!["A -> B".into()],
+    }];
+    let errors = qe.validate(&paths).unwrap();
+    assert!(errors.is_empty());
+}
+
+/// validate multiple paths accumulating different error kinds.
+#[test]
+fn dc4_validate_accumulates_multiple_errors() {
+    let mut reg = SchemaRegistry::new();
+    let spec = TableSpec::new("heroes")
+        .with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64"))
+        .unwrap();
+    reg.register(spec).unwrap();
+    let qe = QueryEngine::new(reg);
+    let paths = vec![
+        ValidatablePath {
+            path: "path1".into(),
+            table: "heroes".into(),
+            columns: vec!["missing_col".into()],
+            relations: vec![],
+        },
+        ValidatablePath {
+            path: "path2".into(),
+            table: "nonexistent".into(),
+            columns: vec![],
+            relations: vec![],
+        },
+    ];
+    let errors = qe.validate(&paths).unwrap();
+    assert_eq!(errors.len(), 2);
+    let kinds: Vec<_> = errors.iter().map(|e| e.kind.clone()).collect();
+    assert!(kinds.contains(&ValidationErrorKind::MissingColumn));
+    assert!(kinds.contains(&ValidationErrorKind::MissingTable));
+}
+
+// ------------------------------------------------------------------
+// inspector.rs: inspect_page no-overlap / summarise_table empty batches
+// ------------------------------------------------------------------
+
+/// inspect_page with two batches where the first page falls entirely
+/// in the first batch — the second batch has no overlap with page 0.
+/// This covers the overlap_start < overlap_end false branch in the loop.
+#[test]
+fn dc10_inspector_inspect_page_batch_no_overlap() {
+    let batch1 = sample_batch(); // 3 rows
+    let batch2 = sample_batch(); // another 3 rows (total 6)
+
+    let mut console = InspectorConsole::new();
+    console.register_schema(Arc::new(test_table_spec()));
+
+    // page 0, size 3 — only overlaps with batch1 (rows 0-2), not batch2
+    let page = console
+        .inspect_page("units", &[batch1.clone(), batch2.clone()], 0, 3)
+        .unwrap();
+    assert_eq!(page.rows.len(), 3);
+    assert_eq!(page.total_rows, 6);
+    assert!(page.has_next());
+
+    // page 1, size 3 — only overlaps with batch2 (rows 3-5), not batch1 fully
+    let page2 = console
+        .inspect_page("units", &[batch1, batch2], 1, 3)
+        .unwrap();
+    assert_eq!(page2.rows.len(), 3);
+    assert!(!page2.has_next());
+}
+
+/// summarise_table with empty batches must return zero row_count
+/// and column summaries derived from the schema.
+#[test]
+fn dc10_inspector_summarize_table_empty_batches() {
+    let mut console = InspectorConsole::new();
+    console.register_schema(Arc::new(test_table_spec()));
+
+    let summary = console.summarize_table("units", &[]).unwrap();
+    assert_eq!(summary.name, "units");
+    assert_eq!(summary.row_count, 0);
+    assert_eq!(summary.column_summaries.len(), 4);
+    for col in &summary.column_summaries {
+        assert_eq!(col.null_count, 0);
+        assert_eq!(col.value_count, 0);
+    }
+}
+
+/// inspect_page with start exactly at total_rows should return
+/// IndexOutOfBounds (edge case of the guard).
+#[test]
+fn dc10_inspector_inspect_page_start_at_total_rows() {
+    let mut console = InspectorConsole::new();
+    console.register_schema(Arc::new(test_table_spec()));
+
+    // 3 rows, page_index=1 with page_size=3 means start=3 == total_rows
+    // start > total_rows is false, but start == total_rows should
+    // still produce an empty page, not an error (since start == total_rows,
+    // NOT > total_rows). So this returns an empty page.
+    let page = console
+        .inspect_page("units", &[sample_batch()], 1, 3)
+        .unwrap();
+    // start (3) equals total_rows (3), so page is empty
+    assert_eq!(page.rows.len(), 0);
+    assert_eq!(page.total_rows, 3);
+}
+
+/// inspect_page with start > total_rows returns IndexOutOfBounds.
+/// This explicitly tests the start > total_rows branch (when page_index
+/// is large enough that start > total_rows).
+#[test]
+fn dc10_inspector_inspect_page_start_beyond_total_rows() {
+    let mut console = InspectorConsole::new();
+    console.register_schema(Arc::new(test_table_spec()));
+
+    // 3 rows, page_index=2 with page_size=3 means start=6 > total_rows=3
+    let result = console.inspect_page("units", &[sample_batch()], 2, 3);
+    assert!(matches!(result, Err(QueryError::IndexOutOfBounds(6))));
+}
+
+// ------------------------------------------------------------------
+// unified_read.rs: TableReadView::new multi-batch concat path
+// ------------------------------------------------------------------
+
+/// TableReadView::new with multiple batches concatenates them into one.
+/// This covers the batches.len() > 1 concat path.
+#[test]
+fn dc10_table_read_view_multi_batch_concat() {
+    let spec = Arc::new(test_table_spec());
+    let batch1 = sample_batch(); // 3 rows
+    let batch2 = sample_batch(); // 3 rows
+
+    let view = TableReadView::new("units", Tick(1), vec![batch1, batch2], spec, None);
+    // multi-batch concat merges into a single batch
+    assert_eq!(
+        view.batch_count(),
+        1,
+        "DC-10: multi-batch should concat into 1 batch"
+    );
+    assert_eq!(view.total_rows(), 6, "DC-10: total rows = 3 + 3 = 6");
+
+    let reader = view.first_batch_reader().unwrap();
+    assert_eq!(reader.row_count(), 6);
+}
+
+/// May-fail: concat must rebase caller-provided row positions.
+#[test]
+fn dc10_table_read_view_multi_batch_concat_rebases_position_map() {
+    let spec = Arc::new(test_table_spec());
+    let batch1 = sample_batch();
+    let batch2 = sample_batch();
+    let mut positions = RowPositionMap::new();
+    positions.insert(RowId::new(10), 0, 1);
+    positions.insert(RowId::new(20), 1, 2);
+
+    let view = TableReadView::new(
+        "units",
+        Tick(1),
+        vec![batch1, batch2],
+        spec,
+        Some(positions),
+    );
+
+    assert_eq!(
+        view.position_map().position_of(RowId::new(10)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        view.position_map().position_of(RowId::new(20)),
+        Some((0, 5))
+    );
+
+    let lookup = RowLookup::new(RowId::new(20), 0, 5);
+    let row = RowLookupView::new(lookup, view);
+    assert_eq!(row.get_i64("id").unwrap(), Some(3));
+}
+
+// ------------------------------------------------------------------
+// debug_write.rs: accessor coverage — ops_for_table empty, latest none
+// ------------------------------------------------------------------
+
+/// ops_for_table on empty journal returns empty vec.
+#[test]
+fn dc4_debug_write_ops_for_table_empty_journal() {
+    let journal = DebugWriteJournal::new(10);
+    let result = journal.ops_for_table("nonexistent");
+    assert!(result.is_empty());
+}
+
+/// latest on empty journal returns None.
+#[test]
+fn dc4_debug_write_latest_empty_journal() {
+    let journal = DebugWriteJournal::new(10);
+    assert!(journal.latest().is_none());
 }

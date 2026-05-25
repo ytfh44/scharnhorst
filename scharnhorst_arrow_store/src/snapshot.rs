@@ -31,6 +31,14 @@ impl WorldSnapshot {
         }
     }
 
+    /// Public constructor that creates a snapshot with one registered table.
+    /// Preferred over `new()` + `register_table()` from outside this crate.
+    pub fn with_table(tick: Tick, name: impl Into<String>, table: Arc<VersionedTable>) -> Self {
+        let mut snap = Self::new(tick);
+        snap.register_table(name, table);
+        snap
+    }
+
     pub fn tick(&self) -> Tick {
         self.tick
     }
@@ -47,7 +55,7 @@ impl WorldSnapshot {
         self.tables.insert(name.into(), table);
     }
 
-    pub fn get_table(&self, name: &str) -> ArrowStoreResult<Arc<VersionedTable>> {
+    pub(crate) fn get_table(&self, name: &str) -> ArrowStoreResult<Arc<VersionedTable>> {
         self.tables
             .get(name)
             .cloned()
@@ -55,32 +63,14 @@ impl WorldSnapshot {
     }
 
     /// Returns the record batches for a table at this snapshot's tick, if any.
-    pub fn table_batches(&self, name: &str) -> ArrowStoreResult<Vec<RecordBatch>> {
+    pub(crate) fn table_batches(&self, name: &str) -> ArrowStoreResult<Vec<RecordBatch>> {
         let table = self.get_table(name)?;
         let batches = table.get_version(self.tick).cloned().unwrap_or_default();
         Ok(batches)
     }
 
-    /// Returns a partition snapshot for the given table and region.
-    pub fn partition_snapshot(
-        &self,
-        table_name: &str,
-        region_id: &str,
-    ) -> ArrowStoreResult<PartitionSnapshot> {
-        self.partition_views
-            .get(table_name)
-            .and_then(|m| m.get(region_id))
-            .cloned()
-            .ok_or_else(|| {
-                crate::error::ArrowStoreError::PartitionNotFound(format!(
-                    "{}:{}",
-                    table_name, region_id
-                ))
-            })
-    }
-
     /// Registers a partition snapshot for a table.
-    pub fn register_partition_snapshot(
+    pub(crate) fn register_partition_snapshot(
         &mut self,
         table_name: impl Into<String>,
         snapshot: PartitionSnapshot,

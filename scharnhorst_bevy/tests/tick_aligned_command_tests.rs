@@ -6,7 +6,7 @@
 //! - openspec/changes/bevy-arrow-grand-strategy-engine/specs/bevy-bridge/spec.md
 //! - openspec/changes/bevy-arrow-grand-strategy-engine/specs/sim-scheduler/spec.md
 
-use scharnhorst_arrow_store::ArrowStore;
+use scharnhorst_arrow_store::{ArrowStore, WorldView};
 use scharnhorst_bevy::{
     BevyBridgeError, BevyBridgeResult, CommandBatch, CommandBufferConsumer, CommandSource,
     InputCommandBuffer, RefreshHandlerConfig, SnapshotRefreshHandler, ViewModel,
@@ -418,7 +418,10 @@ fn push_ai_always_rejects() {
     };
 
     let result = buffer.push_ai(cmd);
-    assert!(matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)));
+    assert!(matches!(
+        result,
+        Err(BevyBridgeError::NonPlayerCommandRejected)
+    ));
 }
 
 /// Test: AI command via string prefix rejected
@@ -440,7 +443,10 @@ fn ai_string_prefix_rejected() {
         },
         cmd.clone(),
     );
-    assert!(matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)));
+    assert!(matches!(
+        result,
+        Err(BevyBridgeError::NonPlayerCommandRejected)
+    ));
 
     let result = buffer.submit_player_command(
         CommandSource::Internal {
@@ -448,7 +454,10 @@ fn ai_string_prefix_rejected() {
         },
         cmd,
     );
-    assert!(matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)));
+    assert!(matches!(
+        result,
+        Err(BevyBridgeError::NonPlayerCommandRejected)
+    ));
 }
 
 // ===================================================================
@@ -668,7 +677,10 @@ fn ai_command_via_source_error() {
         },
     );
 
-    assert!(matches!(result, Err(BevyBridgeError::NonPlayerCommandRejected)));
+    assert!(matches!(
+        result,
+        Err(BevyBridgeError::NonPlayerCommandRejected)
+    ));
 }
 
 /// Test: CommandBatch empty state
@@ -744,8 +756,10 @@ fn refresh_snapshot_updates_generation() -> BevyBridgeResult<()> {
 
     // Signal and refresh
     let _ = handler.on_refresh_signal();
-    let snapshot = scharnhorst_arrow_store::WorldSnapshot::new(Tick(5));
-    handler.refresh_snapshot(snapshot)?;
+    let view = WorldView::new(Arc::new(scharnhorst_arrow_store::WorldSnapshot::new(Tick(
+        5,
+    ))));
+    handler.refresh_snapshot(view)?;
 
     // After refresh
     assert!(!handler.should_refresh()?);
@@ -774,8 +788,10 @@ fn multiple_refresh_cycles() -> BevyBridgeResult<()> {
         assert!(handler.should_refresh()?);
 
         // Bridge refreshes snapshot
-        let snapshot = scharnhorst_arrow_store::WorldSnapshot::new(Tick(i));
-        handler.refresh_snapshot(snapshot)?;
+        let view = WorldView::new(Arc::new(scharnhorst_arrow_store::WorldSnapshot::new(Tick(
+            i,
+        ))));
+        handler.refresh_snapshot(view)?;
 
         assert!(!handler.should_refresh()?);
         assert_eq!(handler.current_generation()?, i);

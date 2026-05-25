@@ -1,5 +1,5 @@
 use bevy::prelude::{Entity, Query, Resource};
-use scharnhorst_arrow_store::WorldSnapshot;
+use scharnhorst_arrow_store::WorldView;
 use scharnhorst_core::{RowId, Tick};
 use scharnhorst_query::engine::QueryEngine;
 use scharnhorst_query::unified_read::ReadRequest;
@@ -12,7 +12,7 @@ use crate::view_of::ViewOf;
 
 #[derive(Debug, Clone, Default)]
 struct ViewModelState {
-    snapshot: Option<Arc<WorldSnapshot>>,
+    snapshot: Option<WorldView>,
     latest_tick: Option<Tick>,
 }
 
@@ -36,7 +36,7 @@ impl ViewModel {
         Self::default()
     }
 
-    pub fn refresh(&self, snapshot: Arc<WorldSnapshot>, generation: u64) -> BevyBridgeResult<()> {
+    pub fn refresh(&self, snapshot: WorldView, generation: u64) -> BevyBridgeResult<()> {
         let mut state = self
             .state
             .lock()
@@ -49,7 +49,7 @@ impl ViewModel {
         Ok(())
     }
 
-    pub fn snapshot(&self) -> BevyBridgeResult<Option<Arc<WorldSnapshot>>> {
+    pub fn snapshot(&self) -> BevyBridgeResult<Option<WorldView>> {
         let state = self
             .state
             .lock()
@@ -204,20 +204,31 @@ impl SyncState {
             .map_err(|e| BevyBridgeError::LockPoisoned(e.to_string()))?;
 
         let mut synced = 0usize;
+        let mut errors: Vec<String> = Vec::new();
         let entities_to_sync: Vec<Entity> = dirty.iter().copied().collect();
 
         for entity in entities_to_sync {
             if let Some(entry) = models.get(&entity) {
-                let _table_view =
-                    view_model.read_table_via_query_engine(query_engine, &entry.table)?;
-                // In full implementation, component-specific sync fields
-                // would be applied here. For now, we mark the sync complete.
-                synced = synced.saturating_add(1);
+                match view_model.read_table_via_query_engine(query_engine, &entry.table) {
+                    Ok(_) => {
+                        // In full implementation, component-specific sync fields
+                        // would be applied here. For now, we mark the sync complete.
+                        synced = synced.saturating_add(1);
+                    }
+                    Err(e) => {
+                        errors.push(e.to_string());
+                    }
+                }
             }
         }
 
         dirty.clear();
-        Ok(synced)
+
+        if errors.is_empty() {
+            Ok(synced)
+        } else {
+            Err(BevyBridgeError::SyncFailed(errors.join("; ")))
+        }
     }
 
     pub fn clear_dirty(&self) -> BevyBridgeResult<()> {
@@ -297,7 +308,8 @@ mod tests {
     fn view_model_refresh_updates_state() -> BevyBridgeResult<()> {
         let vm = ViewModel::new();
         let snapshot = Arc::new(scharnhorst_arrow_store::WorldSnapshot::new(Tick(7)));
-        vm.refresh(snapshot.clone(), 3)?;
+        let view = WorldView::new(snapshot);
+        vm.refresh(view, 3)?;
         assert_eq!(vm.generation()?, 3);
         assert_eq!(vm.latest_tick()?, Some(Tick(7)));
         assert!(vm.snapshot()?.is_some());

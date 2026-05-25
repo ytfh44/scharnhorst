@@ -1,4 +1,4 @@
-use scharnhorst_arrow_store::{ArrowStore, WorldSnapshot};
+use scharnhorst_arrow_store::{ArrowStore, WorldView};
 use scharnhorst_query::engine::QueryEngine;
 use scharnhorst_scheduler::refresh_signal::{RefreshCallback, RefreshSignalHandle};
 use scharnhorst_scheduler::Scheduler;
@@ -40,11 +40,10 @@ impl SnapshotRefreshHandler {
         Ok(self.signal_received.load(Ordering::Acquire))
     }
 
-    pub fn refresh_snapshot(&self, new_snapshot: WorldSnapshot) -> BevyBridgeResult<()> {
+    pub fn refresh_snapshot(&self, new_view: WorldView) -> BevyBridgeResult<()> {
         let generation = self.view_model.generation()?.saturating_add(1);
 
-        self.view_model
-            .refresh(Arc::new(new_snapshot), generation)?;
+        self.view_model.refresh(new_view, generation)?;
 
         self.signal_received.store(false, Ordering::Release);
 
@@ -147,8 +146,10 @@ mod tests {
         handler.on_refresh_signal()?;
         assert!(handler.should_refresh()?);
 
-        let snapshot = WorldSnapshot::new(Tick(7));
-        handler.refresh_snapshot(snapshot)?;
+        let view = WorldView::new(Arc::new(scharnhorst_arrow_store::WorldSnapshot::new(Tick(
+            7,
+        ))));
+        handler.refresh_snapshot(view)?;
 
         assert!(!handler.should_refresh()?);
         assert_eq!(handler.current_generation()?, 1);

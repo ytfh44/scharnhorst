@@ -13,6 +13,10 @@ scharnhorst_arrow_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true, optional = true }
+
+[features]
+metrics = ["tracing"]
 
 [dev-dependencies]
 arrow-array = { workspace = true }

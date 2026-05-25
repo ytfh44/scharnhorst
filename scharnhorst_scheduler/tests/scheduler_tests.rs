@@ -8,8 +8,8 @@ use scharnhorst_journal::diff::Diff;
 use scharnhorst_journal::journal::Journal;
 use scharnhorst_query::engine::QueryEngine;
 use scharnhorst_scheduler::{
-    BoxedSystem, DeterministicRng, Phase, RefreshCallback, Scheduler, SchedulerError,
-    SchedulerResult, SimSystem, SystemRegistration,
+    BoxedSystem, DeterministicRng, Phase, RefreshCallback, RefreshSignalHandle, Scheduler,
+    SchedulerError, SchedulerResult, SimSystem, SystemRegistration,
 };
 use scharnhorst_schema::SchemaRegistry;
 
@@ -20,6 +20,13 @@ use scharnhorst_schema::SchemaRegistry;
 fn empty_query_engine() -> QueryEngine {
     let mut registry = SchemaRegistry::new();
     registry.freeze();
+    QueryEngine::new(registry)
+}
+
+/// QueryEngine backed by an unfrozen schema — used to test
+/// SchemaNotFrozen rejection in initialize().
+fn unfrozen_query_engine() -> QueryEngine {
+    let registry = SchemaRegistry::new();
     QueryEngine::new(registry)
 }
 
@@ -65,7 +72,9 @@ fn make_scheduler_with_table(table_name: &str) -> Scheduler {
         row: RowId::new(1),
         values,
     };
-    journal.submit_diff(insert, &JournalSubmitToken::new()).unwrap();
+    journal
+        .submit_diff(insert, &JournalSubmitToken::new())
+        .unwrap();
     journal.commit().unwrap();
     Scheduler::new(journal, empty_query_engine())
 }
@@ -831,12 +840,16 @@ fn deterministic_rng_across_replays() {
 #[test]
 fn register_system_with_duplicate_name_rejected() {
     let scheduler = empty_scheduler();
-    let first: BoxedSystem = Arc::new(NoOpSystem::new("shared_name", Phase::Economy)
-        .with_reads(&["eco"])
-        .with_writes(&["eco_out"]));
-    let second: BoxedSystem = Arc::new(NoOpSystem::new("shared_name", Phase::Diplomacy)
-        .with_reads(&["dip"])
-        .with_writes(&["dip_out"]));
+    let first: BoxedSystem = Arc::new(
+        NoOpSystem::new("shared_name", Phase::Economy)
+            .with_reads(&["eco"])
+            .with_writes(&["eco_out"]),
+    );
+    let second: BoxedSystem = Arc::new(
+        NoOpSystem::new("shared_name", Phase::Diplomacy)
+            .with_reads(&["dip"])
+            .with_writes(&["dip_out"]),
+    );
 
     scheduler.register_system(first).unwrap();
     assert_eq!(scheduler.system_ids().unwrap().len(), 1);
@@ -871,8 +884,11 @@ fn atomic_commit_without_diffs_advances_generation() {
     let result = scheduler.atomic_commit().unwrap();
     assert_eq!(result.diff_count, 0);
     let after = scheduler.current_generation().unwrap();
-    assert_eq!(after, before + 1,
-        "atomic_commit must advance generation even with no diffs");
+    assert_eq!(
+        after,
+        before + 1,
+        "atomic_commit must advance generation even with no diffs"
+    );
 }
 
 /// Would fail: registering a system with a valid Phase must succeed
@@ -901,10 +917,319 @@ fn system_phase_not_registered_error() {
 
     // Verify all 5 systems registered, each with correct phase.
     let by_phase = scheduler.systems_by_phase().unwrap();
-    assert_eq!(by_phase.len(), 5,
-        "all 5 Phase variants should be accepted by the scheduler");
+    assert_eq!(
+        by_phase.len(),
+        5,
+        "all 5 Phase variants should be accepted by the scheduler"
+    );
     for (phase, ids) in &by_phase {
-        assert_eq!(ids.len(), 1,
-            "phase {:?} should have exactly 1 system", phase);
+        assert_eq!(
+            ids.len(),
+            1,
+            "phase {:?} should have exactly 1 system",
+            phase
+        );
     }
+}
+
+// ===================================================================
+// Refresh signal bus edge-case tests
+// ===================================================================
+
+#[test]
+fn refresh_signal_bus_unregister_invalid_handle_returns_error() {
+    let bus = scharnhorst_scheduler::RefreshSignalBus::new();
+    let fake = RefreshSignalHandle("nonexistent".to_owned());
+    let err = bus.unregister(&fake).unwrap_err();
+    assert!(
+        matches!(err, SchedulerError::RefreshBusLookupFailed(ref name) if name == "nonexistent"),
+        "expected RefreshBusLookupFailed, got {err:?}"
+    );
+}
+
+#[test]
+fn refresh_signal_bus_unregister_by_name_not_found_returns_error() {
+    let bus = scharnhorst_scheduler::RefreshSignalBus::new();
+    let err = bus.unregister_by_name("nonexistent").unwrap_err();
+    assert!(
+        matches!(err, SchedulerError::RefreshBusLookupFailed(ref name) if name == "nonexistent"),
+        "expected RefreshBusLookupFailed, got {err:?}"
+    );
+}
+
+#[test]
+fn refresh_signal_bus_unregister_by_name_succeeds() {
+    let bus = scharnhorst_scheduler::RefreshSignalBus::new();
+    let noop: RefreshCallback = Arc::new(|_, _| Ok(()));
+    bus.register("target", noop).unwrap();
+    assert_eq!(bus.consumer_count().unwrap(), 1);
+    bus.unregister_by_name("target").unwrap();
+    assert_eq!(bus.consumer_count().unwrap(), 0);
+}
+
+#[test]
+fn refresh_signal_bus_broadcast_error_includes_source() {
+    let bus = scharnhorst_scheduler::RefreshSignalBus::new();
+    let cb: RefreshCallback =
+        Arc::new(|_, _| Err(SchedulerError::Generic("inner failure".to_owned())));
+    bus.register("faulty", cb).unwrap();
+    let err = bus.broadcast(0, 0).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("faulty"),
+        "message should name consumer, got: {msg}"
+    );
+    assert!(
+        msg.contains("inner failure"),
+        "message should include source, got: {msg}"
+    );
+    assert!(
+        msg.contains("refresh signal failed"),
+        "message should describe error type, got: {msg}"
+    );
+}
+
+#[test]
+fn refresh_signal_bus_debug_format_includes_consumer_count() {
+    let bus = scharnhorst_scheduler::RefreshSignalBus::new();
+    let debug = format!("{:?}", bus);
+    assert!(
+        debug.contains("RefreshSignalBus"),
+        "Debug should include struct name, got: {debug}"
+    );
+    assert!(
+        debug.contains("consumer_count"),
+        "Debug should include field name, got: {debug}"
+    );
+    assert!(
+        debug.contains("0"),
+        "Debug should show count 0 for empty bus, got: {debug}"
+    );
+
+    let noop: RefreshCallback = Arc::new(|_, _| Ok(()));
+    bus.register("a", noop).unwrap();
+    let debug = format!("{:?}", bus);
+    assert!(
+        debug.contains("1"),
+        "Debug should show updated count, got: {debug}"
+    );
+}
+
+// ===================================================================
+// May-fail edge-case tests (uncovered-branch coverage)
+// ===================================================================
+
+/// Would fail: `initialize()` must reject when the schema registry is
+/// not yet frozen.
+///
+/// Branch: `if !self.query_engine.is_schema_frozen()... → Err(SchemaNotFrozen)`
+/// in `Scheduler::initialize`.
+#[test]
+fn initialize_rejects_unfrozen_schema() {
+    let scheduler = Scheduler::new(empty_journal(), unfrozen_query_engine());
+    // Register a system with valid read/write tables so the
+    // "no tables declared" check does not trigger first.
+    let sys = NoOpSystem::new("valid", Phase::Economy).with_reads(&["eco"]);
+    scheduler.register_system(Arc::new(sys)).unwrap();
+
+    let err = scheduler.initialize().unwrap_err();
+    assert!(
+        matches!(err, SchedulerError::SchemaNotFrozen),
+        "expected SchemaNotFrozen, got {err:?}"
+    );
+    // Must remain uninitialized.
+    assert!(!scheduler.is_initialized().unwrap());
+}
+
+/// Would fail: a system whose `execute()` returns `Err` must propagate
+/// that error through `run_phase → run_phases → tick`.
+///
+/// Branch: `system.execute(...)?` → error path in `run_phase`.
+/// Also covers: the `?` on `self.run_phases(tick)` in `tick`.
+#[test]
+fn system_execute_error_propagates_from_tick() {
+    let scheduler = empty_scheduler();
+
+    // A system that always fails during execute.
+    struct FailingSystem {
+        id: &'static str,
+        phase: Phase,
+    }
+    impl SimSystem for FailingSystem {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn phase(&self) -> Phase {
+            self.phase
+        }
+        fn read_tables(&self) -> Vec<String> {
+            vec!["any".to_owned()]
+        }
+        fn write_tables(&self) -> Vec<String> {
+            vec![]
+        }
+        fn execute(
+            &self,
+            _rng: &mut DeterministicRng,
+            _query: &QueryEngine,
+            _phase: Phase,
+            _tick: u64,
+        ) -> SchedulerResult<Vec<Diff>> {
+            Err(SchedulerError::Generic("execute failure".to_owned()))
+        }
+    }
+
+    scheduler
+        .register_system(Arc::new(FailingSystem {
+            id: "fail",
+            phase: Phase::Economy,
+        }))
+        .unwrap();
+    scheduler.initialize().unwrap();
+
+    let tick_before = scheduler.current_tick().unwrap();
+    let gen_before = scheduler.current_generation().unwrap();
+
+    let err = scheduler.tick().unwrap_err();
+    assert!(
+        matches!(err, SchedulerError::Generic(ref msg) if msg == "execute failure"),
+        "expected execute failure error, got {err:?}"
+    );
+
+    // Tick and generation must NOT advance — atomic_commit was never reached.
+    assert_eq!(
+        scheduler.current_tick().unwrap(),
+        tick_before,
+        "tick must not advance after execute error"
+    );
+    assert_eq!(
+        scheduler.current_generation().unwrap(),
+        gen_before,
+        "generation must not advance after execute error"
+    );
+}
+
+/// Would fail: when `run_phases` fails before `atomic_commit`, commands
+/// consumed at the tick boundary must be restored.
+///
+/// The rollback logic in `tick()` only fires in the `Err` arm of
+/// `atomic_commit`. If `run_phases` fails, consumed commands can be lost
+/// unless `tick()` treats the whole tick as one internal SAGA.
+#[test]
+fn commands_restore_when_run_phases_fails_before_commit() {
+    let scheduler = empty_scheduler();
+
+    struct FailingSystem;
+    impl SimSystem for FailingSystem {
+        fn id(&self) -> &str {
+            "fail"
+        }
+        fn phase(&self) -> Phase {
+            Phase::Economy
+        }
+        fn read_tables(&self) -> Vec<String> {
+            vec!["any".to_owned()]
+        }
+        fn write_tables(&self) -> Vec<String> {
+            vec![]
+        }
+        fn execute(
+            &self,
+            _rng: &mut DeterministicRng,
+            _query: &QueryEngine,
+            _phase: Phase,
+            _tick: u64,
+        ) -> SchedulerResult<Vec<Diff>> {
+            Err(SchedulerError::Generic("boom".to_owned()))
+        }
+    }
+
+    scheduler.register_system(Arc::new(FailingSystem)).unwrap();
+    scheduler.initialize().unwrap();
+
+    let env = CommandEnvelope::new(
+        Tick::ZERO,
+        "bridge",
+        Command::Raw {
+            domain: "input".to_owned(),
+            payload: serde_json::json!({}),
+        },
+    );
+    scheduler.enqueue_command(env).unwrap();
+    assert_eq!(scheduler.pending_command_count().unwrap(), 1);
+
+    let _err = scheduler.tick().unwrap_err();
+
+    assert_eq!(
+        scheduler.pending_command_count().unwrap(),
+        1,
+        "commands consumed before run_phases failure must be restored"
+    );
+}
+
+// ===================================================================
+// Telemetry tests (metrics feature enabled)
+// ===================================================================
+
+#[cfg(feature = "metrics")]
+mod telemetry_tests {
+    use scharnhorst_scheduler::telemetry::{emit_diff_count, emit_system_event, DurationGuard};
+
+    #[test]
+    fn tick_span_construct_and_drop() {
+        let guard = DurationGuard::tick_span(0);
+        drop(guard);
+    }
+
+    #[test]
+    fn phase_span_construct_and_drop() {
+        let guard = DurationGuard::phase_span(0, "test_phase");
+        drop(guard);
+    }
+
+    #[test]
+    fn emit_system_event_no_panic() {
+        emit_system_event(0, "test_phase", "test_system", 42);
+    }
+
+    #[test]
+    fn emit_diff_count_no_panic() {
+        emit_diff_count(0, 5);
+    }
+
+    #[test]
+    fn duration_guard_drop_records_duration() {
+        // Scope-bound drop: the guard records duration_micros on its span when dropped.
+        {
+            let _guard = DurationGuard::tick_span(7);
+            // Guard is dropped here at end of scope.
+        }
+        // No assertion needed for crash-only test — if drop panics, the test fails.
+    }
+
+    #[test]
+    fn explicit_drop_closes_span_without_double_free() {
+        // I-SCHED-SPAN-DROP-CLOSE: explicit drop must close the span
+        // without double-free or other issues.
+        let guard = DurationGuard::tick_span(42);
+        drop(guard);
+        // Guard is consumed by explicit drop. No further drop should occur.
+        // If this compiles and runs without panic, the invariant holds.
+    }
+}
+
+#[test]
+fn noop_duration_guard_compiles_and_does_not_panic() {
+    // When metrics is disabled, DurationGuard is a ZST with noop constructors.
+    // This test ensures both variants compile and run.
+    use scharnhorst_scheduler::telemetry::{emit_diff_count, emit_system_event, DurationGuard};
+
+    let guard = DurationGuard::tick_span(0);
+    drop(guard);
+
+    let guard = DurationGuard::phase_span(0, "test");
+    drop(guard);
+
+    emit_system_event(0, "phase", "system", 0);
+    emit_diff_count(0, 0);
 }

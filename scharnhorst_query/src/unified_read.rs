@@ -32,12 +32,20 @@ impl TableReadView {
         position_map: Option<RowPositionMap>,
     ) -> Self {
         let table_name = table_name.into();
+        let original_row_counts: Vec<usize> = batches.iter().map(|b| b.num_rows()).collect();
+        let mut merged_batches = false;
         let batches = if batches.len() > 1 {
             let merged_schema = batches[0].schema();
             match concat_batches(&merged_schema, &batches) {
-                Ok(merged) => vec![merged],
+                Ok(merged) => {
+                    merged_batches = true;
+                    vec![merged]
+                }
                 Err(e) => {
+                    #[cfg(feature = "metrics")]
                     tracing::warn!("concat_batches failed for table '{}': {}", table_name, e);
+                    #[cfg(not(feature = "metrics"))]
+                    let _ = e;
                     batches
                 }
             }
@@ -45,7 +53,11 @@ impl TableReadView {
             batches
         };
 
-        let position_map = position_map.unwrap_or_else(|| Self::build_position_map(&batches));
+        let position_map = match position_map {
+            Some(map) if merged_batches => Self::rebase_position_map(&map, &original_row_counts),
+            Some(map) => map,
+            None => Self::build_position_map(&batches),
+        };
 
         Self {
             table_name,
@@ -172,6 +184,29 @@ impl TableReadView {
             }
         }
         map
+    }
+
+    fn rebase_position_map(map: &RowPositionMap, row_counts: &[usize]) -> RowPositionMap {
+        let mut batch_offsets = Vec::with_capacity(row_counts.len());
+        let mut offset = 0usize;
+        for row_count in row_counts {
+            batch_offsets.push(offset);
+            offset = offset.saturating_add(*row_count);
+        }
+
+        let mut rebased = RowPositionMap::new();
+        for row_id in map.row_ids() {
+            if let Some((batch_idx, row_offset)) = map.position_of(row_id) {
+                if let (Some(batch_base), Some(row_count)) =
+                    (batch_offsets.get(batch_idx), row_counts.get(batch_idx))
+                {
+                    if row_offset < *row_count {
+                        rebased.insert(row_id, 0, batch_base.saturating_add(row_offset));
+                    }
+                }
+            }
+        }
+        rebased
     }
 }
 

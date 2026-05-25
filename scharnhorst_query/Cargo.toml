@@ -13,11 +13,16 @@ scharnhorst_arrow_store = { workspace = true }
 scharnhorst_journal = { workspace = true }
 datafusion = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
+tracing = { workspace = true, optional = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 serde = { workspace = true }
+pollster = "0.3"
+
+[features]
+metrics = ["tracing"]
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros"] }

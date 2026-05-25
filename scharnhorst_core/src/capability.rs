@@ -133,14 +133,14 @@ impl CommitToken {
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::new_without_default)]
 impl SimReadToken {
     pub fn new() -> Self {
         Self { _private: () }
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::new_without_default)]
 impl JournalSubmitToken {
     pub fn new() -> Self {
         Self { _private: () }

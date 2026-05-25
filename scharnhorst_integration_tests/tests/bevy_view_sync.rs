@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use scharnhorst_arrow_store::{ArrowStore, InitStore, MutationMode};
+use scharnhorst_arrow_store::{ArrowStore, InitStore, MutationMode, WorldView};
 use scharnhorst_bevy::{CommandSource, SnapshotRefreshHandler, ViewModel};
 use scharnhorst_core::Tick;
 use scharnhorst_integration_tests::harness::TestWorld;
@@ -16,8 +16,9 @@ fn view_model_generation_bumps_on_refresh() {
     let vm = ViewModel::new();
     let before = vm.generation().expect("read generation");
 
-    let snapshot = scharnhorst_arrow_store::WorldSnapshot::new(Tick(1));
-    vm.refresh(Arc::new(snapshot), 1).expect("refresh");
+    let snapshot = Arc::new(scharnhorst_arrow_store::WorldSnapshot::new(Tick(1)));
+    let view = WorldView::new(snapshot);
+    vm.refresh(view, 1).expect("refresh");
 
     let after = vm.generation().expect("read generation after");
     assert_eq!(after, before.saturating_add(1));
@@ -26,8 +27,9 @@ fn view_model_generation_bumps_on_refresh() {
 #[test]
 fn view_model_tick_matches_refreshed_snapshot() {
     let vm = ViewModel::new();
-    let snapshot = scharnhorst_arrow_store::WorldSnapshot::new(Tick(5));
-    vm.refresh(Arc::new(snapshot), 2).expect("refresh");
+    let snapshot = Arc::new(scharnhorst_arrow_store::WorldSnapshot::new(Tick(5)));
+    let view = WorldView::new(snapshot);
+    vm.refresh(view, 2).expect("refresh");
 
     let tick = vm.latest_tick().expect("read tick").expect("some tick");
     assert_eq!(tick, Tick(5));
@@ -50,9 +52,7 @@ fn refresh_handler_updates_view_model() {
     init_store
         .create_table(&spec, MutationMode::AppendOnly)
         .expect("create table in arrow store");
-    let commit_store = init_store
-        .into_simulation()
-        .expect("advance to simulation");
+    let commit_store = init_store.into_simulation().expect("advance to simulation");
     commit_store
         .generate_snapshot(Tick(5))
         .expect("generate snapshot at tick 5");

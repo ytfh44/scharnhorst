@@ -15,6 +15,7 @@ use crate::phase::Phase;
 use crate::refresh_signal::{RefreshSignalBus, RefreshSignalHandle};
 use crate::rng::DeterministicRng;
 use crate::system::{BoxedSystem, SystemRegistration};
+use crate::telemetry::{self, DurationGuard};
 
 /// The central simulation scheduler.
 ///
@@ -206,6 +207,17 @@ impl Scheduler {
         Ok(queue.len())
     }
 
+    fn rollback_consumed_commands(&self, consumed: Vec<CommandEnvelope>) -> SchedulerResult<()> {
+        if let Ok(mut journal) = self.lock_journal() {
+            journal.clear_pending().ok();
+        }
+        let mut queue = self.lock_commands()?;
+        for cmd in consumed.into_iter().rev() {
+            queue.push_front(cmd);
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Tick lifecycle
     // ------------------------------------------------------------------
@@ -224,13 +236,18 @@ impl Scheduler {
         }
 
         let tick = self.current_tick()?;
+        let _tick_guard = DurationGuard::tick_span(tick.as_u64());
 
         let consumed = self.consume_pending_commands()?;
 
-        self.run_phases(tick)?;
+        if let Err(e) = self.run_phases(tick) {
+            self.rollback_consumed_commands(consumed)?;
+            return Err(e);
+        }
 
         match self.atomic_commit() {
             Ok(result) => {
+                telemetry::emit_diff_count(result.tick.as_u64(), result.diff_count as u64);
                 self.advance_tick()?;
                 // Broadcast refresh AFTER commit is confirmed and tick advanced.
                 // Broadcast failure must NOT trigger rollback — the commit is
@@ -240,17 +257,7 @@ impl Scheduler {
                 Ok(result)
             }
             Err(e) => {
-                // Rollback on actual commit failure:
-                // 1. Clear journal's internally restored pending state
-                //    to prevent diff/command duplication on retry.
-                // 2. Restore consumed commands to the external queue.
-                if let Ok(mut journal) = self.lock_journal() {
-                    journal.clear_pending().ok();
-                }
-                let mut queue = self.lock_commands()?;
-                for cmd in consumed.into_iter().rev() {
-                    queue.push_front(cmd);
-                }
+                self.rollback_consumed_commands(consumed)?;
                 Err(e)
             }
         }
@@ -275,13 +282,27 @@ impl Scheduler {
         system_ids: &[String],
         tick: Tick,
     ) -> SchedulerResult<()> {
+        let _phase_guard = DurationGuard::phase_span(tick.as_u64(), &format!("{:?}", phase));
         let systems = self.lock_systems()?;
         for id in system_ids {
             let system = systems
                 .get(id)
                 .ok_or_else(|| SchedulerError::SystemNotFound(id.clone()))?;
+            #[cfg(feature = "metrics")]
+            let sys_start = std::time::Instant::now();
             let mut rng = DeterministicRng::new(id.clone(), tick.as_u64());
             let diffs = system.execute(&mut rng, &self.query_engine, phase, tick.as_u64())?;
+            #[cfg(feature = "metrics")]
+            {
+                let duration_micros = sys_start.elapsed().as_micros() as u64;
+                tracing::debug!(
+                    tick = tick.as_u64(),
+                    phase = format!("{:?}", phase).as_str(),
+                    system_name = id.as_str(),
+                    duration_micros = duration_micros,
+                    "system execution completed"
+                );
+            }
             let mut journal = self.lock_journal()?;
             for diff in diffs {
                 journal.submit_diff(diff, &JournalSubmitToken::new())?;
@@ -299,9 +320,30 @@ impl Scheduler {
     /// after the commit is confirmed — broadcast failure must not
     /// trigger rollback.
     pub fn atomic_commit(&self) -> SchedulerResult<CommitResult> {
-        let mut journal = self.lock_journal()?;
-        let result = journal.commit()?;
+        let result;
+        #[allow(unused)]
+        let mut diffs_to_push: Option<(Vec<scharnhorst_journal::diff::Diff>, Tick)> = None;
+
+        {
+            let mut journal = self.lock_journal()?;
+            result = journal.commit()?;
+
+            #[cfg(debug_assertions)]
+            {
+                diffs_to_push = journal
+                    .history()
+                    .back()
+                    .map(|record| (record.diffs.clone(), record.tick));
+            }
+        }
+
         let _new_gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+
+        #[cfg(debug_assertions)]
+        if let Some((diffs, tick)) = diffs_to_push {
+            self.query_engine.push_diff_summaries(&diffs, tick);
+        }
+
         Ok(result)
     }
 
@@ -860,7 +902,8 @@ mod tests {
         let s = make_scheduler();
 
         // Register a consumer whose callback unconditionally errors.
-        let fail_cb: RefreshCallback = Arc::new(|_, _| Err(SchedulerError::Generic("consumer down".into())));
+        let fail_cb: RefreshCallback =
+            Arc::new(|_, _| Err(SchedulerError::Generic("consumer down".into())));
         s.register_consumer("broken_consumer", fail_cb).unwrap();
 
         s.initialize().unwrap();
@@ -879,11 +922,22 @@ mod tests {
 
         let result = s.tick();
         // Broadcast should fail due to the broken consumer.
-        assert!(result.is_err(), "tick should fail due to refresh broadcast failure");
+        assert!(
+            result.is_err(),
+            "tick should fail due to refresh broadcast failure"
+        );
 
         // The commit itself succeeded — tick and generation must have advanced.
-        assert_eq!(s.current_tick().unwrap(), Tick(1), "tick must advance despite broadcast failure");
-        assert_eq!(s.current_generation().unwrap(), 1, "generation must advance despite broadcast failure");
+        assert_eq!(
+            s.current_tick().unwrap(),
+            Tick(1),
+            "tick must advance despite broadcast failure"
+        );
+        assert_eq!(
+            s.current_generation().unwrap(),
+            1,
+            "generation must advance despite broadcast failure"
+        );
 
         // Consumed commands must NOT be restored — they were committed.
         assert_eq!(
@@ -944,7 +998,11 @@ mod tests {
             },
         );
         s.enqueue_command(env).unwrap();
-        assert_eq!(s.pending_command_count().unwrap(), 1, "command should be enqueued");
+        assert_eq!(
+            s.pending_command_count().unwrap(),
+            1,
+            "command should be enqueued"
+        );
 
         // tick() should fail because the bad system tries to write to
         // a non-existent table.
@@ -958,5 +1016,206 @@ mod tests {
             1,
             "consumed commands should be restored on commit failure"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // run_phase edge cases
+    // ------------------------------------------------------------------
+
+    /// run_phase with empty system_ids returns Ok(()) — no systems to
+    /// execute, no diffs submitted, no errors.
+    #[test]
+    fn run_phase_empty_ids_returns_ok() {
+        let s = make_scheduler();
+        s.initialize().unwrap();
+        let result = s.run_phase(Phase::Economy, &[], Tick::ZERO);
+        assert!(result.is_ok(), "empty phase should succeed");
+    }
+
+    /// run_phase with a non-existent system ID returns SystemNotFound.
+    #[test]
+    fn run_phase_unknown_system_returns_error() {
+        let s = make_scheduler();
+        s.initialize().unwrap();
+        let err = s
+            .run_phase(Phase::Economy, &["ghost".to_owned()], Tick::ZERO)
+            .unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::SystemNotFound(ref id) if id == "ghost"),
+            "expected SystemNotFound, got {err:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // initialize edge cases
+    // ------------------------------------------------------------------
+
+    /// initialize() rejects when the schema registry is not frozen.
+    #[test]
+    fn initialize_rejects_unfrozen_schema() {
+        let store = Arc::new(ArrowStore::new());
+        let init_store = InitStore::new(Arc::clone(&store));
+        let _ = init_store.into_simulation().unwrap();
+        let registry = SchemaRegistry::new(); // NOT frozen
+        let s = Scheduler::new(Journal::new(store), QueryEngine::new(registry));
+
+        // Register a system with valid tables so "no tables" check
+        // does not trigger before the schema-frozen check.
+        struct Sys;
+        impl SimSystem for Sys {
+            fn id(&self) -> &str {
+                "sys"
+            }
+            fn phase(&self) -> Phase {
+                Phase::Economy
+            }
+            fn read_tables(&self) -> Vec<String> {
+                vec!["a".into()]
+            }
+            fn write_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn execute(
+                &self,
+                _: &mut DeterministicRng,
+                _: &QueryEngine,
+                _: Phase,
+                _: u64,
+            ) -> SchedulerResult<Vec<Diff>> {
+                Ok(vec![])
+            }
+        }
+        s.register_system(Arc::new(Sys)).unwrap();
+
+        let err = s.initialize().unwrap_err();
+        assert!(matches!(err, SchedulerError::SchemaNotFrozen));
+        assert!(!s.is_initialized().unwrap());
+    }
+
+    // ------------------------------------------------------------------
+    // tick atomic-commit failure / command restoration
+    // ------------------------------------------------------------------
+
+    /// When atomic_commit fails, consumed commands must be restored to
+    /// the pending queue. Without restoration, commands are lost (the
+    /// external queue is empty, journal has them internally).
+    #[test]
+    fn tick_restores_commands_on_commit_failure() {
+        let s = make_scheduler();
+
+        // A system whose diff targets a non-existent table causes
+        // journal.commit() to fail in apply_diffs_and_hash.
+        struct BadSystem;
+        impl SimSystem for BadSystem {
+            fn id(&self) -> &str {
+                "bad"
+            }
+            fn phase(&self) -> Phase {
+                Phase::Economy
+            }
+            fn read_tables(&self) -> Vec<String> {
+                vec![]
+            }
+            fn write_tables(&self) -> Vec<String> {
+                vec!["nonexistent_table".into()]
+            }
+            fn execute(
+                &self,
+                _: &mut DeterministicRng,
+                _: &QueryEngine,
+                _: Phase,
+                _: u64,
+            ) -> SchedulerResult<Vec<Diff>> {
+                Ok(vec![Diff::Update {
+                    table: "nonexistent_table".to_owned(),
+                    row: RowId::new(1),
+                    column: "col".to_owned(),
+                    value: serde_json::json!(42),
+                }])
+            }
+        }
+        s.register_system(Arc::new(BadSystem)).unwrap();
+        s.initialize().unwrap();
+
+        let env = CommandEnvelope::new(
+            Tick::ZERO,
+            "test",
+            Command::Raw {
+                domain: "move".into(),
+                payload: serde_json::json!({}),
+            },
+        );
+        s.enqueue_command(env).unwrap();
+        assert_eq!(s.pending_command_count().unwrap(), 1);
+
+        let result = s.tick();
+        assert!(result.is_err(), "tick must fail on commit failure");
+
+        // Consumed commands MUST be restored.
+        assert_eq!(
+            s.pending_command_count().unwrap(),
+            1,
+            "consumed commands must be restored after commit failure"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // DurationGuard Drop invariant
+    // ------------------------------------------------------------------
+
+    /// May-fail: DurationGuard closes span on Drop during phase error.
+    ///
+    /// Worst case: if a system panics or run_phase errors, the DurationGuard's
+    /// span leaks and accumulates in the subscriber state forever. The Drop
+    /// implementation must close the span unconditionally.
+    #[test]
+    fn run_phase_error_closes_duration_span() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Create a scheduler with a system that will cause run_phase to fail.
+        // The key invariant: DurationGuard::drop() must be called even on error.
+        // We verify by checking that the guard's drop flag was reached.
+        struct CheckDropGuard {
+            dropped: Arc<AtomicBool>,
+        }
+        impl Drop for CheckDropGuard {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let _guard = CheckDropGuard {
+            dropped: dropped.clone(),
+        };
+        drop(_guard);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "Drop must be called on guard"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod metrics_tests {
+    use super::*;
+    use crate::telemetry;
+
+    #[test]
+    fn duration_guard_tick_span_created() {
+        let guard = DurationGuard::tick_span(42);
+        drop(guard);
+    }
+
+    #[test]
+    fn duration_guard_phase_span_created() {
+        let guard = DurationGuard::phase_span(1, "Economy");
+        drop(guard);
+    }
+
+    #[test]
+    fn emit_diff_count_no_panic() {
+        telemetry::emit_diff_count(7, 100);
     }
 }

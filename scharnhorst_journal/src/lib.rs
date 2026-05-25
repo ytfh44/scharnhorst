@@ -10,6 +10,7 @@ pub mod diff;
 pub mod error;
 pub mod journal;
 pub mod save_journal;
+pub mod telemetry;
 
 // SQL parser module is only available in debug builds
 #[cfg(debug_assertions)]

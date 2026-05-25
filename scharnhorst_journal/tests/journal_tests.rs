@@ -1,10 +1,13 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use scharnhorst_arrow_store::{ArrowStore, InitStore, MutationMode};
-use scharnhorst_core::{JournalSubmitToken, RowId, Tick};
+use arrow_array::RecordBatch;
+use scharnhorst_arrow_store::{
+    ArrowStore, InitStore, MutationMode, SnapshotIngestRollback, SnapshotIngestor,
+};
+use scharnhorst_core::{JournalSubmitToken, RowId, RowPositionMap, Tick};
 use scharnhorst_journal::{
-    Command, CommandEnvelope, CommitPhase, Diff, DiffBatch, InMemorySaveJournal, Journal,
-    JournalError, SaveJournal,
+    Command, CommandEnvelope, CommitPhase, CommitRecord, Diff, DiffBatch, InMemorySaveJournal,
+    Journal, JournalError, JournalResult, SaveJournal,
 };
 use scharnhorst_schema::{ColumnSpec, FieldSemantic, TableSpec};
 
@@ -46,7 +49,9 @@ fn make_journal_with_two_col_table(table_name: &str) -> Journal {
         row: RowId::new(1),
         values,
     };
-    journal.submit_diff(insert, &JournalSubmitToken::new()).unwrap();
+    journal
+        .submit_diff(insert, &JournalSubmitToken::new())
+        .unwrap();
     journal.commit().unwrap();
     journal
 }
@@ -172,7 +177,9 @@ fn journal_submit_batch_adds_all_diffs() {
     batch.push(make_update_diff("relation", 1, "trust", 50));
     batch.push(make_update_diff("relation", 2, "trust", 75));
 
-    journal.submit_batch(batch, &JournalSubmitToken::new()).unwrap();
+    journal
+        .submit_batch(batch, &JournalSubmitToken::new())
+        .unwrap();
     assert_eq!(journal.pending_diff_count(), 2);
 }
 
@@ -187,7 +194,10 @@ fn commit_transitions_phase_and_advances_tick() {
     assert_eq!(journal.current_tick(), Tick(1));
 
     journal
-        .submit_diff(make_update_diff("treasury", 1, "value", 100), &JournalSubmitToken::new())
+        .submit_diff(
+            make_update_diff("treasury", 1, "value", 100),
+            &JournalSubmitToken::new(),
+        )
         .unwrap();
 
     let result = journal.commit().unwrap();
@@ -201,7 +211,10 @@ fn commit_transitions_phase_and_advances_tick() {
 fn commit_clears_pending_diffs() {
     let mut journal = make_journal_with_two_col_table("treasury");
     journal
-        .submit_diff(make_update_diff("treasury", 1, "value", 100), &JournalSubmitToken::new())
+        .submit_diff(
+            make_update_diff("treasury", 1, "value", 100),
+            &JournalSubmitToken::new(),
+        )
         .unwrap();
     journal.commit().unwrap();
 
@@ -212,7 +225,10 @@ fn commit_clears_pending_diffs() {
 fn commit_records_history() {
     let mut journal = make_journal_with_two_col_table("treasury");
     journal
-        .submit_diff(make_update_diff("treasury", 1, "value", 100), &JournalSubmitToken::new())
+        .submit_diff(
+            make_update_diff("treasury", 1, "value", 100),
+            &JournalSubmitToken::new(),
+        )
         .unwrap();
     journal.commit().unwrap();
 
@@ -227,7 +243,10 @@ fn multiple_commits_advance_tick_each_time() {
     let mut journal = make_journal_with_two_col_table("counter");
     for i in 0..3 {
         journal
-            .submit_diff(make_update_diff("counter", 1, "value", i as i64), &JournalSubmitToken::new())
+            .submit_diff(
+                make_update_diff("counter", 1, "value", i as i64),
+                &JournalSubmitToken::new(),
+            )
             .unwrap();
         let result = journal.commit().unwrap();
         assert_eq!(result.tick, Tick(i + 1));
@@ -248,7 +267,10 @@ fn commit_without_pending_diffs_succeeds() {
 fn submit_fails_when_committing() {
     let mut journal = make_journal_with_two_col_table("treasury");
     journal
-        .submit_diff(make_update_diff("treasury", 1, "value", 100), &JournalSubmitToken::new())
+        .submit_diff(
+            make_update_diff("treasury", 1, "value", 100),
+            &JournalSubmitToken::new(),
+        )
         .unwrap();
 
     // Manually transition to Committing to simulate mid-commit state.
@@ -257,7 +279,10 @@ fn submit_fails_when_committing() {
     let _ = journal.commit();
 
     // After commit finishes, phase is Open again, so submission works.
-    let result = journal.submit_diff(make_update_diff("treasury", 1, "value", 200), &JournalSubmitToken::new());
+    let result = journal.submit_diff(
+        make_update_diff("treasury", 1, "value", 200),
+        &JournalSubmitToken::new(),
+    );
     assert!(result.is_ok());
 }
 
@@ -275,7 +300,9 @@ fn submit_command_with_wrong_tick_fails() {
         },
     );
 
-    let err = journal.submit_command(envelope, &JournalSubmitToken::new()).unwrap_err();
+    let err = journal
+        .submit_command(envelope, &JournalSubmitToken::new())
+        .unwrap_err();
     match err {
         JournalError::InvalidTick { expected, got } => {
             assert_eq!(expected, 0);
@@ -295,7 +322,10 @@ fn save_journal_appends_on_commit() {
     let mut journal = make_journal_with_two_col_table("treasury").with_save_journal(save);
 
     journal
-        .submit_diff(make_update_diff("treasury", 1, "value", 100), &JournalSubmitToken::new())
+        .submit_diff(
+            make_update_diff("treasury", 1, "value", 100),
+            &JournalSubmitToken::new(),
+        )
         .unwrap();
     journal.commit().unwrap();
 
@@ -363,7 +393,10 @@ fn journal_with_save_journal_records_multiple_commits() {
 
     for i in 0..3 {
         journal
-            .submit_diff(make_update_diff("counter", 1, "value", i as i64), &JournalSubmitToken::new())
+            .submit_diff(
+                make_update_diff("counter", 1, "value", i as i64),
+                &JournalSubmitToken::new(),
+            )
             .unwrap();
         journal.commit().unwrap();
     }
@@ -393,7 +426,9 @@ fn debug_write_journal_disabled_rejects_sql() {
     let mut dwj = DebugWriteJournal::new();
     dwj.set_enabled(false);
     let mut journal = Journal::new(Arc::new(ArrowStore::new()));
-    let err = dwj.execute_sql(&mut journal, "UPDATE actor SET x = 1").unwrap_err();
+    let err = dwj
+        .execute_sql(&mut journal, "UPDATE actor SET x = 1")
+        .unwrap_err();
     match err {
         JournalError::SubmitFailed(msg) => assert!(msg.contains("disabled")),
         other => panic!("expected SubmitFailed, got {:?}", other),
@@ -407,7 +442,9 @@ fn debug_write_journal_rejects_unsupported_sql() {
     use std::sync::Arc;
     let mut dwj = DebugWriteJournal::new();
     let mut journal = Journal::new(Arc::new(ArrowStore::new()));
-    let err = dwj.execute_sql(&mut journal, "SELECT * FROM actor").unwrap_err();
+    let err = dwj
+        .execute_sql(&mut journal, "SELECT * FROM actor")
+        .unwrap_err();
     match err {
         JournalError::SqlUnsupported(msg) => assert!(msg.contains("SELECT")),
         other => panic!("expected SqlUnsupported, got {:?}", other),
@@ -420,8 +457,11 @@ fn debug_write_journal_executes_update_sql() {
     use scharnhorst_journal::DebugWriteJournal;
     let mut dwj = DebugWriteJournal::new();
     let mut journal = make_journal_with_two_col_table("actor_state");
-    dwj.execute_sql(&mut journal, "UPDATE actor_state SET value = 1000 WHERE id = 1")
-        .unwrap();
+    dwj.execute_sql(
+        &mut journal,
+        "UPDATE actor_state SET value = 1000 WHERE id = 1",
+    )
+    .unwrap();
     assert_eq!(journal.pending_diff_count(), 1);
     let result = journal.commit().unwrap();
     assert_eq!(result.diff_count, 1);
@@ -472,8 +512,11 @@ fn debug_write_journal_logs_executed_sql() {
     let mut dwj = DebugWriteJournal::new();
     let mut journal = make_journal_with_two_col_table("actor_state");
 
-    dwj.execute_sql(&mut journal, "UPDATE actor_state SET value = 1000 WHERE id = 1")
-        .unwrap();
+    dwj.execute_sql(
+        &mut journal,
+        "UPDATE actor_state SET value = 1000 WHERE id = 1",
+    )
+    .unwrap();
     dwj.execute_sql(&mut journal, "DELETE FROM actor_state WHERE id = 2")
         .unwrap();
 
@@ -494,7 +537,10 @@ fn debug_write_journal_rejects_non_id_where_clause() {
     let mut dwj = DebugWriteJournal::new();
     let mut journal = Journal::new(Arc::new(ArrowStore::new()));
     let err = dwj
-        .execute_sql(&mut journal, "UPDATE actor_state SET treasury = 1000 WHERE name = 'France'")
+        .execute_sql(
+            &mut journal,
+            "UPDATE actor_state SET treasury = 1000 WHERE name = 'France'",
+        )
         .unwrap_err();
     match err {
         JournalError::SqlUnsupported(msg) => assert!(msg.contains("id column")),
@@ -510,7 +556,10 @@ fn debug_write_journal_rejects_non_equality_where() {
     let mut dwj = DebugWriteJournal::new();
     let mut journal = Journal::new(Arc::new(ArrowStore::new()));
     let err = dwj
-        .execute_sql(&mut journal, "UPDATE actor_state SET treasury = 1000 WHERE actor_id > 1")
+        .execute_sql(
+            &mut journal,
+            "UPDATE actor_state SET treasury = 1000 WHERE actor_id > 1",
+        )
         .unwrap_err();
     match err {
         JournalError::SqlUnsupported(msg) => assert!(msg.contains("= operator")),
@@ -571,17 +620,23 @@ fn full_tick_lifecycle_simulation() {
             to_actor: RowId::new(2),
         },
     )];
-    journal.submit_commands(bridge_commands, &JournalSubmitToken::new()).unwrap();
+    journal
+        .submit_commands(bridge_commands, &JournalSubmitToken::new())
+        .unwrap();
 
     // Systems run and emit diffs -> journal accumulates
     let mut economy_batch = DiffBatch::new("economy_system");
     economy_batch.push(make_update_diff("treasury", 1, "value", 500));
     economy_batch.push(make_update_diff("treasury", 1, "value", 200));
-    journal.submit_batch(economy_batch, &JournalSubmitToken::new()).unwrap();
+    journal
+        .submit_batch(economy_batch, &JournalSubmitToken::new())
+        .unwrap();
 
     let mut diplomacy_batch = DiffBatch::new("diplomacy_system");
     diplomacy_batch.push(make_update_diff("treasury", 1, "value", 80));
-    journal.submit_batch(diplomacy_batch, &JournalSubmitToken::new()).unwrap();
+    journal
+        .submit_batch(diplomacy_batch, &JournalSubmitToken::new())
+        .unwrap();
 
     assert_eq!(journal.pending_command_count(), 1);
     assert_eq!(journal.pending_diff_count(), 3);
@@ -605,14 +660,17 @@ fn clear_pending_drops_all_uncommitted_work() {
         .submit_diff(make_update_diff("a", 1, "x", 1), &JournalSubmitToken::new())
         .unwrap();
     journal
-        .submit_command(make_envelope(
-            Tick::ZERO,
-            "sys",
-            Command::DeleteRow {
-                table: "a".to_owned(),
-                row: RowId::new(99),
-            },
-        ), &JournalSubmitToken::new())
+        .submit_command(
+            make_envelope(
+                Tick::ZERO,
+                "sys",
+                Command::DeleteRow {
+                    table: "a".to_owned(),
+                    row: RowId::new(99),
+                },
+            ),
+            &JournalSubmitToken::new(),
+        )
         .unwrap();
 
     journal.clear_pending().unwrap();
@@ -625,7 +683,10 @@ fn history_iter_returns_all_records() {
     let mut journal = make_journal_with_two_col_table("t");
     for i in 0..3 {
         journal
-            .submit_diff(make_update_diff("t", 1, "value", i as i64), &JournalSubmitToken::new())
+            .submit_diff(
+                make_update_diff("t", 1, "value", i as i64),
+                &JournalSubmitToken::new(),
+            )
             .unwrap();
         journal.commit().unwrap();
     }
@@ -661,14 +722,18 @@ fn commit_failure_preserves_pending_and_resets_phase() {
         row: RowId::new(1),
         values,
     };
-    journal.submit_diff(valid_diff, &JournalSubmitToken::new()).unwrap();
+    journal
+        .submit_diff(valid_diff, &JournalSubmitToken::new())
+        .unwrap();
 
     let bad_diff = Diff::Insert {
         table: "nonexistent_table".to_owned(),
         row: RowId::new(1),
         values: serde_json::Map::new(),
     };
-    journal.submit_diff(bad_diff, &JournalSubmitToken::new()).unwrap();
+    journal
+        .submit_diff(bad_diff, &JournalSubmitToken::new())
+        .unwrap();
 
     let pre_commit_tick = journal.current_tick();
 
@@ -682,6 +747,74 @@ fn commit_failure_preserves_pending_and_resets_phase() {
     assert_eq!(journal.current_tick(), pre_commit_tick);
 }
 
+/// Would fail: when diffs reference a non-existent table, commit must rollback
+/// preserving all pending work with exact counts and resetting phase for retry.
+#[test]
+fn commit_rollback_on_apply_diffs_failure() {
+    let store = Arc::new(ArrowStore::new());
+    let spec = TableSpec::new("test_table")
+        .with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64"))
+        .unwrap();
+
+    let init = InitStore::new(Arc::clone(&store));
+    init.create_table(&spec, MutationMode::AppendOnly).unwrap();
+    let _commit = init.into_simulation().unwrap();
+
+    let mut journal = Journal::new(store);
+
+    let mut values = serde_json::Map::new();
+    values.insert(
+        "id".to_owned(),
+        serde_json::Value::Number(serde_json::Number::from(1u64)),
+    );
+    let valid_diff = Diff::Insert {
+        table: "test_table".to_owned(),
+        row: RowId::new(1),
+        values,
+    };
+    journal
+        .submit_diff(valid_diff, &JournalSubmitToken::new())
+        .unwrap();
+
+    let bad_diff = Diff::Insert {
+        table: "nonexistent_table".to_owned(),
+        row: RowId::new(1),
+        values: serde_json::Map::new(),
+    };
+    journal
+        .submit_diff(bad_diff, &JournalSubmitToken::new())
+        .unwrap();
+
+    let pre_tick = journal.current_tick();
+    let pre_diff_count = journal.pending_diff_count();
+    let pre_command_count = journal.pending_command_count();
+
+    let result = journal.commit();
+    assert!(result.is_err(), "commit must fail on nonexistent table");
+
+    // All invariants after rollback
+    assert_eq!(
+        journal.phase(),
+        CommitPhase::Open,
+        "phase must be restored to Open after diffs apply failure"
+    );
+    assert_eq!(
+        journal.pending_diff_count(),
+        pre_diff_count,
+        "all pending diffs must be preserved after rollback"
+    );
+    assert_eq!(
+        journal.pending_command_count(),
+        pre_command_count,
+        "all pending commands must be preserved after rollback"
+    );
+    assert_eq!(
+        journal.current_tick(),
+        pre_tick,
+        "tick must not advance on failed commit"
+    );
+}
+
 /// Would have failed: clear_pending during Committing phase should return
 /// InvalidPhase. Only allowed during Open.
 #[test]
@@ -691,18 +824,32 @@ fn clear_pending_during_open_succeeds_and_clears() {
     assert_eq!(journal.phase(), CommitPhase::Open);
 
     let mut row2 = serde_json::Map::new();
-    row2.insert("id".to_owned(), serde_json::Value::Number(serde_json::Number::from(2u64)));
-    row2.insert("value".to_owned(), serde_json::Value::Number(serde_json::Number::from(42i64)));
-    journal.submit_diff(Diff::Insert {
-        table: "clear_pending_table".to_owned(),
-        row: RowId::new(2),
-        values: row2,
-    }, &JournalSubmitToken::new()).unwrap();
+    row2.insert(
+        "id".to_owned(),
+        serde_json::Value::Number(serde_json::Number::from(2u64)),
+    );
+    row2.insert(
+        "value".to_owned(),
+        serde_json::Value::Number(serde_json::Number::from(42i64)),
+    );
+    journal
+        .submit_diff(
+            Diff::Insert {
+                table: "clear_pending_table".to_owned(),
+                row: RowId::new(2),
+                values: row2,
+            },
+            &JournalSubmitToken::new(),
+        )
+        .unwrap();
 
     assert_eq!(journal.pending_diff_count(), 1);
     journal.clear_pending().unwrap();
-    assert_eq!(journal.pending_diff_count(), 0,
-        "clear_pending should clear all pending diffs");
+    assert_eq!(
+        journal.pending_diff_count(),
+        0,
+        "clear_pending should clear all pending diffs"
+    );
 }
 
 /// Would have failed: commit_history must remain contiguous after wrapping
@@ -715,26 +862,45 @@ fn commit_history_bounded_and_contiguous_after_wrapping() {
 
     for i in 2..=(MAX_HIST as u64 + 11) {
         let mut values = serde_json::Map::new();
-        values.insert("id".to_owned(), serde_json::Value::Number(serde_json::Number::from(i)));
-        values.insert("value".to_owned(), serde_json::Value::Number(serde_json::Number::from(i as i64 * 10)));
-        journal.submit_diff(Diff::Insert {
-            table: "history_wrap_test".to_owned(),
-            row: RowId::new(i),
-            values,
-        }, &JournalSubmitToken::new()).unwrap();
+        values.insert(
+            "id".to_owned(),
+            serde_json::Value::Number(serde_json::Number::from(i)),
+        );
+        values.insert(
+            "value".to_owned(),
+            serde_json::Value::Number(serde_json::Number::from(i as i64 * 10)),
+        );
+        journal
+            .submit_diff(
+                Diff::Insert {
+                    table: "history_wrap_test".to_owned(),
+                    row: RowId::new(i),
+                    values,
+                },
+                &JournalSubmitToken::new(),
+            )
+            .unwrap();
         journal.commit().unwrap();
     }
 
     let history = journal.commit_history();
-    assert!(history.len() <= MAX_HIST,
-        "history should be bounded to {}, got {}", MAX_HIST, history.len());
+    assert!(
+        history.len() <= MAX_HIST,
+        "history should be bounded to {}, got {}",
+        MAX_HIST,
+        history.len()
+    );
     assert!(history.len() > 1, "history should contain multiple entries");
 
     let mut prev_tick: Option<Tick> = None;
     for record in history {
         if let Some(p) = prev_tick {
-            assert!(record.tick > p,
-                "ticks should be ascending: {} is not > {}", record.tick.0, p.0);
+            assert!(
+                record.tick > p,
+                "ticks should be ascending: {} is not > {}",
+                record.tick.0,
+                p.0
+            );
         }
         prev_tick = Some(record.tick);
     }
@@ -760,7 +926,9 @@ fn commit_with_future_tick_rejected() {
         },
     );
 
-    let err = journal.submit_command(envelope, &JournalSubmitToken::new()).unwrap_err();
+    let err = journal
+        .submit_command(envelope, &JournalSubmitToken::new())
+        .unwrap_err();
     match err {
         JournalError::InvalidTick { expected, got } => {
             assert_eq!(expected, 1);
@@ -808,7 +976,9 @@ fn submit_after_commit_before_tick_advance() {
         },
     );
 
-    let err = journal.submit_command(envelope, &JournalSubmitToken::new()).unwrap_err();
+    let err = journal
+        .submit_command(envelope, &JournalSubmitToken::new())
+        .unwrap_err();
     match err {
         JournalError::InvalidTick { expected, got } => {
             assert_eq!(expected, 2);
@@ -824,8 +994,8 @@ fn submit_after_commit_before_tick_advance() {
 #[test]
 #[cfg(debug_assertions)]
 fn debug_write_journal_insert_then_select() {
-    use scharnhorst_journal::DebugWriteJournal;
     use scharnhorst_arrow_store::ArrowStore;
+    use scharnhorst_journal::DebugWriteJournal;
 
     let store = Arc::new(ArrowStore::new());
     let init_store = scharnhorst_arrow_store::InitStore::new(Arc::clone(&store));
@@ -862,15 +1032,7 @@ fn debug_write_journal_insert_then_select() {
     assert_eq!(result.diff_count, 1);
 
     // Verify committed data exists in ArrowStore at the committed tick.
-    let table = store.get_table("player_data").unwrap();
-    let versions = table.get_version(commit_tick);
-    assert!(
-        versions.is_some(),
-        "table player_data should have data at tick {}",
-        commit_tick.as_u64()
-    );
-
-    let batches = versions.unwrap();
+    let batches = store.get_table_batches("player_data", commit_tick).unwrap();
     assert!(!batches.is_empty(), "expected at least one record batch");
     let batch = &batches[0];
     assert!(
@@ -878,4 +1040,446 @@ fn debug_write_journal_insert_then_select() {
         "expected rows in committed batch, got {}",
         batch.num_rows()
     );
+}
+
+// ------------------------------------------------------------------
+// Commit rollback: save_journal append error (branch 19)
+// ------------------------------------------------------------------
+
+/// Uncovered branch: `if let Err(e) = sj.append(&record)` at journal.rs:257.
+/// Worst-case: save_journal.append errors silently ignored, corrupts durability.
+///
+/// When save_journal.append returns an error, commit MUST rollback:
+///   - phase restored to Open
+///   - pending diffs and commands preserved
+///   - tick not advanced
+struct ErroringSaveJournal;
+
+impl SaveJournal for ErroringSaveJournal {
+    fn append(&mut self, _record: &CommitRecord) -> JournalResult<()> {
+        Err(JournalError::SaveJournal(
+            "simulated save journal append failure".to_owned(),
+        ))
+    }
+    fn flush(&mut self) -> JournalResult<()> {
+        Ok(())
+    }
+    fn truncate_before(&mut self, _tick: Tick) -> JournalResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn commit_rollback_on_save_journal_append_error() {
+    let mut journal = make_journal_with_two_col_table("t").with_save_journal(ErroringSaveJournal);
+    journal
+        .submit_diff(
+            make_update_diff("t", 1, "value", 42),
+            &JournalSubmitToken::new(),
+        )
+        .unwrap();
+
+    let tick_before = journal.current_tick();
+    assert_eq!(journal.pending_diff_count(), 1);
+    assert_eq!(journal.phase(), CommitPhase::Open);
+
+    let result = journal.commit();
+    assert!(
+        result.is_err(),
+        "commit must fail when save_journal.append errors"
+    );
+
+    // Rollback invariants
+    assert_eq!(
+        journal.phase(),
+        CommitPhase::Open,
+        "phase must be restored to Open after save_journal error"
+    );
+    assert_eq!(
+        journal.current_tick(),
+        tick_before,
+        "tick must not advance on failed commit"
+    );
+    assert_eq!(
+        journal.pending_diff_count(),
+        1,
+        "pending diffs must be restored after rollback"
+    );
+
+    // After rollback, journal should accept new submissions
+    journal
+        .submit_diff(
+            make_update_diff("t", 1, "value", 99),
+            &JournalSubmitToken::new(),
+        )
+        .unwrap();
+    assert_eq!(journal.pending_diff_count(), 2);
+}
+
+/// Would fail: when save_journal.append errors, commit must rollback
+/// preserving all pending diffs and commands with exact counts for retry.
+#[test]
+fn commit_rollback_on_save_journal_failure() {
+    let mut journal = make_journal_with_two_col_table("t").with_save_journal(ErroringSaveJournal);
+    journal
+        .submit_diff(
+            make_update_diff("t", 1, "value", 42),
+            &JournalSubmitToken::new(),
+        )
+        .unwrap();
+
+    journal
+        .submit_command(
+            make_envelope(
+                journal.current_tick(),
+                "test",
+                Command::Raw {
+                    domain: "test".to_owned(),
+                    payload: serde_json::json!({}),
+                },
+            ),
+            &JournalSubmitToken::new(),
+        )
+        .unwrap();
+
+    let pre_tick = journal.current_tick();
+    let pre_diff_count = journal.pending_diff_count();
+    let pre_command_count = journal.pending_command_count();
+
+    let result = journal.commit();
+    assert!(result.is_err(), "commit must fail on save_journal error");
+
+    // All rollback invariants
+    assert_eq!(
+        journal.phase(),
+        CommitPhase::Open,
+        "phase must be restored to Open after save_journal error"
+    );
+    assert_eq!(
+        journal.pending_diff_count(),
+        pre_diff_count,
+        "all pending diffs must be preserved after rollback"
+    );
+    assert_eq!(
+        journal.pending_command_count(),
+        pre_command_count,
+        "all pending commands must be preserved after rollback"
+    );
+    assert_eq!(
+        journal.current_tick(),
+        pre_tick,
+        "tick must not advance on failed commit"
+    );
+}
+
+// ------------------------------------------------------------------
+// Commit rollback: query_engine ingest error (branches 13, 15)
+// ------------------------------------------------------------------
+
+/// Uncovered branches:
+///   - `if let Some(ref qe) = qe_opt` at journal.rs:219 (qe Some path)
+///   - `if let Err(e) = qe_result` at journal.rs:245 (ingest error path)
+///
+/// Worst-case: query_engine ingest errors silently swallowed, snapshot
+/// inconsistency between ArrowStore and query engine.
+///
+/// When query_engine.ingest_snapshot returns an error, commit MUST rollback:
+///   - phase restored to Open
+///   - pending diffs and commands preserved
+///   - tick not advanced
+struct ErroringSnapshotIngestor;
+
+impl SnapshotIngestor for ErroringSnapshotIngestor {
+    fn ingest_snapshot(
+        &self,
+        _tick: Tick,
+        _table_name: &str,
+        _batches: Vec<RecordBatch>,
+        _position_map: RowPositionMap,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::other(
+            "simulated ingest snapshot error",
+        )))
+    }
+}
+
+#[derive(Clone)]
+struct RecordingFailingSnapshotIngestor {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+struct RecordingSnapshotRollback {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl SnapshotIngestRollback for RecordingSnapshotRollback {
+    fn rollback(self: Box<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut events = self.events.lock().map_err(|e| {
+            Box::new(std::io::Error::other(
+                format!("events lock poisoned: {e}"),
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        events.clear();
+        Ok(())
+    }
+}
+
+impl SnapshotIngestor for RecordingFailingSnapshotIngestor {
+    fn begin_ingest(
+        &self,
+    ) -> Result<Box<dyn SnapshotIngestRollback>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Box::new(RecordingSnapshotRollback {
+            events: Arc::clone(&self.events),
+        }))
+    }
+
+    fn ingest_snapshot(
+        &self,
+        _tick: Tick,
+        table_name: &str,
+        _batches: Vec<RecordBatch>,
+        _position_map: RowPositionMap,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut events = self.events.lock().map_err(|e| {
+            Box::new(std::io::Error::other(
+                format!("events lock poisoned: {e}"),
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        events.push(table_name.to_owned());
+        if events.len() > 1 {
+            return Err(Box::new(std::io::Error::other(
+                "simulated partial ingest failure",
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn commit_rollback_on_query_engine_error() {
+    let mut journal =
+        make_journal_with_two_col_table("t").with_query_engine(Arc::new(ErroringSnapshotIngestor));
+    journal
+        .submit_diff(
+            make_update_diff("t", 1, "value", 42),
+            &JournalSubmitToken::new(),
+        )
+        .unwrap();
+
+    let tick_before = journal.current_tick();
+    assert_eq!(journal.pending_diff_count(), 1);
+    assert_eq!(journal.phase(), CommitPhase::Open);
+
+    let result = journal.commit();
+    assert!(
+        result.is_err(),
+        "commit must fail when query_engine ingest errors"
+    );
+
+    // Rollback invariants
+    assert_eq!(
+        journal.phase(),
+        CommitPhase::Open,
+        "phase must be restored to Open after query_engine error"
+    );
+    assert_eq!(
+        journal.current_tick(),
+        tick_before,
+        "tick must not advance on failed commit"
+    );
+    assert_eq!(
+        journal.pending_diff_count(),
+        1,
+        "pending diffs must be restored after rollback"
+    );
+
+    // After rollback, journal should accept new submissions
+    journal
+        .submit_diff(
+            make_update_diff("t", 1, "value", 99),
+            &JournalSubmitToken::new(),
+        )
+        .unwrap();
+    assert_eq!(journal.pending_diff_count(), 2);
+}
+
+/// May-fail: query-engine ingest is a side effect inside commit.
+/// If a later table ingest fails, earlier ingests must be compensated.
+#[test]
+fn commit_rollback_reverts_query_ingest_side_effects() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(ArrowStore::new());
+    let init_store = InitStore::new(Arc::clone(&store));
+    for table in ["a", "b"] {
+        let spec =
+            TableSpec::new(table).with_column(ColumnSpec::new("id", FieldSemantic::Id, "i64"))?;
+        init_store.create_table(&spec, MutationMode::Patchable)?;
+    }
+    let _commit_store = init_store.into_simulation()?;
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let ingestor = RecordingFailingSnapshotIngestor {
+        events: Arc::clone(&events),
+    };
+    let mut journal = Journal::new(store).with_query_engine(Arc::new(ingestor));
+
+    let mut values = serde_json::Map::new();
+    values.insert("id".to_owned(), serde_json::json!(1));
+    journal.submit_diff(
+        Diff::Insert {
+            table: "a".to_owned(),
+            row: RowId::new(1),
+            values,
+        },
+        &JournalSubmitToken::new(),
+    )?;
+
+    let result = journal.commit();
+    assert!(result.is_err(), "commit must fail on partial query ingest");
+
+    let events = events.lock().map_err(|e| {
+        Box::new(std::io::Error::other(
+            format!("events lock poisoned: {e}"),
+        )) as Box<dyn std::error::Error>
+    })?;
+    assert!(
+        events.is_empty(),
+        "query ingest rollback must clear partial events, got {events:?}"
+    );
+    Ok(())
+}
+
+// ------------------------------------------------------------------
+// Phase-guard branches: submit_command, submit_diff, clear_pending
+// (branches 1, 5, 7)
+// ------------------------------------------------------------------
+//
+// These branches guard against calling submit/clear during a non-Open
+// phase. They are defensive guards for a concurrent/async commit design
+// that doesn't exist in the current synchronous implementation. In the
+// current code, `commit` is synchronous and always restores the phase to
+// Open before returning (on both success and failure paths). No public
+// API can leave the phase in Committing or Committed from an external
+// caller's perspective.
+//
+// Testing these from integration tests would require either:
+//   a) An async commit that yields mid-cycle, or
+//   b) A `#[cfg(test)]` helper to set the phase field directly.
+//
+// Neither is available. The guards are verified by code review and
+// the fact that the boolean expressions compile — if the phase enum
+// changes, the compiler will force these branches to be updated due
+// to exhaustive match elsewhere (CommitPhase: Committed variant used
+// at journal.rs:275).
+//
+// The existing test `submit_fails_when_committing` (line 248) is
+// misnamed; it actually verifies submission SUCCEEDS after commit
+// (phase is Open again), not that submission fails during Committing.
+//
+// The `commit` phase guard (branch 9) has the same limitation — it
+// protects against calling commit while already mid-commit, which is
+// unreachable without async or a test hook.
+
+// ------------------------------------------------------------------
+// Telemetry (metrics feature)
+// ------------------------------------------------------------------
+
+#[cfg(feature = "metrics")]
+mod telemetry_tests {
+    use std::sync::atomic::Ordering;
+
+    use scharnhorst_journal::telemetry;
+
+    #[test]
+    fn record_diff_submit_no_panic() {
+        telemetry::record_diff_submit("Add", "heroes");
+    }
+
+    #[test]
+    fn record_command_submit_no_panic() {
+        telemetry::record_command_submit("SpawnEntity");
+    }
+
+    #[test]
+    fn emit_commit_record_no_panic() {
+        telemetry::emit_commit_record(1, 10, 8, "abc123");
+    }
+
+    #[test]
+    fn reset_counters_no_panic() {
+        telemetry::reset_counters();
+    }
+
+    #[test]
+    fn record_diff_submit_increments_diffs_submitted() {
+        telemetry::reset_counters();
+        telemetry::record_diff_submit("Add", "heroes");
+        let count = telemetry::DIFFS_SUBMITTED.load(Ordering::Relaxed);
+        assert_eq!(count, 1);
+        telemetry::reset_counters();
+    }
+
+    #[test]
+    fn record_command_submit_increments_commands_submitted() {
+        telemetry::reset_counters();
+        telemetry::record_command_submit("SpawnEntity");
+        let count = telemetry::COMMANDS_SUBMITTED.load(Ordering::Relaxed);
+        assert_eq!(count, 1);
+        telemetry::reset_counters();
+    }
+
+    #[test]
+    fn multiple_diff_submits_accumulate() {
+        telemetry::reset_counters();
+        telemetry::record_diff_submit("Add", "a");
+        telemetry::record_diff_submit("Update", "b");
+        telemetry::record_diff_submit("Delete", "c");
+        let count = telemetry::DIFFS_SUBMITTED.load(Ordering::Relaxed);
+        assert_eq!(count, 3);
+        telemetry::reset_counters();
+    }
+
+    #[test]
+    fn multiple_command_submits_accumulate() {
+        telemetry::reset_counters();
+        telemetry::record_command_submit("SpawnEntity");
+        telemetry::record_command_submit("TransferControl");
+        let count = telemetry::COMMANDS_SUBMITTED.load(Ordering::Relaxed);
+        assert_eq!(count, 2);
+        telemetry::reset_counters();
+    }
+
+    #[test]
+    fn reset_counters_resets_both_to_zero() {
+        telemetry::reset_counters();
+        telemetry::record_diff_submit("Add", "x");
+        telemetry::record_command_submit("y");
+        telemetry::record_diff_submit("Update", "z");
+        telemetry::record_command_submit("w");
+
+        telemetry::reset_counters();
+        let diffs = telemetry::DIFFS_SUBMITTED.load(Ordering::Relaxed);
+        let commands = telemetry::COMMANDS_SUBMITTED.load(Ordering::Relaxed);
+        assert_eq!(diffs, 0);
+        assert_eq!(commands, 0);
+    }
+
+    #[test]
+    fn diff_and_command_counters_are_independent() {
+        telemetry::reset_counters();
+        telemetry::record_diff_submit("Add", "a");
+        telemetry::record_diff_submit("Add", "b");
+        telemetry::record_command_submit("c");
+
+        let diffs = telemetry::DIFFS_SUBMITTED.load(Ordering::Relaxed);
+        let commands = telemetry::COMMANDS_SUBMITTED.load(Ordering::Relaxed);
+        assert_eq!(diffs, 2);
+        assert_eq!(commands, 1);
+        telemetry::reset_counters();
+    }
+
+    #[test]
+    fn emit_commit_record_accepts_various_args() {
+        telemetry::emit_commit_record(0, 0, 0, "");
+        telemetry::emit_commit_record(u64::MAX, u64::MAX, u64::MAX, "hash");
+    }
 }

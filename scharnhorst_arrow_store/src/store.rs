@@ -400,6 +400,22 @@ impl ArrowStore {
         Ok(table.mutation_mode())
     }
 
+    /// Returns the record batches for a table at a given tick.
+    ///
+    /// This is the preferred read-path accessor for external consumers
+    /// that need raw Arrow data (e.g. the journal for snapshot
+    /// publication). It avoids leaking `VersionedTable` internals.
+    pub fn get_table_batches(&self, name: &str, tick: Tick) -> ArrowStoreResult<Vec<RecordBatch>> {
+        let lock = self
+            .tables
+            .get(name)
+            .ok_or_else(|| ArrowStoreError::TableNotFound(name.to_owned()))?;
+        let table = lock
+            .read()
+            .map_err(|e| ArrowStoreError::LockPoisoned(e.to_string()))?;
+        Ok(table.versions.get(&tick).cloned().unwrap_or_default())
+    }
+
     // ------------------------------------------------------------------
     // Data ingestion
     // ------------------------------------------------------------------
@@ -795,7 +811,11 @@ impl ArrowStore {
     // Checkpoint / diff helpers
     // ------------------------------------------------------------------
 
-    pub(crate) fn write_checkpoint(&self, tick: Tick, token: crate::store_guard::WriteCheckpointToken) -> ArrowStoreResult<()> {
+    pub(crate) fn write_checkpoint(
+        &self,
+        tick: Tick,
+        token: crate::store_guard::WriteCheckpointToken,
+    ) -> ArrowStoreResult<()> {
         {
             let lifecycle = self
                 .lifecycle
@@ -1070,8 +1090,7 @@ impl ArrowStore {
 
         // Collect unique table names and save pre-diff versions snapshot
         let touched_tables: HashSet<&str> = diffs.iter().map(|d| d.table()).collect();
-        let mut saved_versions: HashMap<String, HashMap<Tick, Vec<RecordBatch>>> =
-            HashMap::new();
+        let mut saved_versions: HashMap<String, HashMap<Tick, Vec<RecordBatch>>> = HashMap::new();
         for table_name in &touched_tables {
             if let Some(lock) = self.tables.get(*table_name) {
                 let table = lock
@@ -1881,7 +1900,7 @@ where
 
     let mut values: Vec<T::Native> = orig_arr.values().to_vec();
     let len = orig_arr.len();
-    let num_bytes = (len + 7) / 8;
+    let num_bytes = len.div_ceil(8);
     let mut null_bytes: Vec<u8> = orig_arr
         .nulls()
         .map(|n| {
